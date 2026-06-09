@@ -1,11 +1,12 @@
 ; test/sim-cluster-smoke.scm — Phase 0 keystone: the ported pure Raft engine +
 ; durable-KV substrate + actor/transport layer wired into a working in-process
-; multi-voter sim-cluster, exercised end-to-end with the STUB apply-fn.
+; multi-voter sim-cluster, exercised end-to-end with the MVCC apply-fn (cw-u4a.6).
 ;
 ; ONE process, the in-memory sim transport (node-link!): 3 logical nodes a/b/c,
 ; one shard "0" replicated on all three (a 3-voter Raft group). Proves leader
 ; election, cross-"node" replication over node-send, the commit->ack bridge, and
-; that the stub apply-fn recorded the proposed commands (in order) on every node.
+; that the MVCC apply-fn wrote identical committed state (via the real
+; mvcc-get-latest read path) on every node.
 ; This is the exact code that runs over real TCP; only the transport wiring
 ; differs (node-link! here vs node-listen/node-connect in node-cluster.scm).
 ;
@@ -33,7 +34,8 @@
 ; create-if-missing. A per-RUN unique suffix ((current-jiffy)) gives every run a
 ; FRESH store, so a prior run's persisted applied-index can't make a replica skip
 ; re-applying (persist-applied! restores applied from RocksDB on restart — exactly
-; what we want in prod, but it would empty applied-cmds on a reused dir here).
+; what we want in prod, but it would skip the MVCC writes on a reused dir here, so
+; the keys+revisions would not match this run's expectations).
 (define run-tag (number->string (current-jiffy)))
 (define (db-dir nd)
   (string-append "/tmp/cws-sim-" run-tag "-" (symbol->string nd) "-s0"))
@@ -96,8 +98,11 @@
 (spawn-source client-src 'client)
 
 (spin (lambda () (table-lookup 'ws-test "done")) "writes acked by quorum")
-(check "write 1 acked"          'applied (table-lookup 'ws-test "r1"))
-(check "write 2 acked"          'applied (table-lookup 'ws-test "r2"))
+; the MVCC apply-fn acks each PUT with its committed revision: ("PUT" . rev). The
+; no-op become-leader barrier does NO MVCC write (no revision bump), so the first
+; client PUT (city) commits at rev 1 and the second (n) at rev 2.
+(check "write 1 acked at rev 1" (cons "PUT" 1) (table-lookup 'ws-test "r1"))
+(check "write 2 acked at rev 2" (cons "PUT" 2) (table-lookup 'ws-test "r2"))
 (check "read probe confirmed"   'read-ok (car (table-lookup 'ws-test "rd")))
 
 ; ---- every replica must converge: commit index catches up on all three nodes.
@@ -117,33 +122,47 @@
 (check "b applied advanced" #t (>= (applied "b") 3))
 (check "c applied advanced" #t (>= (applied "c") 3))
 
-; ---- the STUB apply-fn must have recorded the SAME two commands, in order, on
-;      EVERY node (quorum + the leader). The no-op barrier is NOT recorded, so the
-;      applied-cmds list is exactly the two client PUTs in propose order.
-(section "stub apply-fn recorded commands on all nodes")
-(define (dump-node nd)
-  ; ask the replica actor for its applied-cmds via a per-node probe actor
-  (table-insert! 'ws-test "dump-target" nd)
-  (table-insert! 'ws-test "dump-done" #f)
+; ---- the MVCC apply-fn must have written the SAME committed state on EVERY node
+;      (quorum + the leader). After both PUTs commit+apply, query each replica's
+;      ctx through the `get` probe (the real mvcc-get-latest read path) and assert
+;      that city="oslo"@rev1 and n="1"@rev2 are present, with the correct
+;      create_rev/mod_rev/version, on all three voters. The no-op become-leader
+;      barrier writes NO MVCC record (no revision bump), so city is rev 1 / n is
+;      rev 2 — a distinct first-write per key, each version 1.
+(section "MVCC state replicated on all nodes")
+
+; ask replica `nd` for its MVCC view of key K via a per-node probe actor; returns
+; (value-bytes create-rev mod-rev version) or #f.
+(define (get-node nd k)
+  (table-insert! 'ws-test "get-target" nd)
+  (table-insert! 'ws-test "get-key" k)
+  (table-insert! 'ws-test "get-done" #f)
   (spawn-source "
     (define (probe)
       (let ((pid (table-lookup 'ws-shard-pid
-                   (string-append (table-lookup 'ws-test \"dump-target\") \":0\"))))
-        (send pid (list 'dump (self)))
-        (table-insert! 'ws-test \"dump-result\" (raw-receive))
-        (table-insert! 'ws-test \"dump-done\" #t)))" 'probe)
-  (spin (lambda () (table-lookup 'ws-test "dump-done")) (string-append "dump " nd))
-  (table-lookup 'ws-test "dump-result"))
+                   (string-append (table-lookup 'ws-test \"get-target\") \":0\"))))
+        (send pid (list 'get (self) (string->utf8 (table-lookup 'ws-test \"get-key\"))))
+        (table-insert! 'ws-test \"get-result\" (raw-receive))
+        (table-insert! 'ws-test \"get-done\" #t)))" 'probe)
+  (spin (lambda () (table-lookup 'ws-test "get-done")) (string-append "get " nd " " k))
+  (table-lookup 'ws-test "get-result"))
 
-; decode an applied cmd (list of bytevectors) to a list of strings for assertion
-(define (decode cmd) (map utf8->string cmd))
-(define expected (list (list "PUT" "city" "oslo") (list "PUT" "n" "1")))
+; decode a (value-bytes create-rev mod-rev version) summary for assertion.
+(define (summarize r)
+  (and r (list (utf8->string (car r)) (cadr r) (caddr r) (cadddr r))))
+
+; expected MVCC view: (value create-rev mod-rev version)
+(define exp-city (list "oslo" 1 1 1))   ; city: first PUT at rev 1
+(define exp-n    (list "1"    2 2 1))   ; n:    first PUT at rev 2
 
 (for-each
  (lambda (nd)
-   (let ((got (map decode (dump-node nd))))
-     (display "  ") (display nd) (display " applied-cmds = ") (write got) (newline)
-     (check (string-append nd " recorded both PUTs in order") expected got)))
+   (let ((city (summarize (get-node nd "city")))
+         (n    (summarize (get-node nd "n"))))
+     (display "  ") (display nd) (display " city=") (write city)
+     (display " n=") (write n) (newline)
+     (check (string-append nd " city=oslo @rev1 v1") exp-city city)
+     (check (string-append nd " n=1 @rev2 v1")       exp-n    n)))
  '("a" "b" "c"))
 
 (done!)

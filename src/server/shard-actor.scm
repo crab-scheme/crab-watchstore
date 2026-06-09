@@ -40,6 +40,7 @@
 
 (include "src/encoding.scm")
 (include "src/store-ctx.scm")
+(include "src/mvcc.scm")
 (include "src/raft.scm")
 
 (define (raft-applied st) (aget st 'applied))
@@ -53,7 +54,6 @@
          (ctx     (make-ctx handle "default" sync?))
          (pending (make-eqv-hashtable))          ; log-index -> conn-pid
          (acc     '())                           ; apply markers, newest-first (apply order)
-         (applied-cmds '())                      ; STUB: committed+applied cmds, NEWEST-FIRST
          (read-q  '())                           ; ReadIndex: reads awaiting a round, (conn . #f)
          (batch   '())                           ; ReadIndex: reads the open round is confirming
          (read-acks '())                         ; ReadIndex: peers acked (fresh) since round opened
@@ -67,17 +67,19 @@
                                      (let ((n (string->number shard-key))) (if n n 0)))
                                   (length voters))
                           3))))
-    ; ---- STUB state machine ----
-    ; Instead of dispatching a Redis command, RECORD each applied command (so the
-    ; smoke can assert which commands committed+applied, in order) and bump the
-    ; opaque state-machine value. The '() become-leader no-op barrier (§5.4.2) is
-    ; recorded as #f so drain!'s positional index alignment still holds (it still
-    ; contributes an acc slot), but it is NOT added to applied-cmds.
+    ; ---- MVCC state machine (cw-u4a.6, ADR 0001) ----
+    ; Apply one committed Raft entry as one etcd Txn: mvcc-apply stamps the new
+    ; revision, writes the KEY-CF record + REV-CF event (+ lease index) and bumps
+    ; the current-rev META key — all via `ctx` (kv-put!/kv-del!), so they ride the
+    ; SAME group-commit batch as persist-applied! below and land under one fsync.
+    ; mvcc-apply's result (e.g. ("PUT" . rev) / ("DEL" rev . n)) is pushed onto `acc`
+    ; as that waiter's client ack. The '() become-leader no-op barrier (§5.4.2) is a
+    ; pure barrier: it does NO MVCC write and MUST NOT bump the revision — it only
+    ; contributes an #f `acc` slot so drain!'s positional index alignment still holds.
     (define (apply-fn sm cmd)
       (if (null? cmd)
-          (set! acc (cons #f acc))                       ; no-op barrier: acc slot only
-          (begin (set! applied-cmds (cons cmd applied-cmds))
-                 (set! acc (cons 'applied acc))))         ; client waiter gets 'applied
+          (set! acc (cons #f acc))                       ; no-op barrier: acc slot only, no rev bump
+          (set! acc (cons (mvcc-apply ctx cmd) acc)))     ; MVCC write; client waiter gets the result
       (+ sm 1))
     ; Persist the applied index (+ its term) into the SAME group-commit batch as
     ; the entry's mutations, so a restart restores base/applied/commit and never
@@ -350,13 +352,21 @@
                   (loop st2 leader 0 #f)))
                (else (loop st leader (+ elapsed 1) #f))))
 
-            ;; ---- test-support: (dump CONN) -> the applied-cmds in apply order ----
-            ;; Lets a test assert WHICH client commands this replica committed +
-            ;; applied (the stub apply-fn's record), and in what order. applied-cmds
-            ;; is newest-first, so reverse it to apply order. Not part of the
-            ;; consensus protocol — a harness probe for the Phase-0 keystone.
-            ((eq? (car m) 'dump)
-             (send (cadr m) (reverse applied-cmds))
+            ;; ---- test-support: (get CONN K) -> this replica's MVCC view of K ----
+            ;; Reads the REAL committed MVCC state on THIS node's ctx via the same
+            ;; mvcc-get-latest read path the apply-fn uses, and replies a small
+            ;; serializable summary: (value-bytes create-rev mod-rev version) for a
+            ;; live key, or #f if absent/tombstoned. Lets a test assert that the MVCC
+            ;; write path replicated identically across every voter. Not part of the
+            ;; consensus protocol — a harness probe; .7 Range generalises this seam.
+            ((eq? (car m) 'get)
+             (let* ((conn (cadr m)) (k (caddr m))
+                    (r (mvcc-get-latest ctx k)))
+               (send conn
+                     (if r
+                         (list (kv-rec-value r) (kv-rec-create-rev r)
+                               (kv-rec-mod-rev r) (kv-rec-version r))
+                         #f)))
              (loop st leader elapsed flush-base))
 
             ;; ---- linearizable read probe: (read CONN) ----

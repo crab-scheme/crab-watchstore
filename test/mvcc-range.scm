@@ -6,11 +6,16 @@
 (include "test/harness.scm")
 (include "src/store-ctx.scm")
 (include "src/mvcc.scm")
+(include "test/mvcc-util.scm")
 
 ; ---- open a fresh store ----
 (define run-tag (number->string (current-jiffy)))
 (define DB-PATH (string-append "/tmp/cws-mvcc-range-" run-tag))
 (define CTX (make-ctx (store-open DB-PATH #t) "default" #t))
+
+; Guarantee isolation: (current-jiffy) is process-relative, so back-to-back runs
+; reuse the same dir — empty the store before building any state.
+(reset-ctx! CTX)
 
 ; ---- helpers ----
 (define (b s) (string->utf8 s))

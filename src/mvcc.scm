@@ -557,6 +557,113 @@
                        (collect (cdr rs) uk (list row) new-results)))))))))))
 
 ; ---------------------------------------------------------------------------
+; mvcc-compact  (cw-u4a.8 — etcd-style MVCC history GC)
+; ---------------------------------------------------------------------------
+;
+; (mvcc-compact ctx compactRev) -> (cons 'ok compactRev)
+;                                | (cons 'err-compacted currentCompactRev)
+;                                | (cons 'err-future-rev currentRev)
+;
+; Implements etcd compaction semantics exactly (ADR §compact):
+;   1. Validate compactRev against current compact-rev and current-rev.
+;   2. Persist the new compact-rev META key (activates ErrCompacted gate in
+;      mvcc-range for any read at revision < compactRev).
+;   3. KEY-CF GC: for each user-key group, keep the single latest-≤-compactRev
+;      version ONLY IF it is a live (non-tombstone) record.  Delete all older
+;      versions with mod_rev ≤ compactRev, and delete the latest-≤-compactRev
+;      version too if it is a tombstone (a key deleted ≤ compactRev is fully gone).
+;      Versions with mod_rev > compactRev are never touched.
+;   4. REV-CF GC: delete every event entry with rev ≤ compactRev.
+;   5. Does NOT bump current-rev (compaction is NOT a revision-creating operation).
+;
+; All deletes go through kv-del! so they batch with the WAL group-commit.
+; Compaction is synchronous; incremental/background compaction is a future option.
+
+(define (mvcc-compact ctx compactRev)
+  (let ((cur-compact (mvcc-compact-rev ctx))
+        (cur-rev     (mvcc-current-rev ctx)))
+    (cond
+      ; ErrCompacted: already compacted to >= compactRev
+      ((<= compactRev cur-compact)
+       (cons 'err-compacted cur-compact))
+      ; future-rev: compactRev is beyond what has been written
+      ((> compactRev cur-rev)
+       (cons 'err-future-rev cur-rev))
+      (else
+       ; Step 2: persist the new compact-rev (activates mvcc-range's ErrCompacted gate)
+       (kv-put! ctx META-COMPACT-REV (u64->bytes compactRev))
+       ; Step 3: KEY-CF GC — scan NS-KEY grouped by user-key (newest-first per key)
+       ; For each key, find the latest-≤-compactRev version and decide keep/delete.
+       (let ((rows (kv-scan ctx (mvcc-byte NS-KEY))))
+         ; Accumulate rows per user-key.  Scan order: ascending user-key, then
+         ; newest-first within key (INV encoding).  So we process groups naturally.
+         (let gc-loop ((rs rows) (cur-uk #f) (cur-group '()))
+           (define (gc-flush-group group)
+             ; group = list of (fullkey . value-bv) in newest-first scan order.
+             ; Collect all versions with mod_rev <= compactRev.  Because we process
+             ; the group newest-first and cons each matching row, the resulting
+             ; at-or-below list ends up OLDEST-FIRST (the first-processed newest
+             ; version is at the tail).  We reverse it to get newest-first so that
+             ; the HEAD is the "latest-≤-compactRev" candidate.
+             (let split ((g group) (at-or-below '()))
+               (if (null? g)
+                   ; Done splitting.
+                   (if (null? at-or-below)
+                       ; All versions are above compactRev — nothing to GC.
+                       (values)
+                       ; at-or-below is currently oldest-first (due to cons during
+                       ; newest-first traversal); reverse to get newest-first.
+                       (let* ((newest-first (reverse at-or-below))
+                              (latest-row   (car newest-first))   ; highest mod_rev ≤ compactRev
+                              (latest-rec   (kv-record-decode (cdr latest-row)))
+                              (is-tomb      (kv-rec-tombstone? latest-rec))
+                              ; Tombstone at/before compactRev: the key was deleted and
+                              ; no live value needs to anchor reads at compactRev -> delete ALL.
+                              ; Non-tombstone: keep latest (anchors reads at compactRev),
+                              ; delete all older versions in at-or-below.
+                              (to-delete    (if is-tomb
+                                               newest-first          ; delete tombstone + older
+                                               (cdr newest-first)))) ; keep latest, delete older
+                         (for-each (lambda (row) (kv-del! ctx (car row))) to-delete)))
+                   ; Partition this row by its mod_rev vs compactRev.
+                   ; Versions with mod_rev > compactRev are skipped (left in place).
+                   (let* ((row (car g))
+                          (rec (kv-record-decode (cdr row)))
+                          (mr  (kv-rec-mod-rev rec)))
+                     (if (<= mr compactRev)
+                         (split (cdr g) (cons row at-or-below))   ; accumulate GC candidate
+                         (split (cdr g) at-or-below))))))         ; skip (above compactRev)
+           (if (null? rs)
+               ; Flush the last group
+               (if cur-uk (gc-flush-group (reverse cur-group)) (values))
+               ; Accumulate row into the current group, flushing on key change
+               (let* ((row  (car rs))
+                      (fk   (car row))
+                      (uk   (key-cf-decode-user-key fk)))
+                 (cond
+                   ((and cur-uk (equal? uk cur-uk))
+                    ; Same key — accumulate (rows arrive newest-first for this key)
+                    (gc-loop (cdr rs) cur-uk (cons row cur-group)))
+                   (else
+                    ; New key — flush the previous group first
+                    (if cur-uk (gc-flush-group (reverse cur-group)) (values))
+                    (gc-loop (cdr rs) uk (list row))))))))
+       ; Step 4: REV-CF GC — delete every event with rev <= compactRev.
+       ; REV-CF keys are NS-REV || rev16 (plain ascending), so we scan the whole
+       ; NS-REV namespace and delete entries whose embedded rev <= compactRev.
+       (let ((rev-rows (kv-scan ctx (mvcc-byte NS-REV))))
+         (for-each
+          (lambda (row)
+            (let* ((fk  (car row))
+                   ; fk = 0x02 || u64be(main) || u64be(sub); main at byte 1
+                   (rev (bytes->u64 fk 1)))
+              (if (<= rev compactRev)
+                  (kv-del! ctx fk))))
+          rev-rows))
+       ; Step 5: compaction does NOT bump current-rev
+       (cons 'ok compactRev)))))
+
+; ---------------------------------------------------------------------------
 ; mvcc-apply  (ADR §2 — one Raft entry = one Txn = one main revision)
 ; ---------------------------------------------------------------------------
 ;
@@ -567,9 +674,13 @@
 ;   ("PUT" K V leaseId)    put, attach lease (leaseId is a decimal-ASCII bytevector)
 ;   ("DEL" K)              delete single key
 ;   ("DEL" K rangeEnd)     delete range [K, rangeEnd)
+;   ("COMPACT" rev)        compact history to rev (does NOT bump current-rev)
 ; Returns:
-;   ("PUT" . newRev)            ; the revision the put committed at
-;   ("DEL" newRev . deleted)    ; revision + count deleted
+;   ("PUT" . newRev)                       ; the revision the put committed at
+;   ("DEL" newRev . deleted)               ; revision + count deleted
+;   (cons 'ok compactRev)                  ; compaction succeeded
+;   (cons 'err-compacted currentCompact)   ; already compacted to >= rev
+;   (cons 'err-future-rev currentRev)      ; rev is beyond current-rev
 ; — a small s-expr usable as the client ack.
 
 (define (cmd-op cmd) (utf8->string (car cmd)))
@@ -594,5 +705,10 @@
               (deleted  (mvcc-delete-range! ctx K rangeEnd main 0)))
          (mvcc-set-current-rev! ctx main)
          (cons "DEL" (cons main deleted))))
+      ((string=? op "COMPACT")
+       ; COMPACT does NOT bump current-rev — call mvcc-compact directly.
+       ; The rev argument is a decimal-ASCII bytevector (same convention as leaseId).
+       (let ((rev (let ((l (bytes->int (list-ref cmd 1)))) (if l l 0))))
+         (mvcc-compact ctx rev)))
       (else
        (error "mvcc-apply: unknown command" op)))))

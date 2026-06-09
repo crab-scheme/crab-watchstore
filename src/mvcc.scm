@@ -320,6 +320,243 @@
             (loop (cdr vs) (+ s 1) (+ n 1)))))))
 
 ; ---------------------------------------------------------------------------
+; mvcc-range  (cw-u4a.7 — Range query API, ADR §3 read paths (a)/(b)/(c))
+; ---------------------------------------------------------------------------
+;
+; NOTE: mvcc-range is a pure read over the ctx.  Linearizable gating (ReadIndex
+; protocol) is the actor's existing job; the gRPC binding (.22) routes Range
+; through that gate before calling here.
+;
+; (mvcc-range ctx key range-end opts) -> '(count . kvlist)
+;                                      | (cons 'err-compacted compact-rev)
+;
+; opts is an assoc list; use (range-opt opts key default) to read with defaults.
+;
+; Supported opts keys (symbols):
+;   revision       - read at this main rev (default = current-rev; 0 = current)
+;   limit          - max keys returned (default = 0 = unlimited)
+;   count-only     - #t => return count, no kvlist
+;   keys-only      - #t => kvlist has keys but zero-length values
+;   sort-order     - 'none | 'ascend | 'descend  (default 'none, natural scan order)
+;   sort-target    - 'key | 'version | 'create | 'mod | 'value  (default 'key)
+;   min-create-rev - min create_rev filter (0 = unset)
+;   max-create-rev - max create_rev filter (0 = unset)
+;   min-mod-rev    - min mod_rev filter (0 = unset)
+;   max-mod-rev    - max mod_rev filter (0 = unset)
+;
+; A KeyValue result item is a pair (user-key-bv . record-vector), where
+; record-vector is from kv-record-decode.  Callers use kv-rec-* accessors.
+
+; ---- opts helper ----
+
+(define (range-opt opts key default)
+  (let ((cell (assq key opts)))
+    (if cell (cdr cell) default)))
+
+; ---- range-end semantics ----
+;
+;   #f or empty bv      => single-key point read (range-end-unset? already covers this)
+;   #u8(0)              => "to end of keyspace" (all keys >= key)
+;   key=#u8(0) + end=#u8(0) => ALL keys (etcd all-keys convention)
+;
+; The "all-keys" case is the intersection: key=zero-byte AND range-end=zero-byte.
+; We canonicalise below so in-range? only needs to know whether we're in "half-open
+; [key, range-end)" mode or the special full-range modes.
+
+; Is range-end the sentinel meaning "to end of keyspace"?
+; #u8(0) is a single zero byte, which has bytevector-length 1 and first byte 0.
+(define (range-end-to-eof? range-end)
+  (and range-end
+       (= (bytevector-length range-end) 1)
+       (= (bytevector-u8-ref range-end 0) 0)))
+
+; uk in [key, range-end)?  Handles all-keys, to-eof, half-open, and single-key modes.
+; uk is a plain user-key bytevector.
+(define (range-in-range? uk key range-end)
+  (cond
+    ; single-key point read
+    ((range-end-unset? range-end) (equal? uk key))
+    ; all-keys: key=#u8(0) AND range-end=#u8(0)
+    ((and (range-end-to-eof? range-end)
+          (= (bytevector-length key) 1)
+          (= (bytevector-u8-ref key 0) 0))
+     #t)
+    ; to-eof: range-end=#u8(0), key is anything
+    ((range-end-to-eof? range-end) (not (bv<? uk key)))  ; uk >= key
+    ; normal half-open [key, range-end)
+    (else (and (not (bv<? uk key)) (bv<? uk range-end)))))
+
+; prefix-range-end: increment the last non-0xFF byte to produce the exclusive
+; upper bound for a prefix scan.  Returns #f if all bytes are 0xFF (overflow =>
+; treat as to-eof, but that can't happen for any real key).
+(define (prefix-range-end prefix)
+  (let* ((n   (bytevector-length prefix))
+         (out (subbv prefix 0 n)))
+    (let loop ((i (- n 1)))
+      (cond
+        ((< i 0) #f)   ; all 0xFF — return #f (caller treats as to-eof)
+        ((< (bytevector-u8-ref out i) #xFF)
+         (bytevector-u8-set! out i (+ (bytevector-u8-ref out i) 1))
+         ; zero out bytes after i
+         (let clr ((j (+ i 1)))
+           (if (< j n) (begin (bytevector-u8-set! out j 0) (clr (+ j 1)))))
+         out)
+        (else (loop (- i 1)))))))
+
+; ---- decode user-key from a KEY-CF composite key ----
+;   composite: 0x01 || u64be(lenK) || K || INV(rev16)
+;   user-key lives at bytes [9, 9+lenK)
+(define (key-cf-decode-user-key fk)
+  (let ((lenK (bytes->u64 fk 1)))
+    (subbv fk 9 (+ 9 lenK))))
+
+; ---- decode the INV(rev16) back to the main revision ----
+;   the inv16 bytes are at offset 9+lenK; un-invert then read the main u64be.
+(define (key-cf-decode-main-rev fk)
+  (let* ((lenK   (bytes->u64 fk 1))
+         (inv-bv (subbv fk (+ 9 lenK) (+ 9 lenK 16)))
+         (plain  (inv16 inv-bv)))      ; inv16 is its own inverse (XOR 0xFF)
+    (bytes->u64 plain 0)))             ; high 8 bytes = main
+
+; ---- in-memory sort of result pairs ((uk . rec) ...) ----
+
+; Extract the sort key for a given sort-target from a (uk . rec) item.
+(define (range-sort-key item target)
+  (let ((uk  (car item))
+        (rec (cdr item)))
+    (cond
+      ((eq? target 'key)     uk)
+      ((eq? target 'version) (kv-rec-version    rec))
+      ((eq? target 'create)  (kv-rec-create-rev rec))
+      ((eq? target 'mod)     (kv-rec-mod-rev    rec))
+      ((eq? target 'value)   (kv-rec-value      rec))
+      (else uk))))
+
+; compare two sort keys (either bytevectors or integers)
+(define (sort-key<? a b)
+  (if (bytevector? a)
+      (bv<? a b)
+      (< a b)))
+
+; insertion sort (small result sets, avoids any stdlib sort dependency)
+(define (isort lst less?)
+  (define (insert x sorted)
+    (cond ((null? sorted) (list x))
+          ((less? x (car sorted)) (cons x sorted))
+          (else (cons (car sorted) (insert x (cdr sorted))))))
+  (let loop ((in lst) (out '()))
+    (if (null? in) out
+        (loop (cdr in) (insert (car in) out)))))
+
+(define (range-sort items order target)
+  (if (eq? order 'none)
+      items
+      (let* ((key-fn (lambda (item) (range-sort-key item target)))
+             (asc?   (lambda (a b) (sort-key<? (key-fn a) (key-fn b))))
+             (sorted (isort items asc?)))
+        (if (eq? order 'descend) (reverse sorted) sorted))))
+
+; ---- the main Range implementation ----
+
+(define (mvcc-range ctx key range-end opts)
+  ; -- read opts --
+  (let* ((req-rev    (range-opt opts 'revision      0))
+         (limit      (range-opt opts 'limit         0))
+         (count-only (range-opt opts 'count-only    #f))
+         (keys-only  (range-opt opts 'keys-only     #f))
+         (sort-order (range-opt opts 'sort-order    'none))
+         (sort-target (range-opt opts 'sort-target  'key))
+         (min-cr     (range-opt opts 'min-create-rev 0))
+         (max-cr     (range-opt opts 'max-create-rev 0))
+         (min-mr     (range-opt opts 'min-mod-rev    0))
+         (max-mr     (range-opt opts 'max-mod-rev    0))
+         ; resolve the effective read revision
+         (cur-rev    (mvcc-current-rev ctx))
+         (at-rev     (if (= req-rev 0) cur-rev req-rev))
+         ; compact-rev check
+         (compact-rev (mvcc-compact-rev ctx)))
+    ; ErrCompacted: if a non-zero explicit revision is below compact-rev
+    (if (and (not (= req-rev 0)) (< req-rev compact-rev))
+        (cons 'err-compacted compact-rev)
+        ; -- scan NS-KEY namespace forward, group by user-key, pick visible version --
+        (let ((rows (kv-scan ctx (mvcc-byte NS-KEY))))
+          ; Iterate all KEY-CF rows in on-disk order.  Rows are ordered by
+          ; user-key (ascending) then by INV(rev) (newest-first within key).
+          ; We group consecutive rows sharing the same user-key.
+          (let collect ((rs rows) (cur-uk #f) (cur-group '()) (results '()))
+            (define (flush-group uk group)
+              ; group is the accumulated (fk . vbv) pairs for uk, in scan order
+              ; (newest→oldest).  Pick the visible version at at-rev.
+              (if (null? group)
+                  results
+                  (let loop ((g group))
+                    (if (null? g)
+                        results                        ; no visible version
+                        (let* ((row (car g))
+                               (rec (kv-record-decode (cdr row)))
+                               (mr  (kv-rec-mod-rev rec)))
+                          (cond
+                            ; skip versions newer than read revision
+                            ((> mr at-rev) (loop (cdr g)))
+                            ; first visible version is tombstone -> absent
+                            ((kv-rec-tombstone? rec) results)
+                            ; live -> add to results if in-range and passes rev filters
+                            (else
+                             (let ((cr (kv-rec-create-rev rec)))
+                               (if (and (range-in-range? uk key range-end)
+                                        (or (= min-cr 0) (>= cr min-cr))
+                                        (or (= max-cr 0) (<= cr max-cr))
+                                        (or (= min-mr 0) (>= mr min-mr))
+                                        (or (= max-mr 0) (<= mr max-mr)))
+                                   (cons (cons uk rec) results)
+                                   results)))))))))
+            (if (null? rs)
+                ; no more rows: flush the final group then finalise
+                (let* ((final-results (if cur-uk (flush-group cur-uk (reverse cur-group)) results))
+                       (matched       (reverse final-results))
+                       ; sort
+                       (sorted        (range-sort matched sort-order sort-target))
+                       ; total count BEFORE limit (etcd more/count semantics)
+                       (total         (length sorted))
+                       ; apply limit
+                       (limited       (if (or (= limit 0) (>= limit total))
+                                          sorted
+                                          (let take ((lst sorted) (n limit) (acc '()))
+                                            (if (or (null? lst) (= n 0))
+                                                (reverse acc)
+                                                (take (cdr lst) (- n 1) (cons (car lst) acc))))))
+                       ; project
+                       (projected     (if count-only
+                                          '()
+                                          (if keys-only
+                                              ; blank the value in the record vector
+                                              (map (lambda (item)
+                                                     (let ((rec (cdr item)))
+                                                       (cons (car item)
+                                                             (vector
+                                                              (vector-ref rec 0)  ; tag
+                                                              (vector-ref rec 1)  ; create-rev
+                                                              (vector-ref rec 2)  ; mod-rev
+                                                              (vector-ref rec 3)  ; version
+                                                              (vector-ref rec 4)  ; lease
+                                                              (make-bytevector 0 0))))) ; blank value
+                                                   limited)
+                                              limited))))
+                  (cons total projected))
+                ; more rows: decode user-key and accumulate group
+                (let* ((row (car rs))
+                       (fk  (car row))
+                       (uk  (key-cf-decode-user-key fk)))
+                  (cond
+                    ; same key as current group — accumulate
+                    ((and cur-uk (equal? uk cur-uk))
+                     (collect (cdr rs) cur-uk (cons row cur-group) results))
+                    ; new key — flush previous group first, start new group
+                    (else
+                     (let ((new-results (if cur-uk (flush-group cur-uk (reverse cur-group)) results)))
+                       (collect (cdr rs) uk (list row) new-results)))))))))))
+
+; ---------------------------------------------------------------------------
 ; mvcc-apply  (ADR §2 — one Raft entry = one Txn = one main revision)
 ; ---------------------------------------------------------------------------
 ;

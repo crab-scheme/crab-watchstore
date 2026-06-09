@@ -710,5 +710,27 @@
        ; The rev argument is a decimal-ASCII bytevector (same convention as leaseId).
        (let ((rev (let ((l (bytes->int (list-ref cmd 1)))) (if l l 0))))
          (mvcc-compact ctx rev)))
+      ((string=? op "TXN")
+       ; An etcd Txn: a single FLAT bytevector (node-send safe) carrying the whole
+       ; compare/success/failure op tree.  txn-apply decodes it, peeks whether the
+       ; executed branch mutates with effect, bumps main = prev+1 ONLY if so (a
+       ; pure-read / zero-effect Txn does NOT advance the revision — cw-u4a.40),
+       ; threads sub-revisions, and persists current-rev iff it bumped.
+       ; Returns (succeeded? . responses).  Defined in src/txn.scm.
+       (txn-apply ctx (list-ref cmd 1) prev-rev))
       (else
        (error "mvcc-apply: unknown command" op)))))
+
+; ---------------------------------------------------------------------------
+; etcd Txn (If/Then/Else) — cw-u4a.10
+; ---------------------------------------------------------------------------
+;
+; The Txn layer (compares + success/failure RequestOp lists, flat node-send
+; serialization, atomic compare-then-apply at this MVCC seam) lives in src/txn.scm
+; and is included HERE — after every mvcc helper it builds on (mvcc-get-latest /
+; mvcc-put! / mvcc-delete-range! / mvcc-range / live-keys-in-range / kv-rec-* /
+; bv<? / mvcc-set-current-rev! / mvcc-byte).  mvcc-apply's "TXN" case dispatches to
+; txn-apply, defined there.  Including it from mvcc.scm means every consumer of the
+; apply-fn (shard-actor + the unit tests) gets the Txn path with zero extra wiring.
+
+(include "src/txn.scm")

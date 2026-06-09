@@ -4,3 +4,13 @@
 *.db
 .beads-credential-key
 .beads/proxieddb/
+
+# Build / runtime artifacts
+target/
+result/
+*.log
+db/
+*-shard*/
+*.tmp
+data/
+snapshots/

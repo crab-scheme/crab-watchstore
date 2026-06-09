@@ -60,18 +60,26 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 
 ## Build & Test
 
-_Add your build and test commands here_
-
 ```bash
-# Example:
-# npm install
-# npm test
+# CrabScheme binary (must be built with --features stdlib-store):
+CRABSCHEME=/Users/ztaylor/repos/workspaces/crabscheme/target/release/crabscheme
+
+# Run the node skeleton:
+$CRABSCHEME run src/node-watchstore.scm
+
+# Run all tests:
+bash bin/test.sh
+
+# Run a single test file:
+$CRABSCHEME run test/smoke.scm
 ```
 
 ## Architecture Overview
 
-_Add a brief overview of your project architecture_
+etcd v3 API-compatible distributed store in CrabScheme: gRPC front-end + Raft consensus + RocksDB durability; all orchestration in Scheme over native `cs-grpc`/`cs-store`/`cs-consensus` substrate.
 
 ## Conventions & Patterns
 
-_Add your project-specific conventions here_
+- Test files `(include "test/harness.scm")` from the repo root (cwd when running `crabscheme run test/...`).
+- All `include` paths are relative to the repo root.
+- `(section ...)` / `(check ...)` / `(done!)` are the test primitives; `(->bv x)` coerces values to bytevectors.

@@ -7,9 +7,14 @@ the evidence that proves each section, and the consistency guarantees.
 
 | Proof | What it exercises | Status |
 |-------|-------------------|--------|
-| `test/etcd-kv-grpc.sh` | etcdctl CLI — KV.Put/Range/Del/Txn/Compact + Maintenance/Status + unimplemented Auth stub | ALL PASS (25 assertions) |
+| `test/etcd-kv-grpc.sh` | etcdctl CLI — KV.Put/Range/Del/Txn/Compact + Maintenance/Status | ALL PASS (25 assertions) |
 | `test/etcd-watch-lease-grpc.sh` | etcdctl CLI — Watch (live/prefix/historical) + Lease (Grant/Put/TTL/KeepAlive/List/Revoke) | ALL PASS (18 assertions) |
 | `test/etcd-mtls-grpc.sh` | etcdctl over mutual TLS — same KV surface, peer-identity logged | ALL PASS (7 assertions) |
+| `test/etcd-auth-grpc.sh` | etcdctl CLI — Auth enable/Authenticate + RBAC enforcement | ALL PASS (22 assertions) |
+| `test/etcd-auth-mgmt-grpc.sh` | etcdctl CLI — User/Role management RPCs | ALL PASS (21 assertions) |
+| `test/etcd-cluster-grpc.sh` | etcdctl CLI — Cluster Member{List,Add,Remove,Promote} on a live cluster | ALL PASS (23 assertions) |
+| `test/etcd-maintenance-grpc.sh` | etcdctl CLI — Status/Hash/HashKV/Defragment/Snapshot/Alarm | ALL PASS (25 assertions) |
+| `test/health-metrics.sh` | grpc.health.v1.Health + HTTP /health, /version, /metrics | ALL PASS (24 assertions) |
 | `test/clientv3-compat/main.go` | **go.etcd.io/etcd/client/v3 library (v3.5.17)** — KV/Txn/Watch/Lease/Compact via the actual Go etcd client | ALL PASS (see matrix below) |
 
 The clientv3 program (`test/clientv3-compat`) is the Phase 5 capstone.  It uses
@@ -56,36 +61,48 @@ off-by-one adaptation is handled in `src/server/grpc-watch.scm`.
 Lease expiry is leader-driven: the shard's deadline timer fires at the leader
 and proposes the revocation through Raft.
 
-### Auth service (`etcdserverpb.Auth`)
+### Auth service (`etcdserverpb.Auth`) — Phase 6
 
-| RPC | Status | Planned | Notes |
-|-----|--------|---------|-------|
-| `AuthEnable` / `AuthDisable` | **Not yet** | cw-u4a.25 | Returns `GRPC_UNIMPLEMENTED(12)` |
-| `Authenticate` | **Not yet** | cw-u4a.25 | Same |
-| `UserAdd` / `UserGet` / `UserList` / `UserDelete` / `UserChangePassword` / `UserGrantRole` / `UserRevokeRole` | **Not yet** | cw-u4a.26 | Same |
-| `RoleAdd` / `RoleGet` / `RoleList` / `RoleDelete` / `RoleGrantPermission` / `RoleRevokePermission` | **Not yet** | cw-u4a.27 | Same |
+| RPC | Status | Notes |
+|-----|--------|-------|
+| `AuthEnable` / `AuthDisable` / `Authenticate` | **Supported** | Argon2id; token issued on Authenticate; `AuthEnable` flips enforcement |
+| `UserAdd` / `UserGet` / `UserList` / `UserDelete` / `UserChangePassword` / `UserGrantRole` / `UserRevokeRole` | **Supported** | full user lifecycle |
+| `RoleAdd` / `RoleGet` / `RoleList` / `RoleDelete` / `RoleGrantPermission` / `RoleRevokePermission` | **Supported** | range-containment authorization |
 
-Any Auth RPC returns `GRPC_UNIMPLEMENTED(12)` — the client gets a clean gRPC status
-rather than a TCP reset.  Verified by `test/etcd-kv-grpc.sh` (`auth status` check).
+Authorization is enforced per request via the auth token **or** the client-certificate CN
+(over mTLS). Users/roles live in an internal `NS-AUTH` namespace invisible to `Range`/`Watch`.
+Proof: `test/etcd-auth-grpc.sh` (RBAC, 22 assertions), `test/etcd-auth-mgmt-grpc.sh` (mgmt RPCs,
+21 assertions).
 
-### Cluster service (`etcdserverpb.Cluster`)
+### Cluster service (`etcdserverpb.Cluster`) — Phase 7 (joint-consensus membership)
 
-| RPC | Status | Planned | Notes |
-|-----|--------|---------|-------|
-| `MemberList` | **Partial (stub)** | cw-u4a.30 | Returns a single-member list with stable ID/name; enough for etcdctl balancer |
-| `MemberAdd` / `MemberRemove` / `MemberUpdate` / `MemberPromote` | **Not yet** | cw-u4a.30 | Returns `GRPC_UNIMPLEMENTED(12)` |
+| RPC | Status | Notes |
+|-----|--------|-------|
+| `MemberList` | **Supported** | real config view; uint64 ID↔name bijection (FNV-1a == node stable-id) |
+| `MemberAdd` | **Supported** | add a voter (two-phase joint change) or a learner (single-phase) on a **live** cluster |
+| `MemberRemove` / `MemberPromote` | **Supported** | remove a voter (incl. the leader; it steps down after Cnew commits) / promote learner→voter |
+| `MemberUpdate` | **Partial (no-op)** | peer addresses are static in this deployment model |
 
-### Maintenance service (`etcdserverpb.Maintenance`)
+Membership changes use joint consensus (Ongaro §4.3): a change requires a majority of **both**
+the old and new voter sets, so there is no split-brain across a reconfiguration. Proof:
+`test/etcd-cluster-grpc.sh` (list→add voter→add learner→promote→remove→follower-redirect, 23
+assertions) and the Jepsen membership nemesis (`cw-u4a.35`).
 
-| RPC | Status | Planned | Notes |
-|-----|--------|---------|-------|
-| `Status` | **Partial (stub)** | cw-u4a.32 | Returns `version="3.6.0"`, raftIndex, raftTerm, dbSize=0, leader=member_id; sufficient for `etcdctl endpoint status` |
-| `Alarm` / `AlarmList` / `AlarmDisarm` | **Not yet** | cw-u4a.32 | Returns `GRPC_UNIMPLEMENTED(12)` |
-| `Defragment` | **Not yet** | cw-u4a.32 | Same |
-| `Hash` / `HashKV` | **Not yet** | cw-u4a.32 | Same |
-| `Snapshot` | **Not yet** | cw-u4a.32 | Same |
-| `MoveLeader` | **Not yet** | cw-u4a.32 | Same |
-| `Downgrade` | **Not yet** | cw-u4a.32 | Same |
+### Maintenance service (`etcdserverpb.Maintenance`) — Phase 8
+
+| RPC | Status | Notes |
+|-----|--------|-------|
+| `Status` | **Supported** | real raft scalars (term/index/applied/leader), db size, key count |
+| `Hash` / `HashKV` | **Supported** | deterministic FNV-1a-32 over canonical scan order — identical across members |
+| `Defragment` | **Supported** | advisory store flush |
+| `Snapshot` | **Partial** | logical-keyspace stream, 512-aligned + sha256 trailer so `etcdctl snapshot save` downloads & verifies; restore is **native, not bbolt** |
+| `Alarm` / `AlarmList` / `AlarmDisarm` | **Partial** | leader-local, not yet Raft-replicated (`cw-u4a.42`) |
+| `MoveLeader` | **Not yet** | the Raft engine has no `TimeoutNow` leadership-transfer primitive (`cw-u4a.42`) |
+| `Downgrade` | **Not yet** | version downgrade protocol not modeled |
+
+Also served (Phase 8): `grpc.health.v1.Health/Check` + `Health/Watch` on the client port, and a
+plain-HTTP `/health` `/version` `/metrics` (Prometheus) listener on a dedicated metrics port.
+Proof: `test/etcd-maintenance-grpc.sh` (25 assertions), `test/health-metrics.sh` (24 assertions).
 
 ## Consistency model
 

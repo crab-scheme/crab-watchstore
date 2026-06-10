@@ -6,7 +6,10 @@ gRPC-native (Protocol Buffers v3), full etcd v3 feature set including Watch stre
 Transactions (Mini-transactions), Auth, Leases, and dynamic cluster membership — all
 orchestration written in Scheme.
 
-> **Status: Phase 0 — scaffolding.** Build/run/test harness in place. No etcd logic yet.
+> **Status: build-out complete.** All 9 phases (KV · Watch · Txn · Lease · Auth/RBAC · gRPC
+> wire · dynamic membership · maintenance/health · validation) are implemented, wire-compatible
+> with real `etcdctl` / `clientv3`, and **Jepsen-validated linearizable** under partition, kill,
+> and live membership churn. See the [exit report](docs/exit-report.md).
 
 ## What it is
 
@@ -36,13 +39,16 @@ and `cs-consensus`).
 
 ```sh
 # Build the runtime once (in the crabscheme repo):
-cargo build -p cs-cli --features stdlib-store --release
+cargo build -p cs-cli --features stdlib-store,grpc --release
 export CRABSCHEME=/path/to/crabscheme/target/release/crabscheme
 
-# Start a node (skeleton — prints banner and exits):
-bash bin/run.sh
-# or:
-$CRABSCHEME run src/node-watchstore.scm -- --port 2379
+# Start a single-node cluster (serves the etcd v3 gRPC API on the client port):
+$CRABSCHEME run src/node-cluster.scm -- \
+  --node a --db /tmp/cws-a --cluster a:127.0.0.1:7001:2379
+
+# Drive it with real etcd tooling:
+etcdctl --endpoints=127.0.0.1:2379 put hello world
+etcdctl --endpoints=127.0.0.1:2379 get hello
 ```
 
 ## Test
@@ -64,13 +70,15 @@ this scaffold task is **`cw-u4a`**; run `bd prime` for full workflow context.
 
 ```
 crab-watchstore/
-├── src/                  # CrabScheme source (node entry, future: server/, commands/)
-│   ├── server/           # connection handlers (future)
-│   └── commands/         # KV/Watch/Txn/Auth/Lease handlers (future)
-├── test/                 # Scheme conformance tests + harness
-├── bench/                # benchmark harness (future)
+├── src/                  # CrabScheme source — all etcd semantics (~7.7k lines)
+│   ├── mvcc.scm raft.scm proto.scm auth.scm txn.scm watch.scm …
+│   ├── server/           # gRPC KV/Watch handlers, shard actor, metrics HTTP server
+│   └── commands/          # command helpers
+├── test/                 # 30 Scheme conformance tests + 10 etcd gRPC integration scripts
+├── bench/                # vs-etcd.sh head-to-head harness
+├── jepsen/               # 5-node Docker linearizability suite (jetcd client)
 ├── proto/                # .proto definitions (etcd v3 API)
-└── docs/                 # measurements + design docs (future)
+└── docs/                 # exit-report, etcd-compat, jepsen-validation, perf-vs-etcd, ADRs
 ```
 
 ## Relationship to CrabScheme and crab-cache
@@ -80,6 +88,14 @@ runtime and depends on the same native modules as crab-cache (`cs-store`, `cs-co
 crab-cache's Raft/store substrate is Jepsen-validated: linearizable under partition/kill
 (register workload), and durable under `kill -9` (group-commit WAL fsync). This store
 inherits that validated base.
+
+## Documentation
+
+- [**Exit report**](docs/exit-report.md) — epic close-out: what was built, the proofs, the full coverage matrix, the crab-cache reuse manifest
+- [etcd v3 compatibility](docs/etcd-compat.md) — per-RPC coverage + proof corpus
+- [Jepsen validation](docs/jepsen-validation.md) — linearizability verdict matrix
+- [Performance vs etcd](docs/perf-vs-etcd.md) — honest head-to-head
+- [ADRs](docs/adr/) — MVCC · Watch · Lease · Auth design decisions
 
 ## License
 

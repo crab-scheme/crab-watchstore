@@ -30,18 +30,21 @@
                                    [append :as append]
                                    [cas :as cas]
                                    [watch :as watch]
-                                   [lease :as lease]]))
+                                   [lease :as lease]
+                                   [membership :as membership]]))
 
 (def workloads
   "Workload name -> constructor."
   {:register register/workload
    :append   append/workload
    :cas      cas/workload
-   :watch    watch/workload     ; stub — cw-u4a.35
-   :lease    lease/workload})   ; stub — cw-u4a.35
+   :watch    watch/workload
+   :lease    lease/workload})
 
 ;; clock excluded: shared-kernel containers can't skew one node's clock in isolation.
-(def all-faults [:partition :kill :pause])
+;; membership = the reconfiguration nemesis (cw-u4a.35) — remove a voter (5->4) then
+;; re-add it (4->5) via the Cluster gRPC service, repeatedly, under load.
+(def all-faults [:partition :kill :pause :membership])
 
 (defn parse-faults
   [s]
@@ -57,7 +60,7 @@
     :parse-fn keyword
     :validate [workloads (cli/one-of workloads)]]
 
-   [nil "--nemesis FAULTS" "Faults: comma-separated subset of partition,kill,pause (or 'none' / 'all')"
+   [nil "--nemesis FAULTS" "Faults: comma-separated subset of partition,kill,pause,membership (or 'none' / 'all')"
     :default  #{:partition}
     :parse-fn parse-faults
     :validate [(fn [fs] (every? (set all-faults) fs))
@@ -100,17 +103,25 @@
         nopts    {:db        database
                   :nodes     (:nodes opts)
                   :faults    faults
-                  :partition {:targets [:one :majority :majorities-ring]}
+                  ;; Isolate a MINORITY (one node, or a <quorum subset) so a majority
+                  ;; keeps serving — this yields :ok ops + a real linearizability proof
+                  ;; AND the split-brain probe (the isolated side must not serve stale),
+                  ;; rather than the :majority / :majorities-ring partitions which just
+                  ;; make the (correctly CP) cluster unavailable → an all-:info history.
+                  :partition {:targets [:one :minority]}
                   :interval  10}
         nemesis  (if (empty? faults)
                    ;; No faults: plain noop nemesis (skip all package setup!).
                    {:nemesis nemesis/noop, :generator nil, :final-generator nil, :perf #{}}
-                   ;; Compose ONLY partition + db (kill/pause/start). Deliberately
-                   ;; excludes file-corruption-package and clock-package (per-node
-                   ;; clock — impossible in shared-kernel containers); both would
-                   ;; fail setup! here and we don't use them.
+                   ;; Compose partition + db (kill/pause/start) + membership. The
+                   ;; membership package only fires when :membership is in faults
+                   ;; (else nil generator), so it's safe to always include — same
+                   ;; pattern as the built-ins. Deliberately excludes file-corruption
+                   ;; and clock packages (per-node clock — impossible in shared-kernel
+                   ;; containers); both would fail setup! here and we don't use them.
                    (nc/compose-packages [(nc/partition-package nopts)
-                                         (nc/db-package nopts)]))]
+                                         (nc/db-package nopts)
+                                         (membership/package nopts)]))]
     (merge tests/noop-test
            opts
            {:name      (str "crabwatchstore " (name (:workload opts))

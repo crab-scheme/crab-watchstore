@@ -38,13 +38,24 @@
   2379)
 
 (def call-timeout-secs
-  "Per-RPC deadline applied when dereffing jetcd's CompletableFutures."
-  10)
+  "Per-RPC deadline applied when dereffing jetcd's CompletableFutures. Kept modest so
+   an attempt that lands on a partitioned-away / dead endpoint returns quickly and the
+   round-robin picker advances to another endpoint instead of blocking the full window."
+  6)
 
 (def max-retries
   "Bounded retries for transient UNAVAILABLE/not-leader (round-robin finds the
    leader within a few hops on a 5-node cluster; this is generous headroom)."
   200)
+
+(def retry-deadline-ms
+  "WALL-CLOCK cap on a single op's leader-finding retries. Under NO fault an op
+   succeeds in well under a second; under a sustained partition/kill an op on the
+   wrong side would otherwise retry ~forever (200 hops x a multi-second call each),
+   stalling the jepsen phase drain. After this budget the op gives up and propagates
+   -> jepsen :info (indeterminate), which is the truthful outcome and lets the run
+   terminate. This is what makes the fault workloads (which cw-u4a.34 never ran) drain."
+  20000)
 
 ;; ---- byte <-> string (etcd keys/values are arbitrary bytes; we use UTF-8) ----
 
@@ -101,20 +112,29 @@
   [^CompletableFuture fut]
   (.get fut call-timeout-secs TimeUnit/SECONDS))
 
+(defn retry-until
+  "Run thunk f; while `again?` says the throwable is transient AND the wall-clock
+   deadline has not passed, back off briefly and retry. Otherwise the throwable
+   propagates (→ jepsen :info). The deadline (not just a hop count) is what bounds an
+   op stuck on the wrong side of a partition so the jepsen phase can drain."
+  [again? f]
+  (let [deadline (+ (System/currentTimeMillis) retry-deadline-ms)]
+    (loop []
+      (let [res (try {:ok (f)}
+                     (catch Throwable e
+                       (if (and (< (System/currentTimeMillis) deadline) (again? e))
+                         {:retry e}
+                         (throw e))))]
+        (if (contains? res :ok)
+          (:ok res)
+          (do (Thread/sleep 50) (recur)))))))
+
 (defn with-retry
   "Run thunk f; on a transient UNAVAILABLE/not-leader, back off briefly and retry
-   (bounded). On exhaustion or any non-retryable throwable, the throwable
-   propagates (→ jepsen :info)."
+   until the wall-clock budget elapses. On a non-retryable throwable or budget
+   exhaustion, the throwable propagates (→ jepsen :info)."
   [f]
-  (loop [tries 0]
-    (let [res (try {:ok (f)}
-                   (catch Throwable e
-                     (if (and (< tries max-retries) (retryable? e))
-                       {:retry e}
-                       (throw e))))]
-      (if (contains? res :ok)
-        (:ok res)
-        (do (Thread/sleep 50) (recur (inc tries)))))))
+  (retry-until retryable? f))
 
 ;; ---- KV ops (the jepsen-op primitives the workloads build on) ----
 
@@ -135,6 +155,16 @@
     (fn []
       (deref-future (.put kv (->bs k) (->bs v)))
       :ok)))
+
+(defn kv-put-rev
+  "Write `v` to key `k`, returning the store revision the put committed at
+   (PutResponse header revision). The watch workload uses this to correlate each
+   committed write with the revision the watcher must deliver it at."
+  [^KV kv ^String k ^String v]
+  (with-retry
+    (fn []
+      (let [resp (deref-future (.put kv (->bs k) (->bs v)))]
+        (.getRevision (.getHeader ^io.etcd.jetcd.kv.PutResponse resp))))))
 
 (defn kv-cas
   "Atomic compare-and-set via an etcd Txn: if the current value of `k` equals

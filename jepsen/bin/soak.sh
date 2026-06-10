@@ -22,22 +22,36 @@ TEST_COUNT=${TEST_COUNT:-1}
 TIME_LIMIT=${TIME_LIMIT:-100}
 SSH="--username root --ssh-private-key /root/.ssh/id_jepsen"
 
-# workload|fault|extra-args  (faults: none partition kill)
+# workload|fault|extra-args  (faults: none partition kill membership)
+# cw-u4a.35 matrix: register/cas under each fault (incl. the membership-change nemesis),
+# Elle append, watch and lease. Keep --register-ops small + concurrency low so Knossos
+# terminates (the leader-finding throughput floor keeps :ok counts modest; cas overall
+# :valid? false with EMPTY :failures is the :stats :info-rate flag, not a violation —
+# the Knossos workload checker is :valid? true). See docs/jepsen-validation.md.
 MATRIX=(
   "register|none|--concurrency 5 --register-group 1 --register-ops 50"
-  "cas|none|--concurrency 5 --register-group 1 --register-ops 50"
   "register|partition|--concurrency 5 --register-group 1 --register-ops 50"
   "register|kill|--concurrency 5 --register-group 1 --register-ops 50"
+  "register|membership|--concurrency 5 --register-group 1 --register-ops 40"
   "cas|partition|--concurrency 5 --register-group 1 --register-ops 50"
+  "cas|kill|--concurrency 5 --register-group 1 --register-ops 50"
+  "cas|membership|--concurrency 5 --register-group 1 --register-ops 40"
   "append|none|--concurrency 5"
   "append|kill|--concurrency 5"
+  "watch|none|--concurrency 8 --rate 30"
+  "watch|kill|--concurrency 8 --rate 30"
+  "lease|none|--concurrency 5"
+  "lease|kill|--concurrency 5"
 )
 
+# CELL_TIMEOUT bounds each cell; pkill reaps any orphaned JVM (a timed-out `lein run`
+# wrapper can leave its java grandchild running, which would starve the next cell).
+CELL_TIMEOUT=${CELL_TIMEOUT:-260}
 run_one() {  # workload fault extra
   local wl=$1 fault=$2 extra=$3
-  docker exec "$CTL" bash -c "cd /crab-watchstore/jepsen && lein run test \
+  docker exec "$CTL" bash -c "cd /crab-watchstore/jepsen && timeout $CELL_TIMEOUT lein run test \
     --workload $wl --nemesis $fault --nodes $NODES $SSH \
-    --time-limit $TIME_LIMIT $extra" 2>&1 | tail -40
+    --time-limit $TIME_LIMIT $extra 2>&1 | tail -40; pkill -9 -x java 2>/dev/null; true"
 }
 
 verdict() {  # reads stdin (lein tail) once, prints true|false|unknown|crash

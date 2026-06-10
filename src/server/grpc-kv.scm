@@ -158,6 +158,19 @@
 (define MoveLeaderResponse-schema
   (list (list 1 'header '(message ResponseHeader-schema-ref) 'optional)))
 
+; ---- grpc.health.v1.Health (cw-u4a.33) — the STANDARD gRPC Health Checking Protocol ----
+; (what grpc_health_probe / k8s liveness probes call; etcd serves it too.)  This is its OWN
+; service (grpc.health.v1.Health), NOT etcdserverpb — but it rides the same client-port gRPC
+; transport (any :path routes to this handler), so it is pure new Scheme, no Rust change.
+;   HealthCheckRequest{service=1 string}
+;   HealthCheckResponse{status=1 enum: UNKNOWN=0 SERVING=1 NOT_SERVING=2 SERVICE_UNKNOWN=3}
+(define HealthCheckRequest-schema
+  (list (list 1 'service 'string 'optional)))
+(define HealthCheckResponse-schema
+  (list (list 1 'status 'enum 'optional)))
+(define HEALTH-SERVING     1)
+(define HEALTH-NOT-SERVING 2)
+
 ; etcdserverpb.Member{ID=1, name=2, peerURLs=3(rep string), clientURLs=4(rep string),
 ;   isLearner=5(bool)}.  isLearner (cw-u4a.30) distinguishes a non-voting learner.
 (define Member-schema
@@ -1150,6 +1163,11 @@
         ; response chunks -> close.  Spawn the snapshot stream worker exactly like Watch.
         ((string=? path "/etcdserverpb.Maintenance/Snapshot")
          (start-stream-worker! h 'grpc-snapshot-worker))
+        ; grpc.health.v1.Health/Watch (cw-u4a.33) is SERVER-STREAMING: emit the current
+        ; serving status, then hold the stream until the client half-closes (the standard
+        ; gRPC Health Watch).  Spawn the health-watch stream worker exactly like Snapshot.
+        ((string=? path "/grpc.health.v1.Health/Watch")
+         (start-stream-worker! h 'grpc-health-watch-worker))
         (else (dispatch-unary! h path)))))
 
   (define (dispatch-unary! h path)
@@ -1203,6 +1221,8 @@
                       ((string=? path "/etcdserverpb.Maintenance/Defragment") (handle-defragment bytes))
                       ((string=? path "/etcdserverpb.Maintenance/Alarm")      (handle-alarm bytes))
                       ((string=? path "/etcdserverpb.Maintenance/MoveLeader") (handle-move-leader bytes))
+                      ; grpc.health.v1.Health/Check (cw-u4a.33): standard gRPC health probe.
+                      ((string=? path "/grpc.health.v1.Health/Check")         (handle-health-check h bytes))
                       (else (cons 'unimplemented path))))))
       (cond
         ((and (pair? res) (eq? (car res) 'ok))
@@ -1328,6 +1348,23 @@
             (string-append "leadership transfer not supported: the Raft engine has no "
                            "TimeoutNow; remove the leader via MemberRemove to force "
                            "re-election"))))))
+
+  ; ===========================================================================
+  ; grpc.health.v1.Health/Check (cw-u4a.33) — standard gRPC health protocol (UNARY)
+  ; ===========================================================================
+  ; SERVING iff this node is READY: it has a leader AND is initialized (applied >= commit,
+  ; i.e. caught up to the committed log).  Otherwise NOT_SERVING.  etcd reports SERVING when
+  ; the server can serve.  The request's `service` field is ignored — like etcd, we report
+  ; overall server health (the readiness seam is endpoint-local, un-gated, served on any node).
+  (define (node-serving?)
+    (let ((r (shard-status)))   ; (status-ok rev term commit applied db-size leader key-count)
+      (and (pair? r) (eq? (car r) 'status-ok)
+           (list-ref r 6)                          ; has a leader (non-#f)
+           (>= (list-ref r 4) (list-ref r 3)))))   ; applied >= commit (initialized)
+  (define (handle-health-check h bytes)
+    (cons 'ok (pb-encode HealthCheckResponse-schema
+                         (list (cons 'status (if (node-serving?)
+                                                 HEALTH-SERVING HEALTH-NOT-SERVING))))))
 
   ; ===========================================================================
   ; Cluster service handlers (cw-u4a.30)

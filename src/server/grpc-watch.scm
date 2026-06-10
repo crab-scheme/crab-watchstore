@@ -331,3 +331,47 @@
                                                   (cons 'blob chunk))))
             (stream end))
           (grpc-stream-close! h WG-OK)))))
+
+; ===========================================================================
+; Health Watch worker — one per /grpc.health.v1.Health/Watch stream (cw-u4a.33)
+; ===========================================================================
+;   (spawn-source "(include \"src/server/grpc-watch.scm\")" 'grpc-health-watch-worker
+;                 H SHARD-PID CLUSTER-ID MEMBER-ID)
+;
+; The standard gRPC Health Watch (server-streaming): the server pushes the serving status
+; whenever it changes.  MINIMAL impl (DOCUMENTED): emit the CURRENT status ONCE, then HOLD the
+; stream open until the client half-closes (emit-once-then-hold).  Re-emit-on-leadership-change
+; would need a leadership-change subscription the shard does not expose (it only answers point
+; reads), so we do not synthesise it — the unary Check is the live probe; Watch is the stream
+; surface.  The HealthCheckResponse schema mirrors grpc-kv.scm's (defined locally here exactly
+; like SnapshotResponse-schema above, since this is a separate spawn-source runtime).
+(define HealthCheckResponse-schema (list (list 1 'status 'enum 'optional)))
+(define HEALTH-SERVING     1)
+(define HEALTH-NOT-SERVING 2)
+
+(define (grpc-health-watch-worker h shard-pid cluster-id member-id)
+  (define ended? #f)
+  ; READINESS = has-leader AND initialized (applied >= commit), read from the shard's .32
+  ; status seam (cw-u4a.33 appended the key-count, unused here).  A client half-close may race
+  ; the reply (server-streaming auto-closes the client side after the one request); if it
+  ; arrives mid-read we note it and close right after the single emit.
+  (define (status-ready?)
+    (send shard-pid (list 'status (self)))
+    (let wait ()
+      (let ((r (raw-receive)))
+        (cond
+          ((and (pair? r) (eq? (car r) 'status-ok))
+           (and (list-ref r 6) (>= (list-ref r 4) (list-ref r 3))))
+          ((and (pair? r) (eq? (car r) 'client-end)) (set! ended? #t) (wait))
+          (else (wait))))))
+  (grpc-stream-send! h (pb-encode HealthCheckResponse-schema
+                                  (list (cons 'status (if (status-ready?)
+                                                          HEALTH-SERVING HEALTH-NOT-SERVING)))))
+  (if ended?
+      (grpc-stream-close! h WG-OK)
+      (let loop ()
+        (let ((m (raw-receive)))
+          (cond
+            ((not (pair? m)) (loop))
+            ((eq? (car m) 'client-end) (grpc-stream-close! h WG-OK))   ; falls out -> exit
+            (else (loop)))))))

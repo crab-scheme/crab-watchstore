@@ -949,15 +949,19 @@
             ;; read THIS node's ctx via the pure mvcc-* helpers and NEVER propose a Raft entry,
             ;; so they touch neither the write/consensus path nor `pending`.  Replies are fully
             ;; SENDABLE (ints / a leader-name symbol / lists of bytevectors).
-            ;;   (status   reply-pid)      -> (status-ok rev term commit applied db-size leader)
+            ;;   (status   reply-pid)      -> (status-ok rev term commit applied db-size leader key-count)
             ;;   (hashkv   reply-pid rev)  -> (hashkv-ok hash compact-rev hash-rev)  (rev 0 = current)
             ;;   (snapshot reply-pid)      -> (snapshot-ok rev ((key . value) ...))
             ;;   (defrag   reply-pid)      -> (defrag-ok)
             ((eq? (car m) 'status)
              (let ((conn (cadr m))
                    (dig  (mvcc-digest-at ctx 0)))         ; (hash size count) at current rev
+               ;; cw-u4a.33: append the live key COUNT (caddr dig) as a trailing field so the
+               ;; /metrics endpoint (etcd_debugging_mvcc_keys_total) + the gRPC Health readiness
+               ;; check read it from the SAME digest this seam already computes for db-size — zero
+               ;; extra shard cost.  APPENDED, so handle-status (reads indices 1–6) is unaffected.
                (send conn (list 'status-ok (mvcc-current-rev ctx) (raft-term st)
-                                (raft-commit st) (raft-applied st) (cadr dig) leader)))
+                                (raft-commit st) (raft-applied st) (cadr dig) leader (caddr dig))))
              (loop st leader elapsed flush-base))
             ((eq? (car m) 'hashkv)
              (let* ((conn (cadr m)) (req-rev (caddr m))

@@ -184,6 +184,16 @@
 (define client-addr (string-append client-host ":" (number->string client-port)))
 (define shard-pid   (table-lookup 'ws-shard-pid (qk)))
 
+; ---- endpoint metrics/health/version HTTP port (cw-u4a.33) ----
+; etcd serves /metrics, /health and /version over plain HTTP on a SEPARATE listener
+; (--listen-metrics-urls); the client port here is Rust-owned h2c gRPC (hardcoded
+; application/grpc), which cannot serve plain HTTP, so the HTTP surface gets its own port.
+; Default = client-port + 10000 (well clear of the raft/client ranges); override with
+; --metrics-port.  It is endpoint-LOCAL (not part of cluster identity), so it stays OUT of the
+; --cluster spec — the 4-field name:host:raftport:clientport parse is unchanged.
+(define metrics-port
+  (string->number (arg-after "--metrics-port" (number->string (+ client-port 10000)))))
+
 ; name->peerURL table for the Cluster gRPC service (cw-u4a.30): each node's raft addr
 ; is its peer URL.  MemberList reports these (best-effort); runtime-added nodes that
 ; aren't in the spec report an empty peerURL.  A list of (name-string peerurl-string)
@@ -214,6 +224,17 @@
 (display client-addr) (display " (cluster-id=") (display cluster-id)
 (display " member-id=") (display member-id) (display ")") (newline)
 
-; The consensus substrate + etcd KV API are up. Park so the node process stays alive
-; serving Raft RPCs to peers and gRPC calls to clients.
+; ---- endpoint metrics/health/version HTTP server (cw-u4a.33) ----
+; A dedicated HTTP/1.1 listener on metrics-port, etcd's --listen-metrics-urls faithful.  The
+; gRPC Health service (grpc.health.v1.Health/Check + /Watch) rides the client-port gRPC server
+; above (new handlers, no Rust change); /health, /version and /metrics ride THIS listener.
+; Dedicated thread: tcp-accept blocks (no cooperative hook) and each request does a blocking
+; shard round-trip — both would freeze the shared green pool (green-threads INV-2/3), same as
+; the shard / poller / grpc-kv handler.  Reads this node's shard-0 replica via the un-gated .32
+; status seam; a bind failure is contained inside the actor (the node keeps serving gRPC).
+(spawn-source-dedicated "(include \"src/server/metrics-http.scm\")" 'metrics-http-main
+                        shard-pid (symbol->string me) client-host metrics-port)
+
+; The consensus substrate + etcd KV API + metrics endpoint are up. Park so the node process
+; stays alive serving Raft RPCs to peers and gRPC calls to clients.
 (let park () (yield) (park))

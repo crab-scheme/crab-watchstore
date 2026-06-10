@@ -603,6 +603,59 @@
                         (let ((nb (settle! #t old flush-base)))
                           (loop (maybe-compact st2 nb) node-name elapsed nb)))))))))
 
+            ;; ---- Lease keepalive: (lease-keepalive REPLY-PID ID) ----  (cw-u4a.18)
+            ;; Leader-local deadline reset — NOT a Raft entry (ADR 0003 §3).  Only
+            ;; the leader owns the `lease-deadlines` map; a non-leader replies the
+            ;; standard redirect.  If the lease-meta exists: reset the deadline to
+            ;; now + granted_ttl (a full fresh window) and reply (keepalive-ok id
+            ;; granted_ttl).  If the lease no longer exists (expired/revoked): reply
+            ;; (keepalive-ok id 0) — etcd's TTL-zero signal that the lease is gone.
+            ;; NO Raft round, NO rev bump (§6).
+            ((eq? (car m) 'lease-keepalive)
+             (let ((reply-pid (cadr m)) (id (caddr m)))
+               (if (not (raft-leader? st))
+                   (send reply-pid (cons 'lease-not-leader leader))
+                   (let ((ttl (mvcc-lease-meta-get ctx id)))
+                     (if ttl
+                         (begin
+                           (hashtable-set! lease-deadlines id (+ (current-second) ttl))
+                           (send reply-pid (list 'keepalive-ok id ttl)))
+                         (send reply-pid (list 'keepalive-ok id 0)))))
+               (loop st leader elapsed flush-base)))
+
+            ;; ---- Lease TTL: (lease-ttl REPLY-PID ID WITH-KEYS?) ----  (cw-u4a.18)
+            ;; Leader-gated pure read.  Replies (lease-ttl-ok id granted-ttl remaining keys):
+            ;;   granted-ttl : the replicated TTL from lease-meta (mvcc-lease-meta-get).
+            ;;   remaining   : ceil(deadline - now) from the leader-local map; -1 if the
+            ;;                 lease is absent/expired (no meta OR no deadline entry).
+            ;;   keys        : (mvcc-lease-keys ctx id) when with-keys? = #t, else '().
+            ;; Non-leader redirects.
+            ((eq? (car m) 'lease-ttl)
+             (let ((reply-pid (cadr m)) (id (caddr m)) (with-keys? (cadddr m)))
+               (if (not (raft-leader? st))
+                   (send reply-pid (cons 'lease-not-leader leader))
+                   (let ((ttl (mvcc-lease-meta-get ctx id)))
+                     (let* ((deadline (hashtable-ref lease-deadlines id #f))
+                            (now      (current-second))
+                            (remaining (if (and ttl deadline)
+                                           (max 0 (exact (ceiling (- deadline now))))
+                                           -1))
+                            (keys     (if with-keys? (mvcc-lease-keys ctx id) '())))
+                       (send reply-pid (list 'lease-ttl-ok id (if ttl ttl 0) remaining keys)))))
+               (loop st leader elapsed flush-base)))
+
+            ;; ---- Lease list: (lease-leases REPLY-PID) ----  (cw-u4a.18)
+            ;; Returns all live lease ids by scanning the NS-LEASE sentinel meta entries
+            ;; (mvcc-all-lease-ids — already the failover re-derivation source).  Kept
+            ;; leader-gated for consistency with keepalive/ttl (the ids are replicated so
+            ;; any node could serve it, but a single authoritative path simplifies testing).
+            ((eq? (car m) 'lease-leases)
+             (let ((reply-pid (cadr m)))
+               (if (not (raft-leader? st))
+                   (send reply-pid (cons 'lease-not-leader leader))
+                   (send reply-pid (list 'lease-leases-ok (mvcc-all-lease-ids ctx))))
+               (loop st leader elapsed flush-base)))
+
             ;; ---- linearizable read probe: (read CONN) ----
             ;; Solo serves inline (a round would never complete); multi-voter
             ;; ReadIndex: enqueue + (if idle) open a confirmation round; serve-batch!

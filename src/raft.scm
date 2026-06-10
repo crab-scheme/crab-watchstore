@@ -279,8 +279,13 @@
                                  'heard (add-mem from (aget st 'heard))))))
          (cons (maybe-commit st) '())))
       (else
+       ; Back off nextIndex on rejection — floor is base+1, NOT 1: entries <= base
+       ; are compacted into the snapshot, so entries-from/append-for cannot serve
+       ; them (a negative list-tail index -> crash; bug cw-u4a.39). Clamp to base+1;
+       ; the follower re-syncs from base+1 (all voters compact to the same base).
        (let* ((nx (cdr (assq from (aget st 'next))))
-              (st (aset* st (list 'next (aset (aget st 'next) from (max 1 (- nx 1)))
+              (st (aset* st (list 'next (aset (aget st 'next) from
+                                              (max (+ (aget st 'base) 1) (- nx 1)))
                                   'heard (add-mem from (aget st 'heard))))))
          (cons st (list (cons from (append-for st from)))))))))
 

@@ -31,12 +31,17 @@
 
 ; ---- one shard "0" replica per node (voters = all three), relaxed mode ----
 ; Distinct RocksDB dir per node so the in-process replicas never collide; opened
-; create-if-missing. A per-RUN unique suffix ((current-jiffy)) gives every run a
-; FRESH store, so a prior run's persisted applied-index can't make a replica skip
-; re-applying (persist-applied! restores applied from RocksDB on restart — exactly
-; what we want in prod, but it would skip the MVCC writes on a reused dir here, so
-; the keys+revisions would not match this run's expectations).
-(define run-tag (number->string (current-jiffy)))
+; create-if-missing. A per-RUN unique suffix gives every run a FRESH store, so a
+; prior run's persisted applied-index can't make a replica skip re-applying
+; (persist-applied! restores applied from RocksDB on restart — exactly what we want
+; in prod, but it would skip the MVCC writes on a reused dir here, so the
+; keys+revisions would not match this run's expectations).
+; NOTE: use WALL-CLOCK microseconds, not (current-jiffy): jiffy is process-relative
+; uptime, so separate `crabscheme run`s hit this line at ~the same tick -> the SAME
+; tag -> dirs reused -> accumulated state (stale revisions) + slow store-open. That
+; was the test-isolation half of bug cw-u4a.39's sim flakiness; current-second is
+; microsecond wall-clock and is unique across runs.
+(define run-tag (number->string (exact (round (* 1000000 (current-second))))))
 (define (db-dir nd)
   (string-append "/tmp/cws-sim-" run-tag "-" (symbol->string nd) "-s0"))
 (for-each

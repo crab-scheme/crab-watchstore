@@ -40,6 +40,20 @@
 (define durable (string=? (arg-after "--durable" "no") "yes"))
 (define cluster-spec (arg-after "--cluster" "a:127.0.0.1:7001:6001"))
 
+; ---- dynamic-membership join (cw-u4a.29) ----
+; `--join yes` brings this node up as a NON-VOTER that dials every existing member, then
+; waits to be added to the group (MemberAdd -> learner/voter) and catches up by Raft log
+; replication.  The --cluster spec must list ALL members INCLUDING this node (so the joiner
+; knows every raft addr to dial).  Without --join the node is a fresh-cluster voter — the
+; original Phase-0 behavior, byte-for-byte unchanged.  Join sequence:
+;   1. start an existing cluster normally (no --join);
+;   2. start the new node with --join yes + the full --cluster spec (it listens, dials all
+;      existing members, brings up shard+poller+gRPC as a non-voter);
+;   3. on the leader, MemberAdd the new node (as voter, or as learner then MemberPromote);
+;   4. the engine replicates the prior log to it (catch-up), the two-phase change commits,
+;      and it becomes a full voter — all over the live transport.
+(define join? (string=? (arg-after "--join" "no") "yes"))
+
 ; ---- optional TLS / mutual-TLS for the etcd gRPC CLIENT port (cw-u4a.21) ----
 ; When --tls-cert is supplied the client port is served over TLS instead of
 ; cleartext h2c.  --tls-ca + --tls-require-client-cert (default "yes") turn on
@@ -66,6 +80,12 @@
 (define (raft-addr nm) (string-append (node-field nm 1) ":" (number->string (node-field nm 2))))
 
 (define all-names (map car nodes))
+; everyone but me — the members this node dials when joining a live cluster (cw-u4a.29).
+(define existing-members
+  (let loop ((ns all-names) (acc '()))
+    (cond ((null? ns) (reverse acc))
+          ((eqv? (car ns) me) (loop (cdr ns) acc))
+          (else (loop (cdr ns) (cons (car ns) acc))))))
 
 (make-table 'ws-shard-pid "set")
 (make-table 'ws-shard-role "set")
@@ -77,12 +97,16 @@
 (node-make (symbol->string me))
 (node-listen (symbol->string me) (raft-addr me))
 
-; dial only higher-named peers (one connection per pair); retry until up.
+; dial only higher-named peers (one connection per pair); retry until up.  A JOINING node
+; instead dials EVERY existing member: it has the complete addr map and must establish the
+; links itself (the existing nodes don't know its address yet, cw-u4a.29).  Either way each
+; pair ends up with one full-duplex connection, so node-send works in both directions.
 (define (sym>? a b) (string>? (symbol->string a) (symbol->string b)))
-(define dial-peers (let loop ((ns all-names) (acc '()))
-                     (cond ((null? ns) (reverse acc))
-                           ((sym>? (car ns) me) (loop (cdr ns) (cons (car ns) acc)))
-                           (else (loop (cdr ns) acc)))))
+(define higher-named (let loop ((ns all-names) (acc '()))
+                       (cond ((null? ns) (reverse acc))
+                             ((sym>? (car ns) me) (loop (cdr ns) (cons (car ns) acc)))
+                             (else (loop (cdr ns) acc)))))
+(define dial-peers (if join? existing-members higher-named))
 (define (try-connect addr) (guard (e (#t #f)) (node-connect (symbol->string me) addr) #t))
 ; On a fresh start the dial-higher-named handshakes form the mesh; on a RESTART,
 ; peers re-dial us via their peer-poller heal, so we just wait for the full peer
@@ -98,8 +122,13 @@
 ; ---- single shard "0": one replica, voters = all nodes ----
 ; Dedicated thread — blocking RocksDB fsync must not freeze a shared green
 ; worker (green-threads INV-2).
+; A joiner starts as a NON-VOTER follower: its initial voter set is the EXISTING members (it
+; is added later via MemberAdd, then promoted), so it never campaigns before being admitted.
+; A fresh node is a voter in the full set.  Either way the live config arrives by replication
+; (adopted on append), overriding this bootstrap set.
+(define shard-voters (if join? existing-members all-names))
 (spawn-source-dedicated "(include \"src/server/shard-actor.scm\")" 'shard-main
-              "0" all-names me (string-append dbbase "-shard0") durable)
+              "0" shard-voters me (string-append dbbase "-shard0") durable)
 
 (define dial-addrs (map raft-addr dial-peers))
 ; Dedicated thread — the poller is the Raft tick-clock AND sole network drainer;
@@ -108,15 +137,20 @@
 (spawn-source-dedicated "(include \"src/server/peer-poller.scm\")" 'peer-poller
               me '("0") 120 dial-addrs (- (length nodes) 1))
 
-; wait until this node has elected/learned a leader for shard 0, so the substrate
-; is ready before we report up.
+; wait until this node has elected/learned a leader for shard 0, so the substrate is ready
+; before we report up.  A JOINER is not in consensus yet (no leader until MemberAdd lands +
+; it catches up), so it does NOT wait — it parks and starts serving once promoted+elected.
 (define (qk) (string-append (symbol->string me) ":0"))
-(let spin ()
-  (if (table-lookup 'ws-shard-leader (qk)) #t (spin)))
-
-(display "node ") (display me) (display ": shard 0 ready (leader=")
-(display (table-lookup 'ws-shard-leader (qk))) (display ", role=")
-(display (table-lookup 'ws-shard-role (qk))) (display ")") (newline)
+(if join?
+    (begin
+      (display "node ") (display me)
+      (display ": joined mesh as a non-voter — awaiting MemberAdd (catch-up + promote)") (newline))
+    (begin
+      (let spin ()
+        (if (table-lookup 'ws-shard-leader (qk)) #t (spin)))
+      (display "node ") (display me) (display ": shard 0 ready (leader=")
+      (display (table-lookup 'ws-shard-leader (qk))) (display ", role=")
+      (display (table-lookup 'ws-shard-role (qk))) (display ")") (newline)))
 
 ; ---- etcd v3 KV gRPC service (cw-u4a.22) ----
 ; The clientport in the --cluster spec (long parsed-but-unused) is THIS node's etcd

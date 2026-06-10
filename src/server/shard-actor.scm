@@ -56,6 +56,18 @@
   (let* ((handle  (store-open db-path #t))      ; create-if-missing
          (ctx     (make-ctx handle "default" sync?))
          (pending (make-eqv-hashtable))          ; log-index -> conn-pid
+         ; ---- dynamic membership (cw-u4a.29) — LEADER-LOCAL, additive. `member-reply-pid`
+         ; is the pid of the caller awaiting the in-flight member-add/remove/promote (one at
+         ; a time, gated by conf-change-pending?); it is acked only when the ConfChange fully
+         ; settles (simple/learner committed, or the joint's auto-Cnew committed), or replied
+         ; 'member-indeterminate when this leader steps down mid-change. `conf-skip` holds the
+         ; ABSOLUTE log indices of ConfChange entries: apply-committed advances `applied` past
+         ; them WITHOUT calling apply-fn, so they carry NO `acc` slot — drain! must skip those
+         ; indices or the next client write's ack shifts onto the conf index (a cross-wire).
+         ; Both are empty/idle on a follower and on the fixed-config path (no member-* ever),
+         ; so this is strictly additive — drain! with an empty conf-skip is the original loop.
+         (member-reply-pid #f)
+         (conf-skip (make-eqv-hashtable))         ; absolute log-index -> #t for ConfChange entries
          (acc     '())                           ; apply markers, newest-first (apply order)
          (read-q  '())                           ; ReadIndex: reads awaiting a round, (conn . #f)
          (batch   '())                           ; ReadIndex: reads the open round is confirming
@@ -133,13 +145,20 @@
            (node-send (symbol->string node-name) (symbol->string (car o))
                       (list 'ws-engine shard-key node-name (cdr o)))))
        outs))
-    ; match in-order applied replies to the indices that produced them
+    ; match in-order applied replies to the indices that produced them. `acc` holds one
+    ; slot per applied NON-conf entry (apply-fn pushes it; the no-op barrier pushes #f); a
+    ; ConfChange entry applies WITHOUT an `acc` slot, so its index must be SKIPPED here (no
+    ; acc slot consumed) — otherwise the next client write's reply lands on the conf index
+    ; and every following reply shifts by one (a cross-wire). With an empty conf-skip (the
+    ; fixed-config path) this is the original positional loop, unchanged (cw-u4a.29).
     (define (drain! old-applied)
-      (let loop ((k 0) (rs (reverse acc)))
+      (let loop ((idx (+ old-applied 1)) (rs (reverse acc)))
         (if (pair? rs)
-            (let* ((idx (+ old-applied 1 k)) (conn (hashtable-ref pending idx #f)))
-              (if conn (begin (send conn (car rs)) (hashtable-delete! pending idx)))
-              (loop (+ k 1) (cdr rs)))))
+            (if (hashtable-contains? conf-skip idx)
+                (loop (+ idx 1) rs)                       ; conf entry: no acc slot — skip index
+                (let ((conn (hashtable-ref pending idx #f)))
+                  (if conn (begin (send conn (car rs)) (hashtable-delete! pending idx)))
+                  (loop (+ idx 1) (cdr rs))))))
       (set! acc '()))
 
     ; On losing leadership, every conn still in `pending` is a write this node
@@ -167,6 +186,12 @@
       (for-each (lambda (e) (send (car e) 'tryagain)) batch)
       (for-each (lambda (e) (send (car e) 'tryagain)) read-q)
       (set! batch '()) (set! read-q '()) (set! read-acks '()) (set! round-open? #f)
+      ; cw-u4a.29: drop the ConfChange skip-indices on stepdown — `pending` was just
+      ; cleared above, so a later drain! has no client waiter to mis-route, and a fresh
+      ; leader re-derives skip-indices as it proposes. (The in-flight member-* caller, if
+      ; any, is acked at the stepdown CALL SITE: 'member-indeterminate on a deposing higher
+      ; term / lost quorum, or 'member-ok when the change's own Cnew committed.)
+      (hashtable-clear! conf-skip)
       ; Drop the leader-local lease deadlines + in-flight revokes on stepdown — the
       ; replicated TTLs are safe in the meta entries, and the next leader re-derives a
       ; fresh full window (ADR 0003 §2).  Harmless to discard.
@@ -263,6 +288,34 @@
       (table-insert! 'ws-shard-leader (qk) leader)
       (table-insert! 'ws-shard-commit (qk) (raft-commit st))
       (table-insert! 'ws-shard-applied (qk) (raft-applied st)))
+
+    ; ---- dynamic membership: propose a member change + settle its async ack (cw-u4a.29) ----
+    ; propose-member! is LEADER-ONLY (callers gate on raft-leader? + (not conf-change-pending?)).
+    ; It records the awaiting reply-pid + the new ConfChange entry's index (for drain! to skip),
+    ; proposes through the SAME engine entry the pure tests use (raft-propose-conf-change), ships
+    ; the resulting AppendEntries to the (now config-updated) peers via emit!, republishes, and
+    ; returns st'. The config is adopted on APPEND (engine recompute-config), so st''s 'peers
+    ; already includes the new member — emit! reaches it on this/the next heartbeat. The member
+    ; ACK is async (settle-member!, from the AER path), so the caller hears the outcome only once
+    ; the change commits on a quorum (mirrors the client-write commit->ack bridge).
+    (define (propose-member! reply-pid target-voters target-learners st)
+      (set! member-reply-pid reply-pid)
+      (hashtable-set! conf-skip (+ 1 (log-len st)) #t)         ; the ConfChange entry's index
+      (let* ((r (raft-propose-conf-change st target-voters target-learners))
+             (st1 (car r)))
+        (emit! (cdr r))
+        (publish! st1 node-name)
+        st1))
+    ; Ack the in-flight member change once it has FULLY settled: conf-change-pending? is #f
+    ; only after a simple/learner entry committed OR the joint's auto-Cnew committed (Ongaro
+    ; §4.3 leave-joint). This also fires when a leader removed ITSELF and is stepping down on
+    ; the committed Cnew — the removal succeeded, so it still acks 'member-ok. Reply the
+    ; resulting config (voters + learners). A strict no-op when no change is in flight.
+    (define (settle-member! st)
+      (if (and member-reply-pid (not (conf-change-pending? st)))
+          (begin
+            (send member-reply-pid (list 'member-ok (aget st 'voters) (aget st 'learners)))
+            (set! member-reply-pid #f))))
 
     ; ---- Lease expiry: leader-driven scan + replicated revoke (cw-u4a.17) ----
     ;
@@ -398,11 +451,26 @@
                                  (begin (flush-and-drain! flush-base) #f)
                                  flush-base))
                          (old (raft-applied st))
+                         (old-loglen (log-len st))          ; cw-u4a.29: detect an auto-appended Cnew
                          (r (raft-step st from rpc)) (st2 (car r)))
                     ; leader -> follower: 'indeterminate the remaining (now
                     ; uncommitted) in-flight proposals + clear pending, before any
                     ; drain! can cross-wire them (H1).
                     (if (and was-leader? (not (raft-leader? st2))) (fail-pending!))
+                    ; cw-u4a.29 membership: on the joint-commit AER the engine auto-appends
+                    ; the Cnew (leave-joint) entry — record its index so drain! skips it (it
+                    ; carries no `acc` slot). Then settle the in-flight member-* ack: a
+                    ; deposing higher term makes the outcome indeterminate; otherwise the
+                    ; change is done exactly when conf-change-pending? clears (Cnew / simple
+                    ; committed), which also covers a leader that removed ITSELF and is now
+                    ; stepping down on that committed Cnew (it still acks 'member-ok).
+                    (if (and member-reply-pid (> (log-len st2) old-loglen))
+                        (hashtable-set! conf-skip (log-len st2) #t))
+                    (cond
+                      ((and member-reply-pid depose?)
+                       (send member-reply-pid 'member-indeterminate)
+                       (set! member-reply-pid #f))
+                      (else (settle-member! st2)))
                     ; record the new applied-index in the batch BEFORE the fsync
                     (if (> (raft-applied st2) old) (persist-applied! st2))
                     ; HOLE 1 fix: a FOLLOWER fsyncs its applied writes (one flush)
@@ -451,7 +519,14 @@
                         ; the heartbeat path is unchanged for the leaseless sim-cluster.
                         (let ((lr (lease-tick! (car r) #f)))
                           (loop (maybe-compact (car lr) (cdr lr)) node-name 0 (cdr lr))))
-                      (begin (fail-pending!) (publish! cq #f)
+                      (begin (fail-pending!)
+                             ; cw-u4a.29: a leader that loses quorum and steps down can no
+                             ; longer confirm an in-flight member change — its outcome is
+                             ; indeterminate (a surviving quorum may yet commit it or not).
+                             (if member-reply-pid
+                                 (begin (send member-reply-pid 'member-indeterminate)
+                                        (set! member-reply-pid #f)))
+                             (publish! cq #f)
                              (loop cq #f 0 #f)))))
                (solo (loop (maybe-compact st #f) leader elapsed #f))
                ((>= elapsed timeout)
@@ -790,6 +865,79 @@
                    (send reply-pid (cons 'lease-not-leader leader))
                    (send reply-pid (list 'lease-leases-ok (mvcc-all-lease-ids ctx))))
                (loop st leader elapsed flush-base)))
+
+            ;; ---- Membership: add / remove / promote / list (cw-u4a.29) ----
+            ;; Dynamic Raft membership bound to the live actor/transport layer. The three
+            ;; mutating ops are LEADER-GATED exactly like watch-register / lease-grant — a
+            ;; non-leader REDIRECTS, ('member-not-leader . LEADER), so the .30 Cluster gRPC /
+            ;; a test re-targets the leader — and serialized: a second change while one is in
+            ;; flight is refused ('member-pending), matching the engine's one-at-a-time rule
+            ;; (conf-change-pending?). Each proposes through raft-propose-conf-change (the
+            ;; SAME entry the pure raft-membership tests drive) and is acked ASYNCHRONOUSLY,
+            ;; (list 'member-ok voters learners), only once the change COMMITS (settle-member!,
+            ;; from the AER path) — the caller learns the outcome only after the new config is
+            ;; durable on a quorum. The config is adopted on APPEND, so st's 'peers (hence
+            ;; emit!) already targets the new member; in the sim the test node-link!s it first,
+            ;; over real TCP the joiner node-connects (see node-cluster.scm --join).
+            ;;   (member-add     REPLY-PID NODE-NAME AS-LEARNER?)  add a voter, or a learner
+            ;;   (member-remove  REPLY-PID NODE-NAME)              drop a voter/learner
+            ;;   (member-promote REPLY-PID NODE-NAME)              learner -> voter (two-phase)
+            ;;   (member-list    REPLY-PID)                        read THIS node's config view
+            ((eq? (car m) 'member-add)
+             (let ((reply-pid (cadr m)) (nn (caddr m)) (as-learner? (cadddr m)))
+               (cond
+                 ((not (raft-leader? st))
+                  (send reply-pid (cons 'member-not-leader leader))
+                  (loop st leader elapsed flush-base))
+                 ((conf-change-pending? st)
+                  (send reply-pid 'member-pending)
+                  (loop st leader elapsed flush-base))
+                 (else
+                  ; voter add changes the voter set (two-phase joint); learner add leaves the
+                  ; voter set unchanged (single-phase simple) — the engine picks which.
+                  (let ((st1 (propose-member! reply-pid
+                              (if as-learner? (aget st 'voters) (add-mem nn (aget st 'voters)))
+                              (if as-learner? (add-mem nn (aget st 'learners)) (aget st 'learners))
+                              st)))
+                    (loop st1 node-name elapsed flush-base))))))
+            ((eq? (car m) 'member-remove)
+             (let ((reply-pid (cadr m)) (nn (caddr m)))
+               (cond
+                 ((not (raft-leader? st))
+                  (send reply-pid (cons 'member-not-leader leader))
+                  (loop st leader elapsed flush-base))
+                 ((conf-change-pending? st)
+                  (send reply-pid 'member-pending)
+                  (loop st leader elapsed flush-base))
+                 (else
+                  ; drop nn from both sets; if nn is the leader (self), the engine steps it
+                  ; down only AFTER the Cnew commits (Ongaro §4.3) — settle-member! still acks.
+                  (let ((st1 (propose-member! reply-pid
+                              (others nn (aget st 'voters))
+                              (others nn (aget st 'learners))
+                              st)))
+                    (loop st1 node-name elapsed flush-base))))))
+            ((eq? (car m) 'member-promote)
+             (let ((reply-pid (cadr m)) (nn (caddr m)))
+               (cond
+                 ((not (raft-leader? st))
+                  (send reply-pid (cons 'member-not-leader leader))
+                  (loop st leader elapsed flush-base))
+                 ((conf-change-pending? st)
+                  (send reply-pid 'member-pending)
+                  (loop st leader elapsed flush-base))
+                 (else
+                  ; move nn from learners into voters — a voter-set change, so two-phase.
+                  (let ((st1 (propose-member! reply-pid
+                              (add-mem nn (aget st 'voters))
+                              (others nn (aget st 'learners))
+                              st)))
+                    (loop st1 node-name elapsed flush-base))))))
+            ;; member-list is a pure read of THIS node's replicated config (adopted on append),
+            ;; so it is NOT leader-gated — a test can query every node to assert convergence.
+            ((eq? (car m) 'member-list)
+             (send (cadr m) (list 'member-list (aget st 'voters) (aget st 'learners)))
+             (loop st leader elapsed flush-base))
 
             ;; ---- linearizable read probe: (read CONN) ----
             ;; Solo serves inline (a round would never complete); multi-voter

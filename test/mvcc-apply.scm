@@ -9,6 +9,7 @@
 (include "test/harness.scm")
 (include "src/store-ctx.scm")
 (include "src/mvcc.scm")
+(include "src/auth.scm")      ; NS-AUTH + the auth check — mvcc-apply's AUTH-* cases (cw-u4a.26)
 (include "test/mvcc-util.scm")
 
 ; ---- open a fresh store (unique per run; substrate has no system/rm -rf) ----
@@ -19,6 +20,7 @@
 ; Guarantee isolation: (current-jiffy) is process-relative, so back-to-back runs
 ; reuse the same dir — empty the store before building any state.
 (reset-ctx! CTX)
+(reset-ns! CTX NS-AUTH)       ; NS-AUTH is this task's namespace — clear it too
 
 ; ---- helpers ----
 (define (b s) (string->utf8 s))
@@ -120,5 +122,74 @@
 ; ===========================================================================
 (section "META current-rev matches last bump")
 (check "current-rev = 9 (last PUT lk)" 9 (mvcc-current-rev CTX))
+
+; ===========================================================================
+; AUTH-* apply path (cw-u4a.26, ADR 0004 §2) — NS-AUTH mutations, separate
+; auth-revision, and the load-bearing authorize decision over the REAL store.
+; ===========================================================================
+(define (auth . parts) (mvcc-apply CTX (map ->bv parts)))   ; AUTH-* with bytevector args
+(define root-hash (crypto-password-hash "rootpw"))          ; real Argon2id PHC (global builtin)
+(define (user-add name hash) (mvcc-apply CTX (list (b "AUTH-USER-ADD") (b name) (string->utf8 hash))))
+
+(section "auth starts disabled, auth-rev 0; keyspace current-rev untouched by auth")
+(check "auth-enabled? #f initially" #f (auth-enabled? CTX))
+(check "auth-rev 0 initially"        0 (auth-rev CTX))
+
+(section "AUTH-ENABLE refused until a root user holds the root role (etcd guard)")
+; auth-rev bumps +1 per SUCCESSFUL mutation; the rejected ENABLE does NOT bump.
+(check "USER-ADD root -> AUTH-OK rev 1" (cons "AUTH-OK" 1) (user-add "root" root-hash))
+(check "ENABLE w/o root role -> err-root-role-not-exist (no bump)"
+       'err-root-role-not-exist (car (auth "AUTH-ENABLE")))
+(check "ROLE-ADD root -> AUTH-OK rev 2" (cons "AUTH-OK" 2) (auth "AUTH-ROLE-ADD" "root"))
+(check "GRANT-ROLE root root -> AUTH-OK rev 3" (cons "AUTH-OK" 3) (auth "AUTH-USER-GRANT-ROLE" "root" "root"))
+(check "ENABLE now succeeds -> AUTH-OK rev 4" (cons "AUTH-OK" 4) (auth "AUTH-ENABLE"))
+(check "auth-enabled? #t" #t (auth-enabled? CTX))
+
+(section "stored root PHC verifies the password (Argon2id round-trip through NS-AUTH)")
+(let ((u (auth-get-user CTX (b "root"))))
+  (check "root pw verifies"  #t (crypto-password-verify "rootpw" (utf8->string (auth-user-hash u))))
+  (check "wrong pw rejected" #f (crypto-password-verify "nope"   (utf8->string (auth-user-hash u)))))
+
+(section "alice + dev role: readwrite app/ (prefix [app/, app0))")
+(user-add "alice" (crypto-password-hash "alicepw"))
+(auth "AUTH-ROLE-ADD" "dev")
+(auth "AUTH-ROLE-GRANT-PERM" "dev" "2" "app/" "app0")   ; permType 2 = READWRITE
+(auth "AUTH-USER-GRANT-ROLE" "alice" "dev")
+
+(section "authorize: alice within app/ prefix; denied beyond; root override")
+(check "alice WRITE app/x allowed"  #t (auth-authorize? CTX (b "alice") (b "app/x") #f 'write))
+(check "alice READ  app/x allowed"  #t (auth-authorize? CTX (b "alice") (b "app/x") #f 'read))
+(check "alice WRITE other/y DENIED" #f (auth-authorize? CTX (b "alice") (b "other/y") #f 'write))
+(check "root WRITE anywhere allowed (root role)"
+       #t (auth-authorize? CTX (b "root") (b "anywhere") #f 'write))
+(check "unknown user DENIED" #f (auth-authorize? CTX (b "nobody") (b "app/x") #f 'read))
+
+(section "duplicate / not-found guards")
+(check "USER-ADD alice again -> err-user-exists"
+       'err-user-exists (car (user-add "alice" root-hash)))
+(check "ROLE-ADD dev again -> err-role-exists"
+       'err-role-exists (car (auth "AUTH-ROLE-ADD" "dev")))
+(check "GRANT-PERM on missing role -> err-role-not-found"
+       'err-role-not-found (car (auth "AUTH-ROLE-GRANT-PERM" "ghost" "0" "k" "")))
+
+(section "REVOKE-ROLE removes the grant; ROLE-DELETE strips the role from every user")
+(auth "AUTH-USER-REVOKE-ROLE" "alice" "dev")
+(check "alice WRITE app/x now DENIED (role revoked)"
+       #f (auth-authorize? CTX (b "alice") (b "app/x") #f 'write))
+(auth "AUTH-USER-GRANT-ROLE" "alice" "dev")              ; re-grant, then delete the role
+(check "alice WRITE app/x allowed again" #t (auth-authorize? CTX (b "alice") (b "app/x") #f 'write))
+(auth "AUTH-ROLE-DELETE" "dev")
+(check "alice no longer holds dev after ROLE-DELETE"
+       #f (let ((u (auth-get-user CTX (b "alice")))) (member (b "dev") (auth-user-roles u))))
+(check "alice WRITE app/x DENIED after ROLE-DELETE"
+       #f (auth-authorize? CTX (b "alice") (b "app/x") #f 'write))
+
+(section "AUTH-DISABLE -> every request allowed again")
+(auth "AUTH-DISABLE")
+(check "auth-enabled? #f after disable" #f (auth-enabled? CTX))
+(check "disabled -> even unknown user allowed" #t (auth-authorize? CTX (b "nobody") (b "x") #f 'write))
+
+(section "auth mutations NEVER bumped the keyspace current-rev (still 9)")
+(check "current-rev still 9 after all auth ops" 9 (mvcc-current-rev CTX))
 
 (done!)

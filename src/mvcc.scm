@@ -871,6 +871,41 @@
             (loop (cdr vs) (+ s 1) (+ n 1)))))))
 
 ; ---------------------------------------------------------------------------
+; AUTH-* apply support (cw-u4a.26 — NS-AUTH command vocabulary, ADR 0004 §2)
+; ---------------------------------------------------------------------------
+;
+; The NS-AUTH storage primitives + the pure permission check live in src/auth.scm
+; (cw-u4a.25); these two helpers are the only extra machinery mvcc-apply's AUTH-*
+; cases need.  They reference auth.scm's perm-key/perm-rend accessors at CALL time,
+; so a consumer that includes mvcc.scm but never drives an AUTH-* command (e.g. the
+; grpc-kv handler, which proposes auth commands to the shard rather than applying
+; them) does not need auth.scm loaded.  The shard actor + the mvcc-apply unit test —
+; the real appliers — DO include src/auth.scm.
+
+; remove every bytevector equal? to X from a list (REVOKE-ROLE / ROLE-DELETE strip).
+(define (auth-remove-bv x lst)
+  (let loop ((l lst) (acc '()))
+    (cond ((null? l) (reverse acc))
+          ((equal? (car l) x) (loop (cdr l) acc))
+          (else (loop (cdr l) (cons (car l) acc))))))
+
+; does permission P cover the SAME (key, range-end) as the command's (KEY, REND)?
+; REND is the raw command bytevector (empty => single-key); normalise empty<->#f so
+; an empty range-end matches a #f-stored single-key permission and vice versa.
+(define (auth-perm-range=? p key rend)
+  (and (equal? (perm-key p) key)
+       (let ((pr (perm-rend p)))
+         (equal? (if (= (bytevector-length pr) 0) #f pr)
+                 (if (= (bytevector-length rend) 0) #f rend)))))
+
+; drop any permission on (KEY, REND) from PERMS (REVOKE-PERM, and re-GRANT replace).
+(define (auth-perms-drop-range perms key rend)
+  (let loop ((l perms) (acc '()))
+    (cond ((null? l) (reverse acc))
+          ((auth-perm-range=? (car l) key rend) (loop (cdr l) acc))
+          (else (loop (cdr l) (cons (car l) acc))))))
+
+; ---------------------------------------------------------------------------
 ; mvcc-apply  (ADR §2 — one Raft entry = one Txn = one main revision)
 ; ---------------------------------------------------------------------------
 ;
@@ -965,6 +1000,104 @@
        ; threads sub-revisions, and persists current-rev iff it bumped.
        ; Returns (succeeded? . responses).  Defined in src/txn.scm.
        (txn-apply ctx (list-ref cmd 1) prev-rev))
+
+      ;; ===== Auth / RBAC mutations (cw-u4a.26, ADR 0004 §2) =====
+      ;; Each writes NS-AUTH (via auth-put-*/auth-set-enabled! + auth.scm key
+      ;; builders) and bumps the SEPARATE auth-revision (auth-bump-rev!) — NEVER
+      ;; the keyspace current-rev (auth is not a keyspace effect, exactly like
+      ;; LEASE-GRANT).  One committed Raft entry applied identically on every
+      ;; replica, so auth state is replicated + survives leader change for free.
+      ;; Success ack: (cons "AUTH-OK" new-auth-rev); failures: (cons 'err-* detail)
+      ;; which grpc-kv maps to the etcd-faithful gRPC status (.27 error table).
+      ((string=? op "AUTH-ENABLE")
+       ; etcd guard: a user named "root" holding the "root" role must exist.
+       (let ((ru (auth-get-user ctx AUTH-ROOT-ROLE)))   ; "root" user (name == role bytes)
+         (cond
+           ((not ru) (cons 'err-root-user-not-exist 0))
+           ((not (auth-has-root-role? (auth-user-roles ru))) (cons 'err-root-role-not-exist 0))
+           (else (auth-set-enabled! ctx #t) (cons "AUTH-OK" (auth-bump-rev! ctx))))))
+      ((string=? op "AUTH-DISABLE")
+       (auth-set-enabled! ctx #f)
+       (cons "AUTH-OK" (auth-bump-rev! ctx)))
+      ((string=? op "AUTH-USER-ADD")             ; ("AUTH-USER-ADD" name hash)
+       (let ((name (list-ref cmd 1)) (hash (list-ref cmd 2)))
+         (if (auth-get-user ctx name)
+             (cons 'err-user-exists name)
+             (begin (auth-put-user! ctx name hash '())
+                    (cons "AUTH-OK" (auth-bump-rev! ctx))))))
+      ((string=? op "AUTH-USER-DELETE")          ; ("AUTH-USER-DELETE" name)
+       (let ((name (list-ref cmd 1)))
+         (if (not (auth-get-user ctx name))
+             (cons 'err-user-not-found name)
+             (begin (kv-del! ctx (auth-user-key name))
+                    (cons "AUTH-OK" (auth-bump-rev! ctx))))))
+      ((string=? op "AUTH-USER-CHPASS")          ; ("AUTH-USER-CHPASS" name hash)
+       (let ((name (list-ref cmd 1)) (hash (list-ref cmd 2)))
+         (let ((u (auth-get-user ctx name)))
+           (if (not u)
+               (cons 'err-user-not-found name)
+               (begin (auth-put-user! ctx name hash (auth-user-roles u))
+                      (cons "AUTH-OK" (auth-bump-rev! ctx)))))))
+      ((string=? op "AUTH-USER-GRANT-ROLE")      ; ("AUTH-USER-GRANT-ROLE" name role)
+       (let ((name (list-ref cmd 1)) (role (list-ref cmd 2)))
+         (let ((u (auth-get-user ctx name)))
+           (if (not u)
+               (cons 'err-user-not-found name)
+               (let ((roles (auth-user-roles u)))
+                 (auth-put-user! ctx name (auth-user-hash u)
+                                 (if (member role roles) roles (append roles (list role))))
+                 (cons "AUTH-OK" (auth-bump-rev! ctx)))))))
+      ((string=? op "AUTH-USER-REVOKE-ROLE")     ; ("AUTH-USER-REVOKE-ROLE" name role)
+       (let ((name (list-ref cmd 1)) (role (list-ref cmd 2)))
+         (let ((u (auth-get-user ctx name)))
+           (if (not u)
+               (cons 'err-user-not-found name)
+               (begin (auth-put-user! ctx name (auth-user-hash u)
+                                      (auth-remove-bv role (auth-user-roles u)))
+                      (cons "AUTH-OK" (auth-bump-rev! ctx)))))))
+      ((string=? op "AUTH-ROLE-ADD")             ; ("AUTH-ROLE-ADD" name)
+       (let ((name (list-ref cmd 1)))
+         (if (auth-get-role ctx name)
+             (cons 'err-role-exists name)
+             (begin (auth-put-role! ctx name '())
+                    (cons "AUTH-OK" (auth-bump-rev! ctx))))))
+      ((string=? op "AUTH-ROLE-DELETE")          ; ("AUTH-ROLE-DELETE" name)
+       (let ((role (list-ref cmd 1)))
+         (if (not (auth-get-role ctx role))
+             (cons 'err-role-not-found role)
+             (begin
+               ; etcd semantics: strip the deleted role from EVERY user.
+               (for-each
+                (lambda (uname)
+                  (let ((u (auth-get-user ctx uname)))
+                    (if u (auth-put-user! ctx uname (auth-user-hash u)
+                                          (auth-remove-bv role (auth-user-roles u))))))
+                (auth-all-users ctx))
+               (kv-del! ctx (auth-role-key role))
+               (cons "AUTH-OK" (auth-bump-rev! ctx))))))
+      ((string=? op "AUTH-ROLE-GRANT-PERM")      ; ("AUTH-ROLE-GRANT-PERM" role ptype key rend)
+       (let ((role  (list-ref cmd 1))
+             (ptype (bytes->int (list-ref cmd 2)))
+             (key   (list-ref cmd 3))
+             (rend  (list-ref cmd 4)))
+         ; auth-get-role returns #f ONLY for an absent role ('() = exists, no perms).
+         (let ((perms (auth-get-role ctx role)))
+           (if (not perms)
+               (cons 'err-role-not-found role)
+               (let* ((np (auth-make-perm (if ptype ptype 0) key
+                                          (if (= (bytevector-length rend) 0) #f rend)))
+                      ; replace any existing perm on the same (key,rend), then append.
+                      (newperms (append (auth-perms-drop-range perms key rend) (list np))))
+                 (auth-put-role! ctx role newperms)
+                 (cons "AUTH-OK" (auth-bump-rev! ctx)))))))
+      ((string=? op "AUTH-ROLE-REVOKE-PERM")     ; ("AUTH-ROLE-REVOKE-PERM" role key rend)
+       (let ((role (list-ref cmd 1)) (key (list-ref cmd 2)) (rend (list-ref cmd 3)))
+         (let ((perms (auth-get-role ctx role)))
+           (if (not perms)
+               (cons 'err-role-not-found role)
+               (begin (auth-put-role! ctx role (auth-perms-drop-range perms key rend))
+                      (cons "AUTH-OK" (auth-bump-rev! ctx)))))))
+
       (else
        (error "mvcc-apply: unknown command" op)))))
 

@@ -41,6 +41,8 @@
 (include "src/encoding.scm")
 (include "src/store-ctx.scm")
 (include "src/mvcc.scm")
+(include "src/auth.scm")      ; NS-AUTH storage + permission check (cw-u4a.25/.26): the
+                              ; shard applies AUTH-* (mvcc-apply) + serves the auth read seams.
 (include "src/watch.scm")     ; Watch backend: registry + replay->live dispatch (cw-u4a.13)
 (include "src/raft.scm")
 
@@ -542,6 +544,34 @@
             ((eq? (car m) 'cur-rev)
              (let ((conn (cadr m)))
                (send conn (list 'cur-rev-ok (mvcc-current-rev ctx) (raft-term st))))
+             (loop st leader elapsed flush-base))
+
+            ;; ---- Auth read seams (cw-u4a.26) — pure reads over NS-AUTH on THIS
+            ;; node's committed ctx (auth.scm).  The gRPC handler (grpc-kv) owns the
+            ;; leader-local token table + identity resolution; it asks here for the
+            ;; replicated auth STATE (the ctx lives in this actor).  Single-node = always
+            ;; leader, so served inline like cur-rev (no leader gate needed for v1).
+            ;;   (auth-state CONN)                         -> (auth-state-ok enabled? auth-rev)
+            ;;   (auth-authorize CONN USER KEY REND REQ)   -> (auth-authorize-ok decision)
+            ;;   (auth-lookup CONN NAME)                   -> (auth-lookup-ok exists? hash admin? auth-rev)
+            ;; USER/NAME/KEY are bytevectors (or #f for no-identity USER); REQ is 'read|'write.
+            ((eq? (car m) 'auth-state)
+             (send (cadr m) (list 'auth-state-ok (auth-enabled? ctx) (auth-rev ctx)))
+             (loop st leader elapsed flush-base))
+            ((eq? (car m) 'auth-authorize)
+             (let ((conn (cadr m)) (user (caddr m)) (key (cadddr m))
+                   (rend (list-ref m 4)) (req (list-ref m 5)))
+               (send conn (list 'auth-authorize-ok
+                                (auth-authorize? ctx user key rend req))))
+             (loop st leader elapsed flush-base))
+            ((eq? (car m) 'auth-lookup)
+             (let* ((conn (cadr m)) (name (caddr m))
+                    (u (auth-get-user ctx name)))
+               (send conn
+                     (if u
+                         (list 'auth-lookup-ok #t (auth-user-hash u)
+                               (auth-has-root-role? (auth-user-roles u)) (auth-rev ctx))
+                         (list 'auth-lookup-ok #f #f #f (auth-rev ctx)))))
              (loop st leader elapsed flush-base))
 
             ;; ---- test-support: (lease-probe CONN ID KEYS) -> revoke proof on THIS

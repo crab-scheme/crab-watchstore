@@ -83,10 +83,14 @@
 
 ; gRPC status codes used here
 (define GRPC-OK            0)
+(define GRPC-INVALID-ARGUMENT  3)   ; ErrUserEmpty / ErrAuthFailed (etcd Auth, .26)
+(define GRPC-PERMISSION-DENIED 7)   ; ErrPermissionDenied (the authz hook deny)
+(define GRPC-FAILED-PRECONDITION 9) ; auth admin errors (user/role exists/not-found, root)
 (define GRPC-OUT-OF-RANGE 11)   ; ErrCompacted surfaces here (etcd convention)
 (define GRPC-UNIMPLEMENTED 12)
 (define GRPC-UNAVAILABLE   14)   ; not-leader: client retries another endpoint
 (define GRPC-INTERNAL      13)
+(define GRPC-UNAUTHENTICATED 16) ; ErrInvalidAuthToken (present-but-bad token)
 
 ; etcd's ErrCompacted gRPC message (what a real client matches on)
 (define ETCD-ERR-COMPACTED "etcdserver: mvcc: required revision has been compacted")
@@ -340,6 +344,112 @@
   (define (shard-write cmd) (ask-shard (cons (self) cmd)))
 
   ; ===========================================================================
+  ; Auth enforcement (cw-u4a.26, ADR 0004 §4/§5) — the leader-local token table +
+  ; identity resolution + the per-request authorization hook.
+  ; ===========================================================================
+  ; The replicated auth STATE (users/roles/enabled/auth-rev) lives in the shard's
+  ; NS-AUTH; THIS actor owns only the ephemeral token table — etcd's `simple` token:
+  ; leader-local, dropped on restart, the client just re-Authenticates.
+
+  ; token-string -> (username-string . issue-auth-rev).  string=? keyed so a token
+  ; read from request metadata (a fresh allocation) matches the one minted here.
+  (define token-table (make-hashtable string-hash string=?))
+
+  ; Resolve THIS request's identity (ADR §4 precedence: token header wins, else the
+  ; verified client-cert CN, else none).  cur-auth-rev gates token staleness: an auth
+  ; mutation bumps auth-rev, so a token issued at an older rev is rejected (re-auth).
+  ;   -> (cons 'user name-str) | 'bad-token | 'none
+  (define (resolve-identity h cur-auth-rev)
+    (let ((tok (grpc-request-metadata h "token")))
+      (if (and tok (> (string-length tok) 0))
+          (let ((entry (hashtable-ref token-table tok #f)))
+            (if (and entry (>= (cdr entry) cur-auth-rev))
+                (cons 'user (car entry))
+                'bad-token))                          ; unknown / stale token -> re-auth
+          (let ((peer (grpc-request-peer-identity h)))
+            (if peer (cons 'user peer) 'none)))))     ; cert-CN, else unauthenticated
+
+  ; Resolve identity against the CURRENT replicated auth state.  Returns one of:
+  ;   'disabled                  auth is OFF  -> the caller allows everything
+  ;   (cons 'user name-str)      authenticated as name
+  ;   (cons 'err (status . msg)) deny (etcd-faithful: empty name vs bad token)
+  (define (auth-identify h)
+    (let ((s (ask-shard (list 'auth-state (self)))))
+      (if (or (not (pair? s)) (not (eq? (car s) 'auth-state-ok)) (not (cadr s)))
+          'disabled                                   ; auth off (or seam down) -> allow
+          (let ((id (resolve-identity h (caddr s))))
+            (cond
+              ((eq? id 'bad-token)
+               (cons 'err (cons GRPC-UNAUTHENTICATED "etcdserver: invalid auth token")))
+              ((eq? id 'none)
+               (cons 'err (cons GRPC-INVALID-ARGUMENT "etcdserver: user name is empty")))
+              (else id))))))
+
+  ; Authorize one (key, range-end) for `required` ('read|'write) as user NAME, via
+  ; the shard's pure auth-authorize? over NS-AUTH.  -> #f (allow) | (status . msg).
+  (define (authorize-key name key rend required)
+    (let ((d (ask-shard (list 'auth-authorize (self) (string->utf8 name) key rend required))))
+      (if (and (pair? d) (eq? (car d) 'auth-authorize-ok) (cadr d))
+          #f
+          (cons GRPC-PERMISSION-DENIED "etcdserver: permission denied"))))
+
+  ; The single-op KV guard: -> #f (allow, proceed) | (status . msg) (deny -> gRPC error).
+  (define (authz-deny? h key rend required)
+    (let ((id (auth-identify h)))
+      (cond
+        ((eq? id 'disabled) #f)
+        ((eq? (car id) 'err) (cdr id))
+        (else (authorize-key (cdr id) key rend required)))))
+
+  ; Txn guard: each compare key -> READ, each inner op by its type (put/delete-range
+  ; -> WRITE, range -> READ).  A nested request_txn is left to its own evaluation.
+  (define (txn-authz-deny? h tr)
+    (let ((id (auth-identify h)))
+      (cond
+        ((eq? id 'disabled) #f)
+        ((eq? (car id) 'err) (cdr id))
+        (else
+         (let ((name (cdr id)))
+           (define (rend-of m) (let ((re (galist 'range_end m EMPTY)))
+                                 (if (= (bytevector-length re) 0) #f re)))
+           (define (deny-cmps cs)
+             (let loop ((cs cs))
+               (if (null? cs) #f
+                   (or (authorize-key name (galist 'key (car cs) EMPTY) #f 'read)
+                       (loop (cdr cs))))))
+           (define (deny-ops os)
+             (let loop ((os os))
+               (if (null? os) #f
+                   (let* ((op (car os))
+                          (put (galist 'request_put op #f))
+                          (del (galist 'request_delete_range op #f))
+                          (rng (galist 'request_range op #f))
+                          (d (cond
+                               (put (authorize-key name (galist 'key put EMPTY) #f 'write))
+                               (del (authorize-key name (galist 'key del EMPTY) (rend-of del) 'write))
+                               (rng (authorize-key name (galist 'key rng EMPTY) (rend-of rng) 'read))
+                               (else #f))))
+                     (or d (loop (cdr os)))))))
+           (or (deny-cmps (galist 'compare tr '()))
+               (deny-ops  (galist 'success tr '()))
+               (deny-ops  (galist 'failure tr '()))))))))
+
+  ; Admin (root-role) guard for the Auth MANAGEMENT RPCs.  Bootstrap (auth disabled)
+  ; is allowed so the first root user/role can be created; once enabled, the request
+  ; must present a root-role identity (etcd requires admin for user/role mutations).
+  ;   -> #f (allow) | (status . msg).
+  (define (admin-deny? h)
+    (let ((id (auth-identify h)))
+      (cond
+        ((eq? id 'disabled) #f)
+        ((eq? (car id) 'err) (cdr id))
+        (else
+         (let ((lk (ask-shard (list 'auth-lookup (self) (string->utf8 (cdr id))))))
+           (if (and (pair? lk) (eq? (car lk) 'auth-lookup-ok) (list-ref lk 3)) ; admin? flag
+               #f
+               (cons GRPC-PERMISSION-DENIED "etcdserver: permission denied")))))))
+
+  ; ===========================================================================
   ; method handlers — each returns (cons 'ok response-bytes)
   ;                              or (cons 'err (cons status "message"))
   ; ===========================================================================
@@ -347,10 +457,12 @@
   ; ---- KV/Range ----
   ; Decode RangeRequest, route the read through the shard's ReadIndex/leader gate,
   ; build RangeResponse{header, kvs, more, count}.  ErrCompacted -> OutOfRange(11).
-  (define (handle-range bytes)
+  (define (handle-range h bytes)
     (let* ((rr   (pb-decode RangeRequest-schema bytes))
            (opts (range-request->opts rr))
-           (res  (shard-range opts)))
+           (deny (authz-deny? h (galist 'key opts EMPTY) (galist 'range-end opts #f) 'read)))
+      (if deny (cons 'err deny)
+      (let ((res (shard-range opts)))
       (cond
         ((not (pair? res)) (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: not leader")))
         ((eq? (car res) 'kv-range-ok)
@@ -367,20 +479,22 @@
                                    (cons 'more  more)
                                    (cons 'count total))))
                  (cons 'ok (pb-encode RangeResponse-schema resp))))))
-        (else (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: not leader"))))))
+        (else (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: not leader")))))))) ; +let +if (authz)
 
   ; ---- KV/Put ----
   ; prev_kv snapshot (if requested) -> propose ("PUT" key value lease) -> PutResponse.
   ; lease is decimal-ASCII bytes (apply-fn convention).  A put to a dead lease comes
   ; back (cons 'err-lease-not-found id) -> a gRPC error (FailedPrecondition 9, etcd's).
-  (define (handle-put bytes)
+  (define (handle-put h bytes)
     (let* ((pr    (pb-decode PutRequest-schema bytes))
            (key   (galist 'key pr EMPTY))
            (value (galist 'value pr EMPTY))
            (lease (galist 'lease pr 0))
            (want-prev (galist 'prev_kv pr #f))
-           (prev  (and want-prev (shard-prev key)))
-           (ack   (shard-write (list (string->utf8 "PUT") key value (int->bytes lease)))))
+           (deny  (authz-deny? h key #f 'write)))
+      (if deny (cons 'err deny)
+      (let* ((prev  (and want-prev (shard-prev key)))
+             (ack   (shard-write (list (string->utf8 "PUT") key value (int->bytes lease)))))
       (cond
         ((and (pair? ack) (string? (car ack)) (string=? (car ack) "PUT"))
          (let* ((rev  (cdr ack))
@@ -391,16 +505,18 @@
          (cons 'err (cons 9 (string-append "etcdserver: requested lease not found"))))
         ((eq? ack 'tryagain)      (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: not leader")))
         ((eq? ack 'indeterminate) (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: leader changed")))
-        (else (cons 'err (cons GRPC-INTERNAL (string-append "put: unexpected ack")))))))
+        (else (cons 'err (cons GRPC-INTERNAL (string-append "put: unexpected ack")))))))))
 
   ; ---- KV/DeleteRange ----
   ; prev_kvs snapshot (if requested) -> propose ("DEL" key range-end) -> DeleteRangeResponse.
-  (define (handle-delete-range bytes)
+  (define (handle-delete-range h bytes)
     (let* ((dr    (pb-decode DeleteRangeRequest-schema bytes))
            (key   (galist 'key dr EMPTY))
            (rend  (let ((re (galist 'range_end dr EMPTY)))
                     (if (= (bytevector-length re) 0) #f re)))
-           (want-prev (galist 'prev_kv dr #f))
+           (deny  (authz-deny? h key rend 'write)))
+      (if deny (cons 'err deny)
+      (let* ((want-prev (galist 'prev_kv dr #f))
            ; snapshot the to-be-deleted live KVs via a Range over the same span.
            (prev-kvs (if want-prev
                          (let ((rres (shard-range (list (cons 'key key)
@@ -423,7 +539,7 @@
            (cons 'ok (pb-encode DeleteRangeResponse-schema resp))))
         ((eq? ack 'tryagain)      (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: not leader")))
         ((eq? ack 'indeterminate) (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: leader changed")))
-        (else (cons 'err (cons GRPC-INTERNAL "delete-range: unexpected ack"))))))
+        (else (cons 'err (cons GRPC-INTERNAL "delete-range: unexpected ack")))))))) ; +let* +if (authz)
 
   ; ---- KV/Compact ----
   ; propose ("COMPACT" rev) -> CompactionResponse{header}.  ErrCompacted (already
@@ -446,11 +562,13 @@
         (else (cons 'err (cons GRPC-INTERNAL "compact: unexpected ack"))))))
 
   ; ---- KV/Txn (translators are top-level; see etcd-txn->internal et al.) ----
-  (define (handle-txn bytes)
-    (let* ((tr    (pb-decode TxnRequest-schema bytes))
-           (itxn  (etcd-txn->internal tr))
-           (flat  (txn-encode itxn))
-           (ack   (shard-write (list (string->utf8 "TXN") flat))))
+  (define (handle-txn h bytes)
+    (let* ((tr   (pb-decode TxnRequest-schema bytes))
+           (deny (txn-authz-deny? h tr)))   ; compares=READ, inner put/del=WRITE, range=READ
+      (if deny (cons 'err deny)
+      (let* ((itxn  (etcd-txn->internal tr))
+             (flat  (txn-encode itxn))
+             (ack   (shard-write (list (string->utf8 "TXN") flat))))
       (cond
         ((and (pair? ack) (boolean? (car ack)))    ; (succeeded? . responses)
          ; the Txn bumped current-rev iff a branch mutated; either way the ResponseHeader
@@ -459,7 +577,7 @@
            (cons 'ok (pb-encode TxnResponse-schema (internal-txn-result->etcd ack hdr)))))
         ((eq? ack 'tryagain)      (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: not leader")))
         ((eq? ack 'indeterminate) (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: leader changed")))
-        (else (cons 'err (cons GRPC-INTERNAL "txn: unexpected ack"))))))
+        (else (cons 'err (cons GRPC-INTERNAL "txn: unexpected ack"))))))))
 
   ; ---- Lease/LeaseGrant (UNARY, cw-u4a.17) ----
   ; Propose ("LEASE-GRANT" id ttl) through the shard's async commit->ack bridge;
@@ -530,6 +648,130 @@
         (else (cons 'err (cons GRPC-INTERNAL "lease-leases: unexpected ack"))))))
 
   ; ===========================================================================
+  ; etcd Auth service (cw-u4a.26 SUBSET) — enforcement + the MINIMUM RPCs that
+  ; drive the etcdctl auth flow.  Each mutation PROPOSES an AUTH-* command through
+  ; the shard (mvcc-apply writes NS-AUTH + bumps auth-rev), then maps the apply
+  ; ack to an etcd-faithful gRPC status.  Authenticate runs the password verify +
+  ; mints the leader-local token.  (UserDelete/ChangePassword/Get/List, RoleDelete/
+  ; Get/List/RevokePermission, UserRevokeRole = cw-u4a.27.)
+  ; ===========================================================================
+
+  ; Map an AUTH-* apply ack -> (cons 'ok resp-bytes) | (cons 'err (status . msg)).
+  ; SCHEMA is the (header-only) success response message for this RPC.
+  (define (auth-write-ack->resp ack schema)
+    (cond
+      ((and (pair? ack) (string? (car ack)) (string=? (car ack) "AUTH-OK"))
+       (cons 'ok (pb-encode schema (list (cons 'header (shard-header))))))
+      ((and (pair? ack) (eq? (car ack) 'err-root-user-not-exist))
+       (cons 'err (cons GRPC-FAILED-PRECONDITION "etcdserver: root user does not exist")))
+      ((and (pair? ack) (eq? (car ack) 'err-root-role-not-exist))
+       (cons 'err (cons GRPC-FAILED-PRECONDITION "etcdserver: root user does not have root role")))
+      ((and (pair? ack) (eq? (car ack) 'err-user-exists))
+       (cons 'err (cons GRPC-FAILED-PRECONDITION "etcdserver: user name already exists")))
+      ((and (pair? ack) (eq? (car ack) 'err-user-not-found))
+       (cons 'err (cons GRPC-FAILED-PRECONDITION "etcdserver: user name not found")))
+      ((and (pair? ack) (eq? (car ack) 'err-role-exists))
+       (cons 'err (cons GRPC-FAILED-PRECONDITION "etcdserver: role name already exists")))
+      ((and (pair? ack) (eq? (car ack) 'err-role-not-found))
+       (cons 'err (cons GRPC-FAILED-PRECONDITION "etcdserver: role name not found")))
+      ((eq? ack 'tryagain)      (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: not leader")))
+      ((eq? ack 'indeterminate) (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: leader changed")))
+      (else (cons 'err (cons GRPC-INTERNAL "auth: unexpected ack")))))
+
+  ; ---- Auth/AuthEnable / AuthDisable ----  admin-gated (bootstrap allowed while off).
+  (define (handle-auth-enable h bytes)
+    (let ((deny (admin-deny? h)))
+      (if deny (cons 'err deny)
+          (auth-write-ack->resp (shard-write (list (string->utf8 "AUTH-ENABLE")))
+                                AuthEnableResponse-schema))))
+  (define (handle-auth-disable h bytes)
+    (let ((deny (admin-deny? h)))
+      (if deny (cons 'err deny)
+          (auth-write-ack->resp (shard-write (list (string->utf8 "AUTH-DISABLE")))
+                                AuthDisableResponse-schema))))
+
+  ; ---- Auth/Authenticate ----  verify the Argon2id PHC on the leader, mint a token.
+  ; NO auth gate (this is how a client GETS a token).  ErrAuthFailed on bad user/pw.
+  (define (handle-authenticate h bytes)
+    (let* ((req  (pb-decode AuthenticateRequest-schema bytes))
+           (name (galist 'name req ""))
+           (pw   (galist 'password req ""))
+           (lk   (ask-shard (list 'auth-lookup (self) (string->utf8 name)))))
+      (if (and (pair? lk) (eq? (car lk) 'auth-lookup-ok) (cadr lk)         ; user exists?
+               (crypto-password-verify pw (utf8->string (caddr lk))))      ; PHC verifies?
+          (let ((token (crypto-random-token 24))
+                (auth-rev (list-ref lk 4)))
+            (hashtable-set! token-table token (cons name auth-rev))
+            (cons 'ok (pb-encode AuthenticateResponse-schema
+                                 (list (cons 'header (shard-header)) (cons 'token token)))))
+          (cons 'err (cons GRPC-INVALID-ARGUMENT
+                           "etcdserver: authentication failed, invalid user ID or password")))))
+
+  ; ---- Auth/UserAdd ----  the leader hashes (Argon2id) + proposes the PHC bytes (ADR §3).
+  (define (handle-user-add h bytes)
+    (let ((deny (admin-deny? h)))
+      (if deny (cons 'err deny)
+          (let* ((req  (pb-decode AuthUserAddRequest-schema bytes))
+                 (name (galist 'name req ""))
+                 (pw   (galist 'password req ""))
+                 ; empty password => no-password user (cert-CN only): store an empty hash.
+                 (hash (if (> (string-length pw) 0)
+                           (string->utf8 (crypto-password-hash pw))
+                           EMPTY)))
+            (auth-write-ack->resp
+             (shard-write (list (string->utf8 "AUTH-USER-ADD") (string->utf8 name) hash))
+             AuthUserAddResponse-schema)))))
+
+  ; ---- Auth/RoleAdd ----
+  (define (handle-role-add h bytes)
+    (let ((deny (admin-deny? h)))
+      (if deny (cons 'err deny)
+          (let* ((req  (pb-decode AuthRoleAddRequest-schema bytes))
+                 (name (galist 'name req "")))
+            (auth-write-ack->resp
+             (shard-write (list (string->utf8 "AUTH-ROLE-ADD") (string->utf8 name)))
+             AuthRoleAddResponse-schema)))))
+
+  ; ---- Auth/RoleGrantPermission ----  perm = authpb.Permission{permType,key,range_end}.
+  (define (handle-role-grant-perm h bytes)
+    (let ((deny (admin-deny? h)))
+      (if deny (cons 'err deny)
+          (let* ((req   (pb-decode AuthRoleGrantPermissionRequest-schema bytes))
+                 (role  (galist 'name req ""))
+                 (perm  (galist 'perm req '()))
+                 (ptype (galist 'permType perm 0))           ; READ=0/WRITE=1/READWRITE=2
+                 (key   (galist 'key perm EMPTY))
+                 (rend  (galist 'range_end perm EMPTY)))
+            (auth-write-ack->resp
+             (shard-write (list (string->utf8 "AUTH-ROLE-GRANT-PERM")
+                                (string->utf8 role) (int->bytes ptype) key rend))
+             AuthRoleGrantPermissionResponse-schema)))))
+
+  ; ---- Auth/UserGrantRole ----
+  (define (handle-user-grant-role h bytes)
+    (let ((deny (admin-deny? h)))
+      (if deny (cons 'err deny)
+          (let* ((req  (pb-decode AuthUserGrantRoleRequest-schema bytes))
+                 (user (galist 'user req ""))
+                 (role (galist 'role req "")))
+            (auth-write-ack->resp
+             (shard-write (list (string->utf8 "AUTH-USER-GRANT-ROLE")
+                                (string->utf8 user) (string->utf8 role)))
+             AuthUserGrantRoleResponse-schema)))))
+
+  ; Watch authz (READ): peek the first WatchRequest's create_request range + authorize,
+  ; so an unauthorised Watch is rejected before a stream worker is spawned.
+  ;   -> #f (allow) | (status . msg).
+  (define (watch-authz-deny? h)
+    (let ((wr (guard (e (#t #f)) (pb-decode WatchRequest-schema (grpc-request-bytes h)))))
+      (let ((cr (and wr (galist 'create_request wr #f))))
+        (if (not cr) #f                         ; cancel/progress -> the worker handles it
+            (authz-deny? h (galist 'key cr EMPTY)
+                         (let ((re (galist 'range_end cr EMPTY)))
+                           (if (= (bytevector-length re) 0) #f re))
+                         'read)))))
+
+  ; ===========================================================================
   ; dispatch one request handle
   ; ===========================================================================
   ; Streaming paths (Watch / LeaseKeepAlive are bidi) spawn a per-stream worker
@@ -556,7 +798,12 @@
         (display " -> ") (display path) (newline))
       (cond
         ((string=? path "/etcdserverpb.Watch/Watch")
-         (start-stream-worker! h 'grpc-watch-worker))
+         ; Watch is a READ: enforce the per-request authz hook before spawning the
+         ; stream worker (.26).  On deny, close the call with the gRPC error directly.
+         (let ((deny (watch-authz-deny? h)))
+           (if deny
+               (grpc-respond-error! h (car deny) (cdr deny))
+               (start-stream-worker! h 'grpc-watch-worker))))
         ((string=? path "/etcdserverpb.Lease/LeaseKeepAlive")
          (start-stream-worker! h 'grpc-lease-keepalive-worker))
         (else (dispatch-unary! h path)))))
@@ -566,11 +813,21 @@
            (res   (guard (e (#t (cons 'err (cons GRPC-INTERNAL
                                                  (string-append "handler error")))))
                     (cond
-                      ((string=? path "/etcdserverpb.KV/Range")       (handle-range bytes))
-                      ((string=? path "/etcdserverpb.KV/Put")         (handle-put bytes))
-                      ((string=? path "/etcdserverpb.KV/DeleteRange") (handle-delete-range bytes))
-                      ((string=? path "/etcdserverpb.KV/Txn")         (handle-txn bytes))
+                      ; KV ops carry the per-request authz hook (.26): h flows in so the
+                      ; handler resolves identity -> auth-authorize? -> deny mapping.
+                      ((string=? path "/etcdserverpb.KV/Range")       (handle-range h bytes))
+                      ((string=? path "/etcdserverpb.KV/Put")         (handle-put h bytes))
+                      ((string=? path "/etcdserverpb.KV/DeleteRange") (handle-delete-range h bytes))
+                      ((string=? path "/etcdserverpb.KV/Txn")         (handle-txn h bytes))
                       ((string=? path "/etcdserverpb.KV/Compact")     (handle-compact bytes))
+                      ; Auth service (cw-u4a.26 subset): enforcement + the minimum RPCs.
+                      ((string=? path "/etcdserverpb.Auth/AuthEnable")          (handle-auth-enable h bytes))
+                      ((string=? path "/etcdserverpb.Auth/AuthDisable")         (handle-auth-disable h bytes))
+                      ((string=? path "/etcdserverpb.Auth/Authenticate")        (handle-authenticate h bytes))
+                      ((string=? path "/etcdserverpb.Auth/UserAdd")             (handle-user-add h bytes))
+                      ((string=? path "/etcdserverpb.Auth/RoleAdd")             (handle-role-add h bytes))
+                      ((string=? path "/etcdserverpb.Auth/RoleGrantPermission") (handle-role-grant-perm h bytes))
+                      ((string=? path "/etcdserverpb.Auth/UserGrantRole")       (handle-user-grant-role h bytes))
                       ; Lease UNARY RPCs (cw-u4a.17/.18); KeepAlive is bidi (above).
                       ((string=? path "/etcdserverpb.Lease/LeaseGrant")      (handle-lease-grant bytes))
                       ((string=? path "/etcdserverpb.Lease/LeaseRevoke")     (handle-lease-revoke bytes))

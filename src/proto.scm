@@ -796,3 +796,66 @@
           (cons 'WatchProgressRequest-schema-ref (lambda () WatchProgressRequest-schema))
           (cons 'LeaseStatus-schema-ref          (lambda () LeaseStatus-schema)))
         schema-ref-table))
+
+; ============================================================================
+; etcd v3 Auth-service message schemas (cw-u4a.26 SUBSET — enough to drive the
+; etcdctl auth flow: Enable/Disable/Authenticate + UserAdd/RoleAdd/
+; RoleGrantPermission/UserGrantRole.  The rest of the Auth service is cw-u4a.27.)
+; Canonical field numbers from etcd rpc.proto + auth.proto.  Field names are
+; lowercased; the wire only cares about numbers.  Unknown request fields (e.g.
+; UserAddRequest.options) are skipped by pb-decode (forward-compat), so they are
+; deliberately omitted from these minimal request schemas.
+; ============================================================================
+
+; authpb.Permission{ permType=1(enum READ=0/WRITE=1/READWRITE=2), key=2, range_end=3 }
+(define Permission-schema
+  '((1 permType  enum  optional)
+    (2 key       bytes optional)
+    (3 range_end bytes optional)))
+
+; AuthEnable / AuthDisable — empty requests; header-only responses.
+(define AuthEnableRequest-schema  '())
+(define AuthDisableRequest-schema '())
+(define AuthEnableResponse-schema
+  (list (list 1 'header '(message ResponseHeader-schema-ref) 'optional)))
+(define AuthDisableResponse-schema
+  (list (list 1 'header '(message ResponseHeader-schema-ref) 'optional)))
+
+; Authenticate{name,password} -> {header, token}
+(define AuthenticateRequest-schema
+  '((1 name     string optional)
+    (2 password string optional)))
+(define AuthenticateResponse-schema
+  (list (list 1 'header '(message ResponseHeader-schema-ref) 'optional)
+        (list 2 'token  'string 'optional)))
+
+; UserAdd{name,password,(options=3 ignored),(hashedPassword=4 ignored)} -> {header}
+(define AuthUserAddRequest-schema
+  '((1 name     string optional)
+    (2 password string optional)))
+(define AuthUserAddResponse-schema
+  (list (list 1 'header '(message ResponseHeader-schema-ref) 'optional)))
+
+; RoleAdd{name} -> {header}
+(define AuthRoleAddRequest-schema
+  '((1 name string optional)))
+(define AuthRoleAddResponse-schema
+  (list (list 1 'header '(message ResponseHeader-schema-ref) 'optional)))
+
+; RoleGrantPermission{name(role), perm(Permission)} -> {header}
+(define AuthRoleGrantPermissionRequest-schema
+  (list (list 1 'name 'string 'optional)
+        (list 2 'perm '(message Permission-schema-ref) 'optional)))
+(define AuthRoleGrantPermissionResponse-schema
+  (list (list 1 'header '(message ResponseHeader-schema-ref) 'optional)))
+
+; UserGrantRole{user, role} -> {header}
+(define AuthUserGrantRoleRequest-schema
+  '((1 user string optional)
+    (2 role string optional)))
+(define AuthUserGrantRoleResponse-schema
+  (list (list 1 'header '(message ResponseHeader-schema-ref) 'optional)))
+
+; Register the nested Permission ref so RoleGrantPermissionRequest can resolve it.
+(set! schema-ref-table
+      (cons (cons 'Permission-schema-ref (lambda () Permission-schema)) schema-ref-table))

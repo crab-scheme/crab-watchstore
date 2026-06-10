@@ -759,6 +759,130 @@
                                 (string->utf8 user) (string->utf8 role)))
              AuthUserGrantRoleResponse-schema)))))
 
+  ; ===========================================================================
+  ; Auth management RPCs (cw-u4a.27) — the remaining 9 Auth service methods.
+  ; Mutations admin-gated + propose via shard-write (mirroring .26).
+  ; Reads (UserGet/UserList/RoleGet/RoleList) admin-gated + served from shard seams.
+  ; ===========================================================================
+
+  ; ---- Auth/UserDelete ----
+  (define (handle-user-delete h bytes)
+    (let ((deny (admin-deny? h)))
+      (if deny (cons 'err deny)
+          (let* ((req  (pb-decode AuthUserDeleteRequest-schema bytes))
+                 (name (galist 'name req "")))
+            (auth-write-ack->resp
+             (shard-write (list (string->utf8 "AUTH-USER-DELETE") (string->utf8 name)))
+             AuthUserDeleteResponse-schema)))))
+
+  ; ---- Auth/UserChangePassword ---- hash on the leader (Argon2id) + propose AUTH-USER-CHPASS.
+  (define (handle-user-change-password h bytes)
+    (let ((deny (admin-deny? h)))
+      (if deny (cons 'err deny)
+          (let* ((req  (pb-decode AuthUserChangePasswordRequest-schema bytes))
+                 (name (galist 'name req ""))
+                 (pw   (galist 'password req ""))
+                 (hash (if (> (string-length pw) 0)
+                           (string->utf8 (crypto-password-hash pw))
+                           EMPTY)))
+            (auth-write-ack->resp
+             (shard-write (list (string->utf8 "AUTH-USER-CHPASS") (string->utf8 name) hash))
+             AuthUserChangePasswordResponse-schema)))))
+
+  ; ---- Auth/UserGet ---- admin-gated read; returns repeated role-name strings.
+  ; AuthUserGetResponse{header=1, roles=2(repeated string)} — no nested User message.
+  (define (handle-user-get h bytes)
+    (let ((deny (admin-deny? h)))
+      (if deny (cons 'err deny)
+          (let* ((req  (pb-decode AuthUserGetRequest-schema bytes))
+                 (name (galist 'name req ""))
+                 (r    (ask-shard (list 'auth-user-info (self) (string->utf8 name)))))
+            (if (and (pair? r) (eq? (car r) 'auth-user-info-ok) (cadr r))
+                (let ((roles (map utf8->string (caddr r))))
+                  (cons 'ok (pb-encode AuthUserGetResponse-schema
+                                       (list (cons 'header (shard-header))
+                                             (cons 'roles roles)))))
+                (cons 'err (cons GRPC-FAILED-PRECONDITION "etcdserver: user name not found")))))))
+
+  ; ---- Auth/UserList ---- admin-gated read; returns list of user names.
+  (define (handle-user-list h bytes)
+    (let ((deny (admin-deny? h)))
+      (if deny (cons 'err deny)
+          (let ((r (ask-shard (list 'auth-user-list (self)))))
+            (if (and (pair? r) (eq? (car r) 'auth-user-list-ok))
+                (cons 'ok (pb-encode AuthUserListResponse-schema
+                                     (list (cons 'header (shard-header))
+                                           (cons 'users (map utf8->string (cadr r))))))
+                (cons 'err (cons GRPC-INTERNAL "user-list: unexpected ack")))))))
+
+  ; ---- Auth/RoleDelete ----
+  (define (handle-role-delete h bytes)
+    (let ((deny (admin-deny? h)))
+      (if deny (cons 'err deny)
+          (let* ((req  (pb-decode AuthRoleDeleteRequest-schema bytes))
+                 (role (galist 'role req "")))
+            (auth-write-ack->resp
+             (shard-write (list (string->utf8 "AUTH-ROLE-DELETE") (string->utf8 role)))
+             AuthRoleDeleteResponse-schema)))))
+
+  ; ---- Auth/RoleGet ---- admin-gated read; returns repeated Permission entries.
+  ; AuthRoleGetResponse{header=1, perm=2(repeated Permission)} — no nested Role message.
+  ; perm is (ptype key rend) list (shard seam converts #(ptype key rend) -> list for
+  ; cross-runtime sendability).
+  (define (handle-role-get h bytes)
+    (let ((deny (admin-deny? h)))
+      (if deny (cons 'err deny)
+          (let* ((req  (pb-decode AuthRoleGetRequest-schema bytes))
+                 (name (galist 'role req ""))
+                 (r    (ask-shard (list 'auth-role-info (self) (string->utf8 name)))))
+            (if (and (pair? r) (eq? (car r) 'auth-role-info-ok) (cadr r))
+                (let ((perms (caddr r)))
+                  (cons 'ok (pb-encode AuthRoleGetResponse-schema
+                                       (list (cons 'header (shard-header))
+                                             (cons 'perm
+                                                   (map (lambda (p)
+                                                          (list (cons 'permType (car p))
+                                                                (cons 'key      (cadr p))
+                                                                (cons 'range_end (caddr p))))
+                                                        perms))))))
+                (cons 'err (cons GRPC-FAILED-PRECONDITION "etcdserver: role name not found")))))))
+
+  ; ---- Auth/RoleList ---- admin-gated read; returns list of role names.
+  (define (handle-role-list h bytes)
+    (let ((deny (admin-deny? h)))
+      (if deny (cons 'err deny)
+          (let ((r (ask-shard (list 'auth-role-list (self)))))
+            (if (and (pair? r) (eq? (car r) 'auth-role-list-ok))
+                (cons 'ok (pb-encode AuthRoleListResponse-schema
+                                     (list (cons 'header (shard-header))
+                                           (cons 'roles (map utf8->string (cadr r))))))
+                (cons 'err (cons GRPC-INTERNAL "role-list: unexpected ack")))))))
+
+  ; ---- Auth/RoleRevokePermission ----
+  (define (handle-role-revoke-perm h bytes)
+    (let ((deny (admin-deny? h)))
+      (if deny (cons 'err deny)
+          (let* ((req  (pb-decode AuthRoleRevokePermissionRequest-schema bytes))
+                 (role (galist 'role req ""))
+                 (key  (galist 'key req EMPTY))
+                 (rend (galist 'range_end req EMPTY)))
+            (auth-write-ack->resp
+             (shard-write (list (string->utf8 "AUTH-ROLE-REVOKE-PERM")
+                                (string->utf8 role) key rend))
+             AuthRoleRevokePermissionResponse-schema)))))
+
+  ; ---- Auth/UserRevokeRole ----
+  (define (handle-user-revoke-role h bytes)
+    (let ((deny (admin-deny? h)))
+      (if deny (cons 'err deny)
+          (let* ((req  (pb-decode AuthUserRevokeRoleRequest-schema bytes))
+                 (name (galist 'name req ""))
+                 (role (galist 'role req "")))
+            (auth-write-ack->resp
+             (shard-write (list (string->utf8 "AUTH-USER-REVOKE-ROLE")
+                                (string->utf8 name) (string->utf8 role)))
+             AuthUserRevokeRoleResponse-schema)))))
+
   ; Watch authz (READ): peek the first WatchRequest's create_request range + authorize,
   ; so an unauthorised Watch is rejected before a stream worker is spawned.
   ;   -> #f (allow) | (status . msg).
@@ -828,6 +952,16 @@
                       ((string=? path "/etcdserverpb.Auth/RoleAdd")             (handle-role-add h bytes))
                       ((string=? path "/etcdserverpb.Auth/RoleGrantPermission") (handle-role-grant-perm h bytes))
                       ((string=? path "/etcdserverpb.Auth/UserGrantRole")       (handle-user-grant-role h bytes))
+                      ; Auth management RPCs (cw-u4a.27): mutating + read.
+                      ((string=? path "/etcdserverpb.Auth/UserDelete")           (handle-user-delete h bytes))
+                      ((string=? path "/etcdserverpb.Auth/UserChangePassword")   (handle-user-change-password h bytes))
+                      ((string=? path "/etcdserverpb.Auth/UserGet")              (handle-user-get h bytes))
+                      ((string=? path "/etcdserverpb.Auth/UserList")             (handle-user-list h bytes))
+                      ((string=? path "/etcdserverpb.Auth/RoleDelete")           (handle-role-delete h bytes))
+                      ((string=? path "/etcdserverpb.Auth/RoleGet")              (handle-role-get h bytes))
+                      ((string=? path "/etcdserverpb.Auth/RoleList")             (handle-role-list h bytes))
+                      ((string=? path "/etcdserverpb.Auth/RoleRevokePermission") (handle-role-revoke-perm h bytes))
+                      ((string=? path "/etcdserverpb.Auth/UserRevokeRole")       (handle-user-revoke-role h bytes))
                       ; Lease UNARY RPCs (cw-u4a.17/.18); KeepAlive is bidi (above).
                       ((string=? path "/etcdserverpb.Lease/LeaseGrant")      (handle-lease-grant bytes))
                       ((string=? path "/etcdserverpb.Lease/LeaseRevoke")     (handle-lease-revoke bytes))

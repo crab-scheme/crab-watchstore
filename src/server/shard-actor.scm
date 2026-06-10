@@ -574,6 +574,41 @@
                          (list 'auth-lookup-ok #f #f #f (auth-rev ctx)))))
              (loop st leader elapsed flush-base))
 
+            ;; ---- Auth read seams (cw-u4a.27) — UserGet/UserList/RoleGet/RoleList.
+            ;; Pure reads over NS-AUTH; admin-gated by the gRPC handler upstream.
+            ;;   (auth-user-info CONN name)   -> (auth-user-info-ok #t roles) | (auth-user-info-ok #f #f)
+            ;;   (auth-user-list CONN)        -> (auth-user-list-ok names)
+            ;;   (auth-role-info CONN name)   -> (auth-role-info-ok #t perms) | (auth-role-info-ok #f #f)
+            ;;   (auth-role-list CONN)        -> (auth-role-list-ok names)
+            ((eq? (car m) 'auth-user-info)
+             (let* ((conn (cadr m)) (name (caddr m))
+                    (u (auth-get-user ctx name)))
+               (send conn
+                     (if u
+                         (list 'auth-user-info-ok #t (auth-user-roles u))
+                         (list 'auth-user-info-ok #f #f))))
+             (loop st leader elapsed flush-base))
+            ((eq? (car m) 'auth-user-list)
+             (send (cadr m) (list 'auth-user-list-ok (auth-all-users ctx)))
+             (loop st leader elapsed flush-base))
+            ((eq? (car m) 'auth-role-info)
+             (let* ((conn (cadr m)) (name (caddr m))
+                    (perms (auth-get-role ctx name)))
+               (send conn
+                     (if perms
+                         ; Convert #(ptype key rend) vectors to lists so they survive
+                         ; the spawn-source cross-runtime boundary (vectors may not be
+                         ; sendable; lists of bytevectors/ints always are).
+                         (list 'auth-role-info-ok #t
+                               (map (lambda (p)
+                                      (list (vector-ref p 0) (vector-ref p 1) (vector-ref p 2)))
+                                    perms))
+                         (list 'auth-role-info-ok #f #f))))
+             (loop st leader elapsed flush-base))
+            ((eq? (car m) 'auth-role-list)
+             (send (cadr m) (list 'auth-role-list-ok (auth-all-roles ctx)))
+             (loop st leader elapsed flush-base))
+
             ;; ---- test-support: (lease-probe CONN ID KEYS) -> revoke proof on THIS
             ;; replica.  Reads THIS node's committed MVCC state and replies a small
             ;; serializable summary so a test can assert the LINEARIZABLE replicated

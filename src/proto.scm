@@ -859,3 +859,95 @@
 ; Register the nested Permission ref so RoleGrantPermissionRequest can resolve it.
 (set! schema-ref-table
       (cons (cons 'Permission-schema-ref (lambda () Permission-schema)) schema-ref-table))
+
+; ============================================================================
+; etcd v3 Auth-service message schemas (cw-u4a.27 — remaining Auth RPCs).
+; UserDelete / UserChangePassword / UserGet / UserList / RoleDelete / RoleGet /
+; RoleList / RoleRevokePermission / UserRevokeRole.
+; Canonical field numbers from etcd rpc.proto + auth.proto.
+; ============================================================================
+
+; authpb.User — name=1(bytes), password=2(bytes omitted in resp), roles=3(rep string)
+(define AuthUser-schema
+  (list
+    (list 1 'name     'bytes  'optional)
+    (list 2 'password 'bytes  'optional)
+    (list 3 'roles    'string 'repeated)))
+
+; authpb.Role — name=1(bytes), keyPermission=2(repeated Permission)
+(define AuthRole-schema
+  (list
+    (list 1 'name          'bytes                           'optional)
+    (list 2 'keyPermission '(message Permission-schema-ref) 'repeated)))
+
+; UserDelete{name} -> {header}
+(define AuthUserDeleteRequest-schema  '((1 name string optional)))
+(define AuthUserDeleteResponse-schema
+  (list (list 1 'header '(message ResponseHeader-schema-ref) 'optional)))
+
+; UserChangePassword{name, password} -> {header}
+(define AuthUserChangePasswordRequest-schema
+  '((1 name     string optional)
+    (2 password string optional)))
+(define AuthUserChangePasswordResponse-schema
+  (list (list 1 'header '(message ResponseHeader-schema-ref) 'optional)))
+
+; UserGet{name} -> {header, roles(repeated string)}
+; rpc.proto AuthUserGetResponse: header=1, roles=2(repeated string).
+; NOTE: no nested User message — the response carries the role-name strings directly.
+(define AuthUserGetRequest-schema  '((1 name string optional)))
+(define AuthUserGetResponse-schema
+  (list
+    (list 1 'header '(message ResponseHeader-schema-ref) 'optional)
+    (list 2 'roles  'string 'repeated)))
+
+; UserList{} -> {header, users(repeated string)}
+(define AuthUserListRequest-schema '())
+(define AuthUserListResponse-schema
+  (list
+    (list 1 'header '(message ResponseHeader-schema-ref) 'optional)
+    (list 2 'users  'string 'repeated)))
+
+; RoleDelete{role} -> {header}
+(define AuthRoleDeleteRequest-schema  '((1 role string optional)))
+(define AuthRoleDeleteResponse-schema
+  (list (list 1 'header '(message ResponseHeader-schema-ref) 'optional)))
+
+; RoleGet{role} -> {header, perm(repeated Permission)}
+; rpc.proto AuthRoleGetResponse: header=1, perm=2(repeated Permission).
+; NOTE: no nested Role message — the response carries Permission entries directly.
+(define AuthRoleGetRequest-schema  '((1 role string optional)))
+(define AuthRoleGetResponse-schema
+  (list
+    (list 1 'header '(message ResponseHeader-schema-ref) 'optional)
+    (list 2 'perm   '(message Permission-schema-ref)     'repeated)))
+
+; RoleList{} -> {header, roles(repeated string)}
+(define AuthRoleListRequest-schema '())
+(define AuthRoleListResponse-schema
+  (list
+    (list 1 'header '(message ResponseHeader-schema-ref) 'optional)
+    (list 2 'roles  'string 'repeated)))
+
+; RoleRevokePermission{role, key, range_end} -> {header}
+(define AuthRoleRevokePermissionRequest-schema
+  '((1 role      string optional)
+    (2 key       bytes  optional)
+    (3 range_end bytes  optional)))
+(define AuthRoleRevokePermissionResponse-schema
+  (list (list 1 'header '(message ResponseHeader-schema-ref) 'optional)))
+
+; UserRevokeRole{name, role} -> {header}
+(define AuthUserRevokeRoleRequest-schema
+  '((1 name string optional)
+    (2 role string optional)))
+(define AuthUserRevokeRoleResponse-schema
+  (list (list 1 'header '(message ResponseHeader-schema-ref) 'optional)))
+
+; Register the nested AuthUser and AuthRole refs.
+(set! schema-ref-table
+      (append
+        (list
+          (cons 'AuthUser-schema-ref (lambda () AuthUser-schema))
+          (cons 'AuthRole-schema-ref (lambda () AuthRole-schema)))
+        schema-ref-table))

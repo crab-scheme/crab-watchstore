@@ -94,6 +94,36 @@
                           (kv-rec-version r) (kv-rec-lease r) (kv-rec-value r))
             #f))))
 
+; ===========================================================================
+; WatchResponse <-> sendable s-expr  (the cross-actor wire bridge, cw-u4a.14)
+; ===========================================================================
+;
+; A watch-response is a RECORD; records can NOT cross a `send` actor boundary
+; (only null/bool/char/num/string/symbol/pair/vector/bytevector/pid are sendable).
+; So the shard registry's deliver-fn flattens each WatchResponse with
+; watch-response->sexp before `send`ing it to the per-conn streaming actor (.14),
+; which reconstructs it with sexp->watch-response on the other side.  A kv-view is
+; already a vector of bytevectors+ints (sendable), so it crosses verbatim; a
+; watch-event becomes the list (type kv prev-kv) with #f for an absent prev-kv.
+;
+; Wire shape:
+;   (WATCH-ID HEADER-REV CREATED? CANCELED? CANCEL-REASON COMPACT-REV
+;    ((TYPE KV PREV-KV) ...))
+; This is the .23 framing surface too: gRPC encodes/decodes against THIS shape.
+(define (watch-event->sexp we)
+  (list (we-type we) (we-kv we) (we-prev-kv we)))
+(define (sexp->watch-event s)
+  (make-watch-event (list-ref s 0) (list-ref s 1) (list-ref s 2)))
+
+(define (watch-response->sexp wr)
+  (list (wr-watch-id wr) (wr-header-rev wr) (wr-created? wr) (wr-canceled? wr)
+        (wr-cancel-reason wr) (wr-compact-revision wr)
+        (map watch-event->sexp (wr-events wr))))
+(define (sexp->watch-response s)
+  (make-watch-response (list-ref s 0) (list-ref s 1)
+                       (map sexp->watch-event (list-ref s 6))
+                       (list-ref s 2) (list-ref s 3) (list-ref s 4) (list-ref s 5)))
+
 ; Turn one decoded REV-CF event (event-decode vector) into a watch-event, doing the
 ; §2 KEY-CF reconstruction.  prev-kv? toggles the (optional) second lookup.
 (define (event->watch-event ctx ev prev-kv?)

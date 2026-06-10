@@ -90,7 +90,19 @@
           (set! acc (cons #f acc))                       ; no-op barrier: acc slot only, no rev bump
           (let ((pre (mvcc-current-rev ctx)))
             (set! acc (cons (mvcc-apply ctx cmd) acc))    ; MVCC write; client waiter gets the result
-            (watch-on-apply! watch-reg ctx pre (mvcc-current-rev ctx))))
+            (watch-on-apply! watch-reg ctx pre (mvcc-current-rev ctx))
+            ; Watch backend (cw-u4a.14, ADR 0002 §5 mid-stream ErrCompacted): a
+            ; COMPACT applied here GC's REV-CF events <= compact-rev, so any watcher
+            ; still BELOW that floor (delivered_rev < compact-rev) can no longer be
+            ; served its remaining history — cancel it with compact_revision set so
+            ; the client re-establishes above the floor.  COMPACT does NOT bump
+            ; current-rev, so watch-on-apply! above is already a no-op for it; this
+            ; is the separate wiring point §5 calls for.  Gated on a NON-EMPTY
+            ; registry so a watcher-free apply path (sim-cluster) is unperturbed:
+            ; with no watchers this is a single hashtable-size check, no scan.
+            (if (and (> (reg-count watch-reg) 0)
+                     (pair? cmd) (string=? (cmd-op cmd) "COMPACT"))
+                (watch-check-compaction! watch-reg ctx))))
       (+ sm 1))
     ; Persist the applied index (+ its term) into the SAME group-commit batch as
     ; the entry's mutations, so a restart restores base/applied/commit and never
@@ -379,6 +391,51 @@
                                (kv-rec-mod-rev r) (kv-rec-version r))
                          #f)))
              (loop st leader elapsed flush-base))
+
+            ;; ---- Watch register: (watch-register REPLY-PID SPEC) ----  (cw-u4a.14)
+            ;; The per-conn streaming actor (.14) asks the LEADER's shard registry to
+            ;; establish a watcher.  LEADER-GATED exactly like reads: only the leader
+            ;; applies + holds client streams (ADR 0002 §4), so a non-leader must
+            ;; redirect rather than silently serve a watch — it replies
+            ;; ('watch-not-leader . LEADER) so the streaming actor re-targets the new
+            ;; leader (mirrors the read path's 'tryagain).
+            ;;
+            ;; SPEC is the sendable assoc-list watch-spec (keys: key/range-end/
+            ;; start-rev/filters/prev-kv/watch-id — all bytevectors/ints/symbols, so
+            ;; it crosses the actor boundary intact).  The registry's deliver-fn must
+            ;; push a SENDABLE shape to REPLY-PID (a watch-response RECORD can't cross
+            ;; a `send`), so we flatten it with watch-response->sexp and tag it
+            ;; 'watch-response.  watch-register! runs the REGISTER->REPLAY->CATCH-UP->
+            ;; PROMOTE handoff on THIS single thread (so the §3 seam stays race-free),
+            ;; delivering any historical replay to REPLY-PID before we ack the id.
+            ;; The reply to the REGISTER request itself is the assigned watch-id, or
+            ;; ('watch-compacted . COMPACT-REV) if start-rev is below the floor (§5).
+            ((eq? (car m) 'watch-register)
+             (let ((reply-pid (cadr m)) (spec (caddr m)))
+               (if (not (raft-leader? st))
+                   (send reply-pid (cons 'watch-not-leader leader))
+                   (let* ((deliver-fn
+                           (lambda (wr)
+                             (send reply-pid (list 'watch-response (watch-response->sexp wr)))))
+                          (res (watch-register! watch-reg ctx spec deliver-fn)))
+                     (if (and (pair? res) (eq? (car res) 'compacted))
+                         (send reply-pid (cons 'watch-compacted (cdr res)))
+                         (send reply-pid (cons 'watch-created res)))))   ; res = watch-id
+               (loop st leader elapsed flush-base)))
+
+            ;; ---- Watch cancel: (watch-cancel REPLY-PID WATCH-ID) ----  (cw-u4a.14)
+            ;; Deregister the watcher + (via its deliver-fn) emit a canceled
+            ;; WatchResponse to the stream, then ack the cancel to REPLY-PID.  Also
+            ;; leader-gated: the registry lives only on the leader.  watch-cancel!
+            ;; runs on this single thread so a cancel concurrent with an in-flight
+            ;; dispatch is serialized (no use-after-cancel, ADR 0002 §6).
+            ((eq? (car m) 'watch-cancel)
+             (let ((reply-pid (cadr m)) (wid (caddr m)))
+               (if (not (raft-leader? st))
+                   (send reply-pid (cons 'watch-not-leader leader))
+                   (let ((ok (watch-cancel! watch-reg wid)))
+                     (send reply-pid (cons 'watch-canceled (if ok wid #f)))))
+               (loop st leader elapsed flush-base)))
 
             ;; ---- linearizable read probe: (read CONN) ----
             ;; Solo serves inline (a round would never complete); multi-voter

@@ -333,4 +333,76 @@
   (check "skip-unknown -> known version" 2        (cdr (assq 'version decoded)))
   (check "skip-unknown -> default crev"  0        (cdr (assq 'create_revision decoded))))
 
+; ===========================================================================
+(section "§C round-trip — Watch + Lease messages (cw-u4a.23)")
+; ===========================================================================
+
+; -- mvccpb.Event (PUT with kv + prev_kv) --
+(check-roundtrip "Event put" Event-schema
+  (list (cons 'type 0)
+        (cons 'kv      (list (cons 'key (b "k")) (cons 'value (b "v2")) (cons 'mod_revision 9)))
+        (cons 'prev_kv (list (cons 'key (b "k")) (cons 'value (b "v1")) (cons 'mod_revision 8)))))
+; -- Event DELETE (type=1) --
+(check-roundtrip "Event delete" Event-schema
+  (list (cons 'type 1) (cons 'kv (list (cons 'key (b "k")) (cons 'mod_revision 10)))))
+
+; -- WatchCreateRequest with range/filters/flags/watch_id --
+(check-roundtrip "WatchCreateRequest full" WatchCreateRequest-schema
+  (list (cons 'key (b "a")) (cons 'range_end (b "b")) (cons 'start_revision 5)
+        (cons 'progress_notify #t) (cons 'filters (list 0 1)) (cons 'prev_kv #t)
+        (cons 'watch_id 7) (cons 'fragment #f)))
+; -- WatchCancelRequest --
+(check-roundtrip "WatchCancelRequest" WatchCancelRequest-schema (list (cons 'watch_id 7)))
+; -- WatchRequest (create branch / cancel branch) --
+(check-roundtrip "WatchRequest create" WatchRequest-schema
+  (list (cons 'create_request (list (cons 'key (b "k")) (cons 'start_revision 3)))))
+(check-roundtrip "WatchRequest cancel" WatchRequest-schema
+  (list (cons 'cancel_request (list (cons 'watch_id 9)))))
+(check-roundtrip "WatchRequest progress" WatchRequest-schema
+  (list (cons 'progress_request '())))
+
+; -- WatchResponse with header + repeated events (field 11) --
+(check-roundtrip "WatchResponse events" WatchResponse-schema
+  (list (cons 'header (list (cons 'revision 9))) (cons 'watch_id 7) (cons 'created #f)
+        (cons 'events (list (list (cons 'type 0)
+                                  (cons 'kv (list (cons 'key (b "k")) (cons 'value (b "v")) (cons 'mod_revision 9))))
+                            (list (cons 'type 1)
+                                  (cons 'kv (list (cons 'key (b "k2")) (cons 'mod_revision 9))))))))
+; -- WatchResponse created ack (empty events) --
+(check-roundtrip "WatchResponse created" WatchResponse-schema
+  (list (cons 'header (list (cons 'revision 4))) (cons 'watch_id 1) (cons 'created #t)))
+; -- WatchResponse canceled (compact_revision + reason) --
+(check-roundtrip "WatchResponse canceled" WatchResponse-schema
+  (list (cons 'watch_id 2) (cons 'canceled #t) (cons 'compact_revision 12)
+        (cons 'cancel_reason "mvcc: required revision has been compacted")))
+
+; WIRE-COMPAT: WatchResponse.events MUST be field 11 (tag 0x5A), not 7.  A single
+; all-default Event encodes to an empty embedded message -> 5A 00.
+(check "WatchResponse events field=11 (tag 0x5A) ref bytes"
+       (u8s #x5A 0)
+       (pb-encode WatchResponse-schema (list (cons 'events (list '())))))
+
+; -- Lease grant / revoke --
+(check-roundtrip "LeaseGrantRequest"  LeaseGrantRequest-schema  (list (cons 'ttl 60) (cons 'id 0)))
+(check-roundtrip "LeaseGrantResponse" LeaseGrantResponse-schema
+  (list (cons 'header (list (cons 'revision 3))) (cons 'id 1234) (cons 'ttl 60)))
+(check-roundtrip "LeaseRevokeRequest"  LeaseRevokeRequest-schema  (list (cons 'id 1234)))
+(check-roundtrip "LeaseRevokeResponse" LeaseRevokeResponse-schema
+  (list (cons 'header (list (cons 'revision 4)))))
+; -- Lease keepalive (bidi) --
+(check-roundtrip "LeaseKeepAliveRequest"  LeaseKeepAliveRequest-schema  (list (cons 'id 1234)))
+(check-roundtrip "LeaseKeepAliveResponse" LeaseKeepAliveResponse-schema
+  (list (cons 'header (list (cons 'revision 5))) (cons 'id 1234) (cons 'ttl 60)))
+; -- Lease TTL (repeated keys bytes) --
+(check-roundtrip "LeaseTimeToLiveRequest"  LeaseTimeToLiveRequest-schema
+  (list (cons 'id 1234) (cons 'keys #t)))
+(check-roundtrip "LeaseTimeToLiveResponse" LeaseTimeToLiveResponse-schema
+  (list (cons 'header (list (cons 'revision 6))) (cons 'id 1234) (cons 'ttl 42)
+        (cons 'granted_ttl 60) (cons 'keys (list (b "k1") (b "k2")))))
+; -- Lease list (repeated LeaseStatus) --
+(check-roundtrip "LeaseLeasesResponse" LeaseLeasesResponse-schema
+  (list (cons 'header (list (cons 'revision 7)))
+        (cons 'leases (list (list (cons 'id 1)) (list (cons 'id 2)) (list (cons 'id 3))))))
+(check-roundtrip "LeaseStatus" LeaseStatus-schema (list (cons 'id 9)))
+
 (done!)

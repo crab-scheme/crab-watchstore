@@ -283,8 +283,35 @@
 
 (define (grpc-kv-main shard-pid cluster-id member-id)
 
+  ; ---- streaming state (cw-u4a.23) ----
+  ; Active bidi streams (Watch / LeaseKeepAlive): call-handle -> worker-pid.
+  ; The transport delivers a stream's client messages to THIS actor tagged with
+  ; the handle; we route them to the per-stream worker (server/grpc-watch.scm).
+  (define stream-workers (make-eqv-hashtable))
+  ; FIFO buffer of dispatcher messages (*grpc-*) that arrived while a UNARY
+  ; handler was mid `ask-shard` (its raw-receive must return the SHARD reply, not
+  ; a concurrent stream/request message).  The main loop drains these first.
+  (define grpc-pending '())
+
   ; ---- shard round-trips (this actor's PID is the reply-pid) ----
-  (define (ask-shard msg) (send shard-pid msg) (raw-receive))
+  ; raw-receive here must yield the shard's reply; any dispatcher traffic that
+  ; races in (*grpc-request* / *grpc-stream-msg* / *grpc-stream-end*) is buffered
+  ; for the main loop so we never mis-parse it as a shard ack.
+  (define (ask-shard msg)
+    (send shard-pid msg)
+    (let wait ()
+      (let ((r (raw-receive)))
+        (if (and (pair? r)
+                 (memq (car r) '(*grpc-request* *grpc-stream-msg* *grpc-stream-end*)))
+            (begin (set! grpc-pending (append grpc-pending (list r))) (wait))
+            r))))
+
+  ; next mailbox message for the main loop: buffered dispatcher traffic first
+  ; (FIFO), else a fresh receive.
+  (define (next-message)
+    (if (pair? grpc-pending)
+        (let ((m (car grpc-pending))) (set! grpc-pending (cdr grpc-pending)) m)
+        (raw-receive)))
 
   ; current (revision . term) for a ResponseHeader, read from the shard.
   (define (shard-header)
@@ -434,12 +461,100 @@
         ((eq? ack 'indeterminate) (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: leader changed")))
         (else (cons 'err (cons GRPC-INTERNAL "txn: unexpected ack"))))))
 
+  ; ---- Lease/LeaseGrant (UNARY, cw-u4a.17) ----
+  ; Propose ("LEASE-GRANT" id ttl) through the shard's async commit->ack bridge;
+  ; ack (cons "LEASE-GRANT" assigned-id).  id=0 => apply auto-assigns.
+  (define (handle-lease-grant bytes)
+    (let* ((req (pb-decode LeaseGrantRequest-schema bytes))
+           (ttl (galist 'ttl req 0))
+           (id  (galist 'id req 0))
+           (ack (ask-shard (list 'lease-grant (self) ttl id))))
+      (cond
+        ((and (pair? ack) (string? (car ack)) (string=? (car ack) "LEASE-GRANT"))
+         (cons 'ok (pb-encode LeaseGrantResponse-schema
+                              (list (cons 'header (shard-header))
+                                    (cons 'id (cdr ack)) (cons 'ttl ttl)))))
+        ((and (pair? ack) (eq? (car ack) 'lease-not-leader))
+         (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: not leader")))
+        (else (cons 'err (cons GRPC-INTERNAL "lease-grant: unexpected ack"))))))
+
+  ; ---- Lease/LeaseRevoke (UNARY, cw-u4a.17) ----
+  ; Propose ("LEASE-REVOKE" id); ack (cons "LEASE-REVOKE" (cons rev count)).
+  (define (handle-lease-revoke bytes)
+    (let* ((req (pb-decode LeaseRevokeRequest-schema bytes))
+           (id  (galist 'id req 0))
+           (ack (ask-shard (list 'lease-revoke (self) id))))
+      (cond
+        ((and (pair? ack) (string? (car ack)) (string=? (car ack) "LEASE-REVOKE"))
+         (cons 'ok (pb-encode LeaseRevokeResponse-schema
+                              (list (cons 'header (shard-header))))))
+        ((and (pair? ack) (eq? (car ack) 'lease-not-leader))
+         (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: not leader")))
+        (else (cons 'err (cons GRPC-INTERNAL "lease-revoke: unexpected ack"))))))
+
+  ; ---- Lease/LeaseTimeToLive (UNARY, cw-u4a.18) ----
+  ; Leader-gated read; ack (lease-ttl-ok id granted-ttl remaining keys).  etcd's
+  ; TTL field carries the REMAINING ttl (-1 if the lease is gone), grantedTTL the
+  ; original; keys are the attached keys when requested.
+  (define (handle-lease-ttl bytes)
+    (let* ((req (pb-decode LeaseTimeToLiveRequest-schema bytes))
+           (id  (galist 'id req 0))
+           (want-keys (galist 'keys req #f))
+           (ack (ask-shard (list 'lease-ttl (self) id want-keys))))
+      (cond
+        ((and (pair? ack) (eq? (car ack) 'lease-ttl-ok))
+         (let ((granted (list-ref ack 2)) (remaining (list-ref ack 3)) (keys (list-ref ack 4)))
+           (cons 'ok (pb-encode LeaseTimeToLiveResponse-schema
+                                (append
+                                  (list (cons 'header (shard-header))
+                                        (cons 'id id)
+                                        (cons 'ttl remaining)
+                                        (cons 'granted_ttl granted))
+                                  (if (pair? keys) (list (cons 'keys keys)) '()))))))
+        ((and (pair? ack) (eq? (car ack) 'lease-not-leader))
+         (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: not leader")))
+        (else (cons 'err (cons GRPC-INTERNAL "lease-ttl: unexpected ack"))))))
+
+  ; ---- Lease/LeaseLeases (UNARY, cw-u4a.18) ----
+  ; ack (lease-leases-ok (id ...)) -> LeaseLeasesResponse{leases:[{ID}...]}.
+  (define (handle-lease-leases bytes)
+    (let ((ack (ask-shard (list 'lease-leases (self)))))
+      (cond
+        ((and (pair? ack) (eq? (car ack) 'lease-leases-ok))
+         (cons 'ok (pb-encode LeaseLeasesResponse-schema
+                              (list (cons 'header (shard-header))
+                                    (cons 'leases (map (lambda (id) (list (cons 'id id)))
+                                                       (cadr ack)))))))
+        ((and (pair? ack) (eq? (car ack) 'lease-not-leader))
+         (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: not leader")))
+        (else (cons 'err (cons GRPC-INTERNAL "lease-leases: unexpected ack"))))))
+
   ; ===========================================================================
   ; dispatch one request handle
   ; ===========================================================================
+  ; Streaming paths (Watch / LeaseKeepAlive are bidi) spawn a per-stream worker
+  ; (server/grpc-watch.scm) and register it in stream-workers; everything else is
+  ; served UNARY inline.
+  ; The worker reads its FIRST client message itself via (grpc-request-bytes h)
+  ; (the call slot lives until the worker closes the stream).  We pass only h +
+  ; sendable scalars/pid — a bytevector spawn ARG would render as a #vu8(...)
+  ; literal the spawn-source bootstrap reader rejects.
+  (define (start-stream-worker! h entry)
+    (let ((wpid (spawn-source "(include \"src/server/grpc-watch.scm\")" entry
+                              h shard-pid cluster-id member-id)))
+      (hashtable-set! stream-workers h wpid)))
+
   (define (dispatch! h)
-    (let* ((path  (grpc-request-path h))
-           (bytes (grpc-request-bytes h))
+    (let ((path (grpc-request-path h)))
+      (cond
+        ((string=? path "/etcdserverpb.Watch/Watch")
+         (start-stream-worker! h 'grpc-watch-worker))
+        ((string=? path "/etcdserverpb.Lease/LeaseKeepAlive")
+         (start-stream-worker! h 'grpc-lease-keepalive-worker))
+        (else (dispatch-unary! h path)))))
+
+  (define (dispatch-unary! h path)
+    (let* ((bytes (grpc-request-bytes h))
            (res   (guard (e (#t (cons 'err (cons GRPC-INTERNAL
                                                  (string-append "handler error")))))
                     (cond
@@ -448,6 +563,11 @@
                       ((string=? path "/etcdserverpb.KV/DeleteRange") (handle-delete-range bytes))
                       ((string=? path "/etcdserverpb.KV/Txn")         (handle-txn bytes))
                       ((string=? path "/etcdserverpb.KV/Compact")     (handle-compact bytes))
+                      ; Lease UNARY RPCs (cw-u4a.17/.18); KeepAlive is bidi (above).
+                      ((string=? path "/etcdserverpb.Lease/LeaseGrant")      (handle-lease-grant bytes))
+                      ((string=? path "/etcdserverpb.Lease/LeaseRevoke")     (handle-lease-revoke bytes))
+                      ((string=? path "/etcdserverpb.Lease/LeaseTimeToLive") (handle-lease-ttl bytes))
+                      ((string=? path "/etcdserverpb.Lease/LeaseLeases")     (handle-lease-leases bytes))
                       ; minimal Status/MemberList STUBS so etcdctl's balancer connects
                       ; (full Maintenance/Cluster are cw-u4a.30/.32).
                       ((string=? path "/etcdserverpb.Maintenance/Status") (handle-status bytes))
@@ -484,12 +604,28 @@
                                                  (cons 'peerURLs '()))))))))
 
   ; ===========================================================================
-  ; main loop: pure mailbox dispatch
+  ; main loop: pure mailbox dispatch (unary inline + stream routing)
   ; ===========================================================================
   (let loop ()
-    (let ((m (raw-receive)))
+    (let ((m (next-message)))
       (cond
         ((not (pair? m)) (loop))
         ((eq? (car m) '*grpc-request*)
          (dispatch! (cadr m)) (loop))
+        ; a subsequent client-streamed message -> forward to the stream worker.
+        ; A dead worker (it crashed / already exited) must NOT take down the
+        ; dispatcher: guard the send and drop the stale route.
+        ((eq? (car m) '*grpc-stream-msg*)
+         (let ((w (hashtable-ref stream-workers (cadr m) #f)))
+           (when w
+             (guard (e (#t (hashtable-delete! stream-workers (cadr m))))
+               (send w (list 'client-msg (caddr m))))))
+         (loop))
+        ; client half-closed -> tell the worker to tear down + drop the route
+        ((eq? (car m) '*grpc-stream-end*)
+         (let ((w (hashtable-ref stream-workers (cadr m) #f)))
+           (when w
+             (guard (e (#t #f)) (send w (list 'client-end)))
+             (hashtable-delete! stream-workers (cadr m))))
+         (loop))
         (else (loop))))))

@@ -592,7 +592,11 @@
                    (send reply-pid (cons 'watch-not-leader leader))
                    (let* ((deliver-fn
                            (lambda (wr)
-                             (send reply-pid (list 'watch-response (watch-response->sexp wr)))))
+                             ; A registry's delivery must NEVER crash the registry:
+                             ; the per-conn consumer (the gRPC stream worker) may have
+                             ; exited, and `send` to a dead actor raises.  Guard it.
+                             (guard (e (#t #f))
+                               (send reply-pid (list 'watch-response (watch-response->sexp wr))))))
                           (res (watch-register! watch-reg ctx spec deliver-fn)))
                      (if (and (pair? res) (eq? (car res) 'compacted))
                          (send reply-pid (cons 'watch-compacted (cdr res)))

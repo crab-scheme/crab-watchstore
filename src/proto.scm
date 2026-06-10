@@ -440,10 +440,14 @@
                                    (accumulate acc name
                                                (pb-decode (fs-submessage-schema spec) inner)
                                                #t)))))
-                        ; repeated scalar — may arrive PACKED (LEN) or as
-                        ; individual TLVs (older/non-packed encoders).
+                        ; repeated scalar.  A LEN wire type means PACKED only
+                        ; for a packable (varint/fixed) type; repeated
+                        ; string/bytes are ALSO LEN-wire but each occurrence is
+                        ; ONE element (never packed), so read it as a single
+                        ; scalar.  (Without this guard a repeated-bytes field
+                        ; mis-decodes its payload as a packed varint array.)
                         ((fs-repeated? spec)
-                         (if (= wt WT-LEN)
+                         (if (and (= wt WT-LEN) (scalar-packable? type))
                              (call-with-values
                                (lambda () (read-len-delim bv after-tag))
                                (lambda (inner next)
@@ -672,3 +676,123 @@
 (define (deref-schema ref-sym)
   (let ((cell (assq ref-sym schema-ref-table)))
     (if cell ((cdr cell)) (error "deref-schema: unknown schema ref" ref-sym))))
+
+; ============================================================================
+; etcd v3 Watch-service message schemas (canonical field numbers).
+; rpc.proto WatchRequest/WatchResponse + mvccpb.Event.  THIS is pure DATA on
+; top of the codec — the Watch gRPC binding (.23) decodes WatchRequest and
+; encodes WatchResponse against these schemas; no codec code changes.
+; ============================================================================
+
+; mvccpb.Event{type=1 enum(PUT=0,DELETE=1), kv=2 KeyValue, prev_kv=3 KeyValue}
+(define Event-schema
+  (list
+    (list 1 'type    'enum 'optional)
+    (list 2 'kv      '(message KeyValue-schema-ref) 'optional)
+    (list 3 'prev_kv '(message KeyValue-schema-ref) 'optional)))
+
+; etcdserverpb.WatchCreateRequest
+(define WatchCreateRequest-schema
+  '((1 key             bytes optional)
+    (2 range_end       bytes optional)
+    (3 start_revision  int64 optional)
+    (4 progress_notify bool  optional)
+    (5 filters         enum  repeated)
+    (6 prev_kv         bool  optional)
+    (7 watch_id        int64 optional)
+    (8 fragment        bool  optional)))
+
+; etcdserverpb.WatchCancelRequest
+(define WatchCancelRequest-schema
+  '((1 watch_id int64 optional)))
+
+; etcdserverpb.WatchProgressRequest (no fields)
+(define WatchProgressRequest-schema '())
+
+; etcdserverpb.WatchRequest — oneof request_union(create=1,cancel=2,progress=3).
+; Each branch an embedded message; pb-decode leaves the absent ones #f.
+(define WatchRequest-schema
+  (list
+    (list 1 'create_request   '(message WatchCreateRequest-schema-ref)   'optional)
+    (list 2 'cancel_request   '(message WatchCancelRequest-schema-ref)   'optional)
+    (list 3 'progress_request '(message WatchProgressRequest-schema-ref) 'optional)))
+
+; etcdserverpb.WatchResponse — note events is field 11 (NOT 7).
+(define WatchResponse-schema
+  (list
+    (list 1  'header           '(message ResponseHeader-schema-ref) 'optional)
+    (list 2  'watch_id         'int64  'optional)
+    (list 3  'created          'bool   'optional)
+    (list 4  'canceled         'bool   'optional)
+    (list 5  'compact_revision 'int64  'optional)
+    (list 6  'cancel_reason    'string 'optional)
+    (list 7  'fragment         'bool   'optional)
+    (list 11 'events           '(message Event-schema-ref) 'repeated)))
+
+; ============================================================================
+; etcd v3 Lease-service message schemas (canonical field numbers).
+; rpc.proto LeaseGrant/Revoke/KeepAlive/TimeToLive/Leases.  Field names are
+; lowercased here (the wire only cares about numbers); the Lease bindings
+; (.23 unary + KeepAlive bidi) read these symbols.
+; ============================================================================
+
+(define LeaseGrantRequest-schema
+  '((1 ttl int64 optional)
+    (2 id  int64 optional)))
+
+(define LeaseGrantResponse-schema
+  (list
+    (list 1 'header '(message ResponseHeader-schema-ref) 'optional)
+    (list 2 'id     'int64  'optional)
+    (list 3 'ttl    'int64  'optional)
+    (list 4 'error  'string 'optional)))
+
+(define LeaseRevokeRequest-schema
+  '((1 id int64 optional)))
+
+(define LeaseRevokeResponse-schema
+  (list
+    (list 1 'header '(message ResponseHeader-schema-ref) 'optional)))
+
+(define LeaseKeepAliveRequest-schema
+  '((1 id int64 optional)))
+
+(define LeaseKeepAliveResponse-schema
+  (list
+    (list 1 'header '(message ResponseHeader-schema-ref) 'optional)
+    (list 2 'id     'int64 'optional)
+    (list 3 'ttl    'int64 'optional)))
+
+(define LeaseTimeToLiveRequest-schema
+  '((1 id   int64 optional)
+    (2 keys bool  optional)))
+
+(define LeaseTimeToLiveResponse-schema
+  (list
+    (list 1 'header      '(message ResponseHeader-schema-ref) 'optional)
+    (list 2 'id          'int64 'optional)
+    (list 3 'ttl         'int64 'optional)
+    (list 4 'granted_ttl 'int64 'optional)
+    (list 5 'keys        'bytes 'repeated)))
+
+(define LeaseLeasesRequest-schema '())
+
+; etcdserverpb.LeaseStatus{ID=1}
+(define LeaseStatus-schema
+  '((1 id int64 optional)))
+
+(define LeaseLeasesResponse-schema
+  (list
+    (list 1 'header '(message ResponseHeader-schema-ref) 'optional)
+    (list 2 'leases '(message LeaseStatus-schema-ref) 'repeated)))
+
+; Register the nested-message refs (lazy thunks; order-independent, additive).
+(set! schema-ref-table
+      (append
+        (list
+          (cons 'Event-schema-ref                (lambda () Event-schema))
+          (cons 'WatchCreateRequest-schema-ref   (lambda () WatchCreateRequest-schema))
+          (cons 'WatchCancelRequest-schema-ref   (lambda () WatchCancelRequest-schema))
+          (cons 'WatchProgressRequest-schema-ref (lambda () WatchProgressRequest-schema))
+          (cons 'LeaseStatus-schema-ref          (lambda () LeaseStatus-schema)))
+        schema-ref-table))

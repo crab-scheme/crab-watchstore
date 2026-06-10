@@ -174,15 +174,15 @@ echo "  $st"
 assert_contains '"version":"3.6.0"' "$st" "endpoint status returns version (stub)"
 
 echo
-echo "== etcdctl: an unhandled RPC (Lease) returns UNIMPLEMENTED (12) =="
-# Lease/Auth/Watch services are NOT bound by cw-u4a.22 — an unknown path must come
-# back UNIMPLEMENTED so the client gets a clean gRPC status (not a torn stream).
-un="$( "${ECTL[@]}" lease grant 60 2>&1 | grep -v unrecognized )"
-echo "  lease grant -> $un"
+echo "== etcdctl: an unhandled RPC (Auth) returns UNIMPLEMENTED (12) =="
+# Lease + Watch ARE bound now (cw-u4a.23); Auth is NOT (cw-u4a.25-.27) — an unknown
+# path must come back UNIMPLEMENTED so the client gets a clean gRPC status.
+un="$( "${ECTL[@]}" auth status 2>&1 | grep -v unrecognized )"
+echo "  auth status -> $un"
 if echo "$un" | grep -qiE "Unimplemented|unimplemented method|code = Unimplemented"; then
-  ok "unhandled Lease RPC -> UNIMPLEMENTED(12)"
+  ok "unhandled Auth RPC -> UNIMPLEMENTED(12)"
 else
-  bad "unhandled Lease RPC -> UNIMPLEMENTED(12)" "got: $un"
+  bad "unhandled Auth RPC -> UNIMPLEMENTED(12)" "got: $un"
 fi
 
 echo

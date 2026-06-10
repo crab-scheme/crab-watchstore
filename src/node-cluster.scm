@@ -184,9 +184,19 @@
 (define client-addr (string-append client-host ":" (number->string client-port)))
 (define shard-pid   (table-lookup 'ws-shard-pid (qk)))
 
+; name->peerURL table for the Cluster gRPC service (cw-u4a.30): each node's raft addr
+; is its peer URL.  MemberList reports these (best-effort); runtime-added nodes that
+; aren't in the spec report an empty peerURL.  A list of (name-string peerurl-string)
+; — sendable as a quoted datum (lists of strings serialize like dial-addrs above).
+(define cluster-members
+  (map (lambda (e)
+         (list (symbol->string (car e))
+               (string-append "http://" (cadr e) ":" (number->string (caddr e)))))
+       nodes))
+
 (define grpc-handler
   (spawn-source-dedicated "(include \"src/server/grpc-kv.scm\")" 'grpc-kv-main
-                          shard-pid cluster-id member-id))
+                          shard-pid cluster-id member-id cluster-members))
 ; TLS path (cw-u4a.21) iff --tls-cert was given; otherwise the original h2c
 ; server.  grpc-serve-tls reuses the SAME handler actor — TLS only wraps the IO.
 (define grpc-sid

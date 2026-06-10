@@ -114,13 +114,15 @@
     (list 5 'raftIndex  'uint64 'optional)
     (list 6 'raftTerm   'uint64 'optional)))
 
-; etcdserverpb.Member{ID=1, name=2, peerURLs=3(rep string), clientURLs=4(rep string)}.
+; etcdserverpb.Member{ID=1, name=2, peerURLs=3(rep string), clientURLs=4(rep string),
+;   isLearner=5(bool)}.  isLearner (cw-u4a.30) distinguishes a non-voting learner.
 (define Member-schema
   (list
     (list 1 'ID         'uint64 'optional)
     (list 2 'name       'string 'optional)
     (list 3 'peerURLs   'string 'repeated)
-    (list 4 'clientURLs 'string 'repeated)))
+    (list 4 'clientURLs 'string 'repeated)
+    (list 5 'isLearner  'bool   'optional)))
 
 ; etcdserverpb.MemberListResponse{header=1, members=2(repeated Member)}.
 (define MemberListResponse-schema
@@ -128,11 +130,97 @@
     (list 1 'header  '(message ResponseHeader-schema-ref) 'optional)
     (list 2 'members '(message Member-schema-ref)         'repeated)))
 
+; ---- Cluster service request/response messages (cw-u4a.30; etcd rpc.proto fields) ----
+; MemberAddResponse nests Member (member=2) + repeated Member (members=3); every other
+; mutation/list response carries the full member list.  Member is the only NESTED schema
+; here, so Member-schema-ref (registered below) is the only ref the codec must resolve —
+; the *Response/*Request schemas are always TOP-LEVEL encode/decode targets.
+(define MemberAddRequest-schema
+  (list
+    (list 1 'peerURLs  'string 'repeated)
+    (list 2 'isLearner 'bool   'optional)))
+(define MemberAddResponse-schema
+  (list
+    (list 1 'header  '(message ResponseHeader-schema-ref) 'optional)
+    (list 2 'member  '(message Member-schema-ref)         'optional)
+    (list 3 'members '(message Member-schema-ref)         'repeated)))
+(define MemberRemoveRequest-schema
+  (list (list 1 'ID 'uint64 'optional)))
+(define MemberRemoveResponse-schema
+  (list
+    (list 1 'header  '(message ResponseHeader-schema-ref) 'optional)
+    (list 2 'members '(message Member-schema-ref)         'repeated)))
+(define MemberUpdateRequest-schema
+  (list
+    (list 1 'ID       'uint64 'optional)
+    (list 2 'peerURLs 'string 'repeated)))
+(define MemberUpdateResponse-schema
+  (list
+    (list 1 'header  '(message ResponseHeader-schema-ref) 'optional)
+    (list 2 'members '(message Member-schema-ref)         'repeated)))
+(define MemberPromoteRequest-schema
+  (list (list 1 'ID 'uint64 'optional)))
+(define MemberPromoteResponse-schema
+  (list
+    (list 1 'header  '(message ResponseHeader-schema-ref) 'optional)
+    (list 2 'members '(message Member-schema-ref)         'repeated)))
+; MemberListRequest{linearizable=1 bool} — parse-tolerant; the field is ignored (we
+; always serve THIS node's replicated config view).
+(define MemberListRequest-schema
+  (list (list 1 'linearizable 'bool 'optional)))
+
 ; Register Member-schema-ref so the nested-message codec can resolve the repeated
 ; Member field.  proto.scm's deref-schema reads schema-ref-table at call time, so
 ; appending here (once, at include time) is additive and order-independent.
 (set! schema-ref-table
       (cons (cons 'Member-schema-ref (lambda () Member-schema)) schema-ref-table))
+
+; ===========================================================================
+; uint64 member-ID <-> node-name bijection (cw-u4a.30) — deterministic, stateless.
+; ===========================================================================
+; name->id is an FNV-1a fold of the node-name string into a positive integer in
+; [1, 1e9] (kept well under 2^32 to dodge the i64-wrap in bitwise/shift, cw-u4a.41;
+; etcdctl only displays it as hex and round-trips it).  It is IDENTICAL to
+; node-cluster.scm's stable-id, so a node's own member-id spawn arg equals
+; (member-name->id its-own-name) — the local member's MemberList ID matches the
+; ResponseHeader member_id.  Collisions across ~5-20 short names cannot occur (the
+; cluster test asserts the IDs are distinct).
+(define (member-name->id name-str)
+  (let loop ((i 0) (h 2166136261))
+    (if (= i (string-length name-str))
+        (+ 1 (modulo h 1000000000))
+        (loop (+ i 1)
+              (modulo (* (bitwise-xor h (char->integer (string-ref name-str i))) 16777619)
+                      4294967296)))))
+
+; id -> node-name SYMBOL, scanning a candidate name set (voters U learners U the
+; cluster-spec names) for the one whose hash == id.  #f if none matches (a Remove/
+; Promote/Update for an unknown ID -> a "member not found" gRPC error).
+(define (member-id->name id candidates)
+  (let loop ((cs candidates))
+    (cond ((null? cs) #f)
+          ((= (member-name->id (symbol->string (car cs))) id) (car cs))
+          (else (loop (cdr cs))))))
+
+; Take the node-name from a peerURL HOST (convention: "http://NAME:port" -> NAME;
+; also tolerates "NAME:port" / "NAME").  etcd's MemberAddRequest carries no name, and
+; in our model the node-name IS the cluster identity, so MemberAdd derives it here.
+; -> NAME symbol, or #f for an empty/host-less URL.
+(define (peer-url->name url)
+  (let* ((rest (let scan ((i 0))                      ; strip a "scheme://" prefix
+                 (cond ((> (+ i 3) (string-length url)) url)
+                       ((and (char=? (string-ref url i) #\:)
+                             (char=? (string-ref url (+ i 1)) #\/)
+                             (char=? (string-ref url (+ i 2)) #\/))
+                        (substring url (+ i 3) (string-length url)))
+                       (else (scan (+ i 1))))))
+         (end  (let scan ((i 0))                       ; up to the first ":port" / "/path"
+                 (cond ((= i (string-length rest)) i)
+                       ((or (char=? (string-ref rest i) #\:)
+                            (char=? (string-ref rest i) #\/)) i)
+                       (else (scan (+ i 1))))))
+         (host (substring rest 0 end)))
+    (if (= (string-length host) 0) #f (string->symbol host))))
 
 ; ===========================================================================
 ; ResponseHeader  (cluster-id / member-id are spawn args; rev/term per-op)
@@ -285,7 +373,11 @@
 ; the actor
 ; ===========================================================================
 
-(define (grpc-kv-main shard-pid cluster-id member-id)
+(define (grpc-kv-main shard-pid cluster-id member-id cluster-members)
+  ; cluster-members (cw-u4a.30): the static --cluster spec as a list of
+  ; (name-string peerurl-string), e.g. (("a" "http://127.0.0.1:7001") ...).  Used by
+  ; the Cluster service to report peerURLs in MemberList and as an extra id->name
+  ; candidate source.  Runtime-added nodes (not in the spec) report an empty peerURL.
 
   ; ---- streaming state (cw-u4a.23) ----
   ; Active bidi streams (Watch / LeaseKeepAlive): call-handle -> worker-pid.
@@ -342,6 +434,81 @@
 
   ; propose an internal write command; returns the shard ack.
   (define (shard-write cmd) (ask-shard (cons (self) cmd)))
+
+  ; ===========================================================================
+  ; Cluster service helpers (cw-u4a.30) — node-name <-> etcd Member, over the .29
+  ; membership mailbox.  cluster-members supplies the static peerURLs.
+  ; ===========================================================================
+
+  ; node-name string -> its static peerURL (from the --cluster spec), or "" if the
+  ; node was added at runtime (not in the spec; addresses are not modeled past .29).
+  (define (name->peer-url name-str)
+    (let ((c (assoc name-str cluster-members)))   ; string keys -> assoc/equal?
+      (if c (cadr c) "")))
+
+  ; the static cluster-spec node names (symbols) — extra id->name candidates.
+  (define spec-names (map (lambda (e) (string->symbol (car e))) cluster-members))
+
+  ; a name SYMBOL -> its peerURLs list ((url) or ()) for a Member message.
+  (define (peer-urls-of name-sym)
+    (let ((u (name->peer-url (symbol->string name-sym))))
+      (if (> (string-length u) 0) (list u) '())))
+
+  ; build one etcd Member alist for a node-name SYMBOL.  peer-urls is an explicit
+  ; list of url strings (the requested URLs for a just-added node, else the spec's).
+  (define (member-alist name-sym learner? peer-urls)
+    (list (cons 'ID         (member-name->id (symbol->string name-sym)))
+          (cons 'name       (symbol->string name-sym))
+          (cons 'peerURLs   peer-urls)
+          (cons 'clientURLs '())
+          (cons 'isLearner  learner?)))
+
+  ; voter + learner symbol lists -> the etcd `members` list (voters first, isLearner
+  ; #f; learners next, isLearner #t), peerURLs from the static spec.
+  (define (members-of voters learners)
+    (append (map (lambda (n) (member-alist n #f (peer-urls-of n))) voters)
+            (map (lambda (n) (member-alist n #t (peer-urls-of n))) learners)))
+
+  ; read THIS node's replicated config (un-gated; (member-list voters learners)) and
+  ; render it as the etcd `members` list.  Used by MemberList + MemberUpdate.
+  (define (current-members)
+    (let ((r (ask-shard (list 'member-list (self)))))
+      (if (and (pair? r) (eq? (car r) 'member-list))
+          (members-of (cadr r) (caddr r))
+          '())))
+
+  ; resolve an etcd member ID -> node-name SYMBOL, scanning voters U learners U the
+  ; cluster-spec names.  #f if no candidate hashes to ID.
+  (define (resolve-id->name id)
+    (let* ((r (ask-shard (list 'member-list (self))))
+           (cands (if (and (pair? r) (eq? (car r) 'member-list))
+                      (append (cadr r) (caddr r) spec-names)
+                      spec-names)))
+      (member-id->name id cands)))
+
+  ; Map a .29 member-* async outcome to (cons 'ok bytes) | (cons 'err (status . msg)).
+  ; The mutating ops ack ASYNCHRONOUSLY only once the ConfChange COMMITS:
+  ;   (member-ok VOTERS LEARNERS)  -> success; `build` renders the post-commit config.
+  ;   (member-not-leader . LEADER) -> UNAVAILABLE(14), naming the leader (client retargets).
+  ;   member-pending               -> FAILED_PRECONDITION(9), a change is already in flight.
+  ;   member-indeterminate         -> UNAVAILABLE(14), leader stepped down mid-change; retry.
+  ; (member-ok is a PROPER list -> cadr/caddr; member-not-leader is a DOTTED pair -> cdr.)
+  (define (member-outcome->resp r build)
+    (cond
+      ((and (pair? r) (eq? (car r) 'member-ok))
+       (cons 'ok (build (cadr r) (caddr r))))
+      ((and (pair? r) (eq? (car r) 'member-not-leader))
+       (cons 'err (cons GRPC-UNAVAILABLE
+                        (if (cdr r)
+                            (string-append "etcdserver: not leader, leader is "
+                                           (symbol->string (cdr r)))
+                            "etcdserver: not leader"))))
+      ((eq? r 'member-pending)
+       (cons 'err (cons GRPC-FAILED-PRECONDITION
+                        "etcdserver: cluster reconfiguration in progress")))
+      ((eq? r 'member-indeterminate)
+       (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: leader changed, retry")))
+      (else (cons 'err (cons GRPC-INTERNAL "member: unexpected ack")))))
 
   ; ===========================================================================
   ; Auth enforcement (cw-u4a.26, ADR 0004 §4/§5) — the leader-local token table +
@@ -967,10 +1134,17 @@
                       ((string=? path "/etcdserverpb.Lease/LeaseRevoke")     (handle-lease-revoke bytes))
                       ((string=? path "/etcdserverpb.Lease/LeaseTimeToLive") (handle-lease-ttl bytes))
                       ((string=? path "/etcdserverpb.Lease/LeaseLeases")     (handle-lease-leases bytes))
-                      ; minimal Status/MemberList STUBS so etcdctl's balancer connects
-                      ; (full Maintenance/Cluster are cw-u4a.30/.32).
+                      ; Cluster service (cw-u4a.30): real replicated membership over the
+                      ; .29 mailbox.  MemberList reports THIS node's config; the four
+                      ; mutating ops drive raft-propose-conf-change + block on the commit.
+                      ((string=? path "/etcdserverpb.Cluster/MemberList")    (handle-member-list bytes))
+                      ((string=? path "/etcdserverpb.Cluster/MemberAdd")     (handle-member-add bytes))
+                      ((string=? path "/etcdserverpb.Cluster/MemberRemove")  (handle-member-remove bytes))
+                      ((string=? path "/etcdserverpb.Cluster/MemberUpdate")  (handle-member-update bytes))
+                      ((string=? path "/etcdserverpb.Cluster/MemberPromote") (handle-member-promote bytes))
+                      ; minimal Maintenance/Status STUB so etcdctl's balancer connects +
+                      ; `endpoint status` prints (full Maintenance is cw-u4a.32).
                       ((string=? path "/etcdserverpb.Maintenance/Status") (handle-status bytes))
-                      ((string=? path "/etcdserverpb.Cluster/MemberList") (handle-member-list bytes))
                       (else (cons 'unimplemented path))))))
       (cond
         ((and (pair? res) (eq? (car res) 'ok))
@@ -982,7 +1156,7 @@
                               (string-append "unimplemented method: " (cdr res))))
         (else (grpc-respond-error! h GRPC-INTERNAL "handler produced no response")))))
 
-  ; ---- Maintenance/Status + Cluster/MemberList stubs (schemas are at module top) ----
+  ; ---- Maintenance/Status STUB (schema is at module top) ----
   ; Just enough for etcdctl's balancer to connect + `endpoint status` to print.
   (define (handle-status bytes)
     (let ((hdr (shard-header)))
@@ -993,14 +1167,82 @@
                                  (cons 'leader member-id)
                                  (cons 'raftIndex (galist 'revision hdr 0))
                                  (cons 'raftTerm (galist 'raft_term hdr 0)))))))
+
+  ; ===========================================================================
+  ; Cluster service handlers (cw-u4a.30)
+  ; ===========================================================================
+
+  ; ---- Cluster/MemberList ---- REAL replicated config (replaces the .22 stub).
+  ; Reads THIS node's voters/learners (un-gated) and renders them as etcd Members.
+  ; MemberListRequest.linearizable is ignored (parse-tolerant; config is local).
   (define (handle-member-list bytes)
     (cons 'ok (pb-encode MemberListResponse-schema
-                         (list (cons 'header (shard-header))
-                               (cons 'members
-                                     (list (list (cons 'ID member-id)
-                                                 (cons 'name "crab-watchstore-0")
-                                                 (cons 'clientURLs '())
-                                                 (cons 'peerURLs '()))))))))
+                         (list (cons 'header  (shard-header))
+                               (cons 'members (current-members))))))
+
+  ; ---- Cluster/MemberAdd ---- derive NODE-NAME from peerURLs[0]'s host, propose
+  ; (member-add (self) name isLearner?), BLOCK on the async commit (etcd MemberAdd
+  ; blocks until the conf change commits; the peer-poller keeps ticking the shard so
+  ; it makes progress).  Response member = the new member (with the REQUESTED peerURLs);
+  ; members = the full post-commit list.
+  (define (handle-member-add bytes)
+    (let* ((req       (pb-decode MemberAddRequest-schema bytes))
+           (peer-urls (galist 'peerURLs req '()))
+           (learner?  (galist 'isLearner req #f))
+           (name      (peer-url->name (if (pair? peer-urls) (car peer-urls) ""))))
+      (if (not name)
+          (cons 'err (cons GRPC-INVALID-ARGUMENT "etcdserver: peerURL is required"))
+          (member-outcome->resp
+            (ask-shard (list 'member-add (self) name learner?))
+            (lambda (voters learners)
+              (pb-encode MemberAddResponse-schema
+                         (list (cons 'header  (shard-header))
+                               (cons 'member  (member-alist name learner? peer-urls))
+                               (cons 'members (members-of voters learners)))))))))
+
+  ; ---- Cluster/MemberRemove ---- ID -> name, propose (member-remove (self) name),
+  ; block on commit; response = the full post-commit member list.
+  (define (handle-member-remove bytes)
+    (let* ((req  (pb-decode MemberRemoveRequest-schema bytes))
+           (id   (galist 'ID req 0))
+           (name (resolve-id->name id)))
+      (if (not name)
+          (cons 'err (cons GRPC-FAILED-PRECONDITION "etcdserver: member not found"))
+          (member-outcome->resp
+            (ask-shard (list 'member-remove (self) name))
+            (lambda (voters learners)
+              (pb-encode MemberRemoveResponse-schema
+                         (list (cons 'header  (shard-header))
+                               (cons 'members (members-of voters learners)))))))))
+
+  ; ---- Cluster/MemberPromote ---- ID -> name, propose (member-promote (self) name)
+  ; (learner -> voter, two-phase), block on commit; response = the full member list.
+  (define (handle-member-promote bytes)
+    (let* ((req  (pb-decode MemberPromoteRequest-schema bytes))
+           (id   (galist 'ID req 0))
+           (name (resolve-id->name id)))
+      (if (not name)
+          (cons 'err (cons GRPC-FAILED-PRECONDITION "etcdserver: member not found"))
+          (member-outcome->resp
+            (ask-shard (list 'member-promote (self) name))
+            (lambda (voters learners)
+              (pb-encode MemberPromoteResponse-schema
+                         (list (cons 'header  (shard-header))
+                               (cons 'members (members-of voters learners)))))))))
+
+  ; ---- Cluster/MemberUpdate ---- node addresses are STATIC (from the --cluster spec),
+  ; so a peerURL change is a no-op in the consensus layer (runtime addr-change is not a
+  ; .29 capability).  We validate the ID resolves, then return the CURRENT member list
+  ; WITHOUT fabricating a ConfChange.
+  (define (handle-member-update bytes)
+    (let* ((req  (pb-decode MemberUpdateRequest-schema bytes))
+           (id   (galist 'ID req 0))
+           (name (resolve-id->name id)))
+      (if (not name)
+          (cons 'err (cons GRPC-FAILED-PRECONDITION "etcdserver: member not found"))
+          (cons 'ok (pb-encode MemberUpdateResponse-schema
+                               (list (cons 'header  (shard-header))
+                                     (cons 'members (current-members))))))))
 
   ; ===========================================================================
   ; main loop: pure mailbox dispatch (unary inline + stream routing)

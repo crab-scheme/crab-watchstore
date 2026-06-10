@@ -1,0 +1,10 @@
+/target/
+/store/
+/classes/
+*.jar
+.nrepl-port
+.lein-*
+# docker build inputs (extracted ~49M Linux binary, copied src, ssh keys) — not committed
+docker/crabscheme
+docker/src/
+docker/keys/

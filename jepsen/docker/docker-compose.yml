@@ -1,0 +1,46 @@
+# A self-contained, arm64-native Jepsen cluster for crab-watchstore:
+#   control  — runs `lein run test ...` (the jetcd client lives here)
+#   n1..n5   — DB nodes (resolve each other + control by name via compose DNS);
+#              each serves the etcd v3 gRPC API on :2379 (h2c) and Raft on :7000
+#
+#   docker compose -f jepsen/docker/docker-compose.yml up -d --build
+#   docker compose -f jepsen/docker/docker-compose.yml exec control bash
+#     lein run test --workload register --nemesis none \
+#                   --nodes n1,n2,n3,n4,n5 --username root \
+#                   --ssh-private-key /root/.ssh/id_jepsen --time-limit 30
+name: crabwatchstore-jepsen
+
+networks:
+  jepsen:
+    driver: bridge
+
+x-node: &node
+  build:
+    context: .
+    dockerfile: Dockerfile.node
+  image: crabwatchstore-jepsen-node
+  cap_add: [NET_ADMIN, SYS_TIME]   # NET_ADMIN: iptables partitions
+  networks: [jepsen]
+
+services:
+  control:
+    build:
+      context: .
+      dockerfile: Dockerfile.control
+    image: crabwatchstore-jepsen-control
+    container_name: jcws-control
+    networks: [jepsen]
+    volumes:
+      - ../../:/crab-watchstore     # live repo (the jepsen/ project)
+      - m2:/root/.m2                # cache lein deps across restarts
+    working_dir: /crab-watchstore/jepsen
+    command: ["sleep", "infinity"]
+
+  n1: {<<: *node, hostname: n1, container_name: jcws-n1}
+  n2: {<<: *node, hostname: n2, container_name: jcws-n2}
+  n3: {<<: *node, hostname: n3, container_name: jcws-n3}
+  n4: {<<: *node, hostname: n4, container_name: jcws-n4}
+  n5: {<<: *node, hostname: n5, container_name: jcws-n5}
+
+volumes:
+  m2:

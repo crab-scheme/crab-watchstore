@@ -1,0 +1,19 @@
+# Jepsen control node: lein + JDK + gnuplot/graphviz (perf + Knossos rendering)
+# + an ssh client/key to drive the DB nodes. The jepsen project itself is
+# bind-mounted at /crab-watchstore/jepsen by docker-compose (live, editable).
+# The jetcd client (etcd v3 gRPC) runs here and dials n1..n5:2379 over h2c.
+FROM clojure:temurin-21-lein-bookworm
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      gnuplot graphviz openssh-client rsync iputils-ping git \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY keys/id_jepsen /root/.ssh/id_jepsen
+RUN chmod 700 /root/.ssh \
+ && chmod 600 /root/.ssh/id_jepsen \
+ && printf 'Host *\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n  User root\n  IdentityFile /root/.ssh/id_jepsen\n' > /root/.ssh/config \
+ && chmod 600 /root/.ssh/config
+
+WORKDIR /crab-watchstore/jepsen
+CMD ["sleep", "infinity"]

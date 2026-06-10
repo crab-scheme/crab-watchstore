@@ -1,0 +1,27 @@
+# A crab-watchstore Jepsen DB node: sshd + iptables (partitions) + the crabscheme
+# binary and crab-watchstore src pre-baked under /opt/crabwatchstore. arm64-native.
+FROM debian:bookworm
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      openssh-server sudo iptables iproute2 procps libstdc++6 ca-certificates \
+ && rm -rf /var/lib/apt/lists/* \
+ && (update-alternatives --set iptables  /usr/sbin/iptables-legacy  || true) \
+ && (update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy || true) \
+ && mkdir -p /opt/crabwatchstore /run/sshd /root/.ssh \
+ && sed -ri 's/^#?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
+
+# The arm64-Linux binary (built with --features stdlib-store,grpc — the gRPC
+# transport is REQUIRED, unlike crab-cache's RESP build) + the crab-watchstore
+# Scheme source.
+COPY crabscheme /opt/crabwatchstore/crabscheme
+COPY src        /opt/crabwatchstore/src
+COPY keys/id_jepsen.pub /root/.ssh/authorized_keys
+
+RUN chmod +x /opt/crabwatchstore/crabscheme \
+ && chmod 700 /root/.ssh \
+ && chmod 600 /root/.ssh/authorized_keys
+
+# 22 ssh; 2379 etcd v3 gRPC client (h2c); 7000 Raft inter-node.
+EXPOSE 22 2379 7000
+CMD ["/usr/sbin/sshd", "-D", "-e"]

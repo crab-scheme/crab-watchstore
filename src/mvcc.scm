@@ -98,12 +98,67 @@
 ; index entry is 0x03 || u64be(leaseId) || K, so the user-key K is everything
 ; after the 1-byte tag + 8-byte leaseId (offset 9).  Returns a list of user-key
 ; bytevectors in on-disk (ascending-K) order; '() if the lease has no keys.
+;
+; SKIP the length-9 lease-META sentinel (0x03 || u64be(id), empty K — the lease
+; OBJECT, ADR 0003 §1) which sorts FIRST in the same prefix group: a real attached
+; key K is non-empty, so a length-9 row is the meta entry, never an index entry.
 (define (mvcc-lease-keys ctx leaseId)
   (let ((pfx-len 9))   ; NS-LEASE(1) + u64be(leaseId)(8)
-    (map (lambda (row)
-           (let ((fk (car row)))           ; full index key 0x03||u64be(id)||K
-             (subbv fk pfx-len (bytevector-length fk))))
-         (kv-scan ctx (lease-prefix leaseId)))))
+    (let loop ((rows (kv-scan ctx (lease-prefix leaseId))) (out '()))
+      (if (null? rows)
+          (reverse out)
+          (let ((fk (caar rows)))          ; full index key 0x03||u64be(id)||K
+            (if (> (bytevector-length fk) pfx-len)        ; non-empty K => real index entry
+                (loop (cdr rows) (cons (subbv fk pfx-len (bytevector-length fk)) out))
+                (loop (cdr rows) out)))))))                ; length-9 meta sentinel: skip
+
+; ---------------------------------------------------------------------------
+; lease META entry (cw-u4a.17, ADR 0003 §1) — the lease OBJECT, replicated.
+; ---------------------------------------------------------------------------
+;
+; The granted TTL must survive a leader change, so it lives in the durable,
+; replicated store under NS-LEASE, distinguished from the lease->keys index
+; entries by an EMPTY sentinel key (K = ""):
+;
+;   lease-meta key   :  0x03 || u64be(id)            (length exactly 9, K empty)
+;   lease-meta value :  u64be(granted_ttl_seconds)
+;
+; The sentinel 0x03||u64be(id) is a byte-prefix of every real index entry
+; 0x03||u64be(id)||K (K non-empty), so it sorts FIRST within the lease's group.
+; "Is lease id live?" == this meta entry exists.  mvcc-lease-keys above already
+; skips it (it returns only non-empty K), since the meta key's tail past offset 9
+; is empty and is never produced by a real attach.
+
+(define (lease-meta-key id)             ; 0x03 || u64be(id) || <empty>  (length 9)
+  (lease-prefix id))                    ; identical bytes to the scan prefix
+
+(define (mvcc-lease-meta-get ctx id)    ; granted-ttl | #f if no such lease
+  (let ((b (kv-get ctx (lease-meta-key id))))
+    (if (and b (>= (bytevector-length b) 8)) (bytes->u64 b 0) #f)))
+
+(define (mvcc-lease-exists? ctx id)
+  (and (mvcc-lease-meta-get ctx id) #t))
+
+; the replicated auto-id counter (NS-META scalar, alongside current-rev), only
+; ever incremented on grant (never reused) so ids are unique across the cluster's
+; life even across leader changes.  META-LEASE-ID-SEQ itself is defined in the META
+; keys section below (after meta-key), since this lease section runs before it.
+(define (mvcc-lease-id-seq ctx)
+  (let ((b (kv-get ctx META-LEASE-ID-SEQ)))
+    (if (and b (>= (bytevector-length b) 8)) (bytes->u64 b 0) 0)))
+
+; All live lease ids (decode the id out of each length-9 sentinel key under
+; NS-LEASE).  The leader's failover re-derivation scans this; LeaseLeases (.18)
+; will reuse it.  A real index entry is length > 9 (has a non-empty K), so the
+; length-9 guard isolates the meta sentinels.
+(define (mvcc-all-lease-ids ctx)
+  (let loop ((rows (kv-scan ctx (mvcc-byte NS-LEASE))) (out '()))
+    (if (null? rows)
+        (reverse out)
+        (let ((fk (caar rows)))
+          (if (= (bytevector-length fk) 9)               ; 0x03 || u64be(id), K empty
+              (loop (cdr rows) (cons (bytes->u64 fk 1) out))
+              (loop (cdr rows) out))))))
 
 ; ---------------------------------------------------------------------------
 ; META keys
@@ -112,6 +167,7 @@
 (define (meta-key name) (bytevector-append (mvcc-byte NS-META) (string->utf8 name)))
 (define META-CURRENT-REV (meta-key "current-rev"))
 (define META-COMPACT-REV (meta-key "compact-rev"))
+(define META-LEASE-ID-SEQ (meta-key "lease-id-seq"))   ; lease auto-id counter (cw-u4a.17)
 
 ; ---------------------------------------------------------------------------
 ; KeyValue record (self-describing, length-prefixed; ADR §4)
@@ -742,6 +798,79 @@
        (cons 'ok compactRev)))))
 
 ; ---------------------------------------------------------------------------
+; mvcc-lease-grant!  (cw-u4a.17, ADR 0003 §1)
+; ---------------------------------------------------------------------------
+;
+; Create the lease OBJECT: write the replicated lease-meta entry (granted TTL).
+; A grant is NOT a keyspace mutation — it writes a side-namespace scalar, never a
+; NS-KEY version — so it does NOT bump current-rev (§6).  Caller (mvcc-apply's
+; "LEASE-GRANT" case) does not advance the revision either.
+;
+;   id = 0  ⇒ auto-assign next = (lease-id-seq) + 1, persist the counter (also a
+;             non-bumping meta write), and use `next`.
+;   id ≠ 0  ⇒ use the client-chosen id (etcd allows this).
+;
+; A duplicate grant (id already live) is rejected — the lease object already
+; exists; re-granting would silently re-window/overwrite its TTL.
+;
+; Returns:  the assigned id (a positive integer)
+;        |  (cons 'err-lease-exists id)   if id≠0 and a lease with that id is live.
+
+(define (mvcc-lease-grant! ctx id ttl)
+  (let ((eff-id (if (= id 0) (+ 1 (mvcc-lease-id-seq ctx)) id)))
+    (cond
+      ((mvcc-lease-exists? ctx eff-id) (cons 'err-lease-exists eff-id))
+      (else
+       ; bump the replicated id-seq counter only when we auto-assigned (so the next
+       ; auto-id is unique forever); a client-chosen id never touches the counter.
+       (if (= id 0) (kv-put! ctx META-LEASE-ID-SEQ (u64->bytes eff-id)))
+       ; the lease-meta entry: 0x03 || u64be(id) -> u64be(granted_ttl)
+       (kv-put! ctx (lease-meta-key eff-id) (u64->bytes ttl))
+       eff-id))))
+
+; ---------------------------------------------------------------------------
+; mvcc-lease-revoke!  (cw-u4a.17, ADR 0003 §2)
+; ---------------------------------------------------------------------------
+;
+; The LINEARIZABLE replicated revoke: enumerate the lease's currently-attached
+; keys (mvcc-lease-keys) and TOMBSTONE each — writing a KEY-CF tombstone version
+; AND a REV-CF DELETE event AND removing its 0x03||id||K index entry, i.e. the
+; EXACT per-key delete body mvcc-delete-range! performs (so Watch sees a DELETE
+; and reads after `main` see the key gone) — under successive sub-revisions
+; main.0, main.1, ….  Then delete the lease-meta entry (the lease no longer
+; exists).  Returns the count of keys deleted.
+;
+; This deletes EXACTLY the same keys at the same revision on every replica because
+; it is one committed Raft entry applied identically everywhere (§2).  The caller
+; (mvcc-apply's "LEASE-REVOKE" case) bumps current-rev once IFF count > 0 (a
+; zero-key revoke is not a keyspace effect — §6 / cw-u4a.40), and only removes the
+; (already-empty) meta entry.
+
+(define (mvcc-lease-revoke! ctx id main)
+  ; snapshot the attached keys BEFORE mutating (the per-key delete removes index
+  ; entries as it goes; iterating a live scan would race that removal).
+  (let ((victims (mvcc-lease-keys ctx id)))
+    (let loop ((vs victims) (s 0) (n 0))
+      (if (null? vs)
+          (begin
+            ; the lease itself is gone: drop the meta entry (so it can't be
+            ; re-revoked and "does lease id exist?" is now #f on every replica).
+            (kv-del! ctx (lease-meta-key id))
+            n)
+          (let* ((uk    (car vs))
+                 (prev  (mvcc-get-latest ctx uk))
+                 (lease (if prev (kv-rec-lease prev) 0)))
+            ; KEY-CF: a tombstone version (create_rev=0, version=0, no value)
+            (kv-put! ctx (enc-key uk main s)
+                     (kv-record-encode REC-TOMBSTONE 0 main 0 0 (make-bytevector 0 0)))
+            ; REV-CF: a DELETE event keyed by this op's own main.sub
+            (kv-put! ctx (enc-rev main s) (event-encode EV-DELETE uk (make-bytevector 0 0) main))
+            ; LEASE index: drop the key's lease entry (mirrors mvcc-delete-range!)
+            (if (and prev (not (= lease 0)))
+                (kv-del! ctx (enc-lease lease uk)))
+            (loop (cdr vs) (+ s 1) (+ n 1)))))))
+
+; ---------------------------------------------------------------------------
 ; mvcc-apply  (ADR §2 — one Raft entry = one Txn = one main revision)
 ; ---------------------------------------------------------------------------
 ;
@@ -753,12 +882,19 @@
 ;   ("DEL" K)              delete single key
 ;   ("DEL" K rangeEnd)     delete range [K, rangeEnd)
 ;   ("COMPACT" rev)        compact history to rev (does NOT bump current-rev)
+;   ("LEASE-GRANT" id ttl) create lease object (does NOT bump; cw-u4a.17)
+;   ("LEASE-REVOKE" id)    revoke: tombstone all attached keys + drop meta, one
+;                          revision IFF ≥1 key deleted (cw-u4a.17)
 ; Returns:
 ;   ("PUT" . newRev)                       ; the revision the put committed at
+;   (cons 'err-lease-not-found leaseId)    ; PUT attached to a dead/unknown lease (no write)
 ;   ("DEL" newRev . deleted)               ; revision + count deleted
 ;   (cons 'ok compactRev)                  ; compaction succeeded
 ;   (cons 'err-compacted currentCompact)   ; already compacted to >= rev
 ;   (cons 'err-future-rev currentRev)      ; rev is beyond current-rev
+;   (cons "LEASE-GRANT" id)                ; lease granted, assigned id
+;   (cons 'err-lease-exists id)            ; grant of an already-live id
+;   (cons "LEASE-REVOKE" (cons newRev n))  ; revoke: revision (or prev-rev if n=0) + count
 ; — a small s-expr usable as the client ack.
 
 (define (cmd-op cmd) (utf8->string (car cmd)))
@@ -774,9 +910,19 @@
               (lease (if (>= (length cmd) 4)
                          (let ((l (bytes->int (list-ref cmd 3)))) (if l l 0))
                          0)))
-         (mvcc-put! ctx K V lease main 0)
-         (mvcc-set-current-rev! ctx main)
-         (cons "PUT" main)))
+         ; Put-to-dead-lease guard (ADR 0003 §4, etcd ErrLeaseNotFound): a PUT that
+         ; attaches to a lease id (lease≠0) whose meta entry does NOT exist (never
+         ; granted, or already revoked/expired) must FAIL and write nothing — so a
+         ; key is never silently orphaned to a dead lease (it would leak, never
+         ; revoked).  A single replicated kv-exists? on the apply path; every replica
+         ; sees the same meta state, so the decision is identical everywhere.  The
+         ; no-lease (lease=0) path is unchanged.
+         (if (and (not (= lease 0)) (not (mvcc-lease-exists? ctx lease)))
+             (cons 'err-lease-not-found lease)            ; no write, no rev bump
+             (begin
+               (mvcc-put! ctx K V lease main 0)
+               (mvcc-set-current-rev! ctx main)
+               (cons "PUT" main)))))
       ((string=? op "DEL")
        (let* ((K        (list-ref cmd 1))
               (rangeEnd (if (>= (length cmd) 3) (list-ref cmd 2) #f))
@@ -788,6 +934,29 @@
        ; The rev argument is a decimal-ASCII bytevector (same convention as leaseId).
        (let ((rev (let ((l (bytes->int (list-ref cmd 1)))) (if l l 0))))
          (mvcc-compact ctx rev)))
+      ((string=? op "LEASE-GRANT")
+       ; ("LEASE-GRANT" id ttl): create the lease object.  A grant writes only the
+       ; replicated lease-meta scalar (+ the auto-id counter) — NOT a keyspace
+       ; version — so it does NOT bump current-rev (§6).  id/ttl are decimal-ASCII
+       ; bytevectors (same convention as leaseId).  Returns ("LEASE-GRANT" . id)
+       ; with the assigned id, or (cons 'err-lease-exists id) on a duplicate.
+       (let* ((id  (let ((l (bytes->int (list-ref cmd 1)))) (if l l 0)))
+              (ttl (let ((l (bytes->int (list-ref cmd 2)))) (if l l 0)))
+              (res (mvcc-lease-grant! ctx id ttl)))
+         (if (pair? res) res (cons "LEASE-GRANT" res))))
+      ((string=? op "LEASE-REVOKE")
+       ; ("LEASE-REVOKE" id): the replicated revoke — tombstone all attached keys +
+       ; drop the meta entry.  Bumps current-rev exactly ONCE iff ≥1 key was deleted
+       ; (a real keyspace effect); a zero-key revoke removes only the (empty) meta
+       ; entry and does NOT advance the revision (§6 / cw-u4a.40).  Returns
+       ; ("LEASE-REVOKE" newRev . count) — newRev is the bumped rev, or prev-rev when
+       ; nothing was deleted (no bump).
+       (let* ((id (let ((l (bytes->int (list-ref cmd 1)))) (if l l 0)))
+              (n  (mvcc-lease-revoke! ctx id main)))
+         (if (> n 0)
+             (begin (mvcc-set-current-rev! ctx main)
+                    (cons "LEASE-REVOKE" (cons main n)))
+             (cons "LEASE-REVOKE" (cons prev-rev 0)))))   ; no effect => no bump
       ((string=? op "TXN")
        ; An etcd Txn: a single FLAT bytevector (node-send safe) carrying the whole
        ; compare/success/failure op tree.  txn-apply decodes it, peeks whether the

@@ -150,6 +150,7 @@
 ; set up "t" with known fields: put twice (version=2), and with a lease.
 (put "PUT" "t" "tv1")                  ; create_rev = this, version 1
 (define t-create (kv-rec-create-rev (latest "t")))
+(put "LEASE-GRANT" "55" "60")          ; grant lease 55 first (no rev bump) — .17 guard
 (put "PUT" "t" "tv2" "55")             ; version 2, lease 55, mod_rev = this
 (define t-mod (kv-rec-mod-rev (latest "t")))
 

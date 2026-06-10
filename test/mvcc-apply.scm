@@ -99,6 +99,9 @@
 
 ; ===========================================================================
 (section "lease: PUT lk v 100 -> LEASE index has 0x03||u64be(100)||lk")
+; A key may only attach to a GRANTED lease (cw-u4a.17 put-to-dead-lease guard,
+; etcd ErrLeaseNotFound).  Grant lease 100 first; a grant does NOT bump the rev.
+(put "LEASE-GRANT" "100" "60")               ; grant lease 100 (ttl 60), no rev bump
 (put "PUT" "lk" "lv" "100")                  ; rev 9, lease 100
 (let* ((lkey (enc-lease 100 (b "lk")))
        (got  (kv-get CTX lkey)))
@@ -106,9 +109,13 @@
   (check "lease index value empty"   0  (bytevector-length got)))
 ; the record carries the lease inline
 (check "lk record lease = 100" 100 (kv-rec-lease (latest "lk")))
-; scanning the lease-100 prefix finds exactly lk
+; scanning the lease-100 prefix finds the length-9 meta sentinel (the lease object,
+; cw-u4a.17) PLUS the single attached key lk = 2 rows.  mvcc-lease-keys skips the
+; sentinel and returns just {lk}.
 (let ((rows (kv-scan CTX (lease-prefix 100))))
-  (check "lease-100 scan finds 1 key" 1 (length rows)))
+  (check "lease-100 prefix scan finds meta + lk = 2 rows" 2 (length rows)))
+(check "mvcc-lease-keys 100 = {lk} (sentinel skipped)"
+       (list (b "lk")) (mvcc-lease-keys CTX 100))
 
 ; ===========================================================================
 (section "META current-rev matches last bump")

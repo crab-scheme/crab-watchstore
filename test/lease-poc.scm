@@ -58,6 +58,12 @@
 (define (lease-keys id)
   (list-sort string<? (map utf8->string (mvcc-lease-keys CTX id))))
 
+; A key may only attach to a GRANTED lease (cw-u4a.17 put-to-dead-lease guard,
+; etcd ErrLeaseNotFound) — grant L1/L2 up front.  A LEASE-GRANT does NOT bump the
+; revision, so every revision assertion below is unchanged (rev 1 is the first PUT).
+(put "LEASE-GRANT" "100" "60")    ; grant L1 (ttl 60), no rev bump
+(put "LEASE-GRANT" "200" "60")    ; grant L2 (ttl 60), no rev bump
+
 ; ===========================================================================
 (section "attach: 3 keys to lease L1 -> prefix scan returns exactly those 3")
 ; Each PUT k v L1 attaches k to L1.  (One mvcc-apply = one Raft entry = one rev.)
@@ -71,8 +77,9 @@
 (check "k3 record lease = 100" 100 (kv-rec-lease (mvcc-get-latest CTX (b "k3"))))
 ; THE INDEX: scanning 0x03||u64be(100) returns exactly {k1,k2,k3}.
 (check "L1 index = {k1,k2,k3}" '("k1" "k2" "k3") (lease-keys L1))
-; Raw scan count agrees (one empty-valued entry per attached key).
-(check "L1 prefix scan count = 3" 3 (length (kv-scan CTX (lease-prefix L1))))
+; Raw scan count = the length-9 meta sentinel (granted above) + one empty-valued
+; entry per attached key = 1 + 3 = 4.  mvcc-lease-keys skips the sentinel (= 3).
+(check "L1 prefix scan count = meta + 3 keys = 4" 4 (length (kv-scan CTX (lease-prefix L1))))
 ; A lease with no keys scans empty.
 (check "L2 index empty (no attaches yet)" '() (lease-keys L2))
 
@@ -111,7 +118,9 @@
 (check "DEL k3 -> rev 6, 1 deleted" (cons "DEL" (cons 6 1)) (del "DEL" "k3"))
 (check "k3 now absent (tombstoned)" #f (mvcc-get-latest CTX (b "k3")))
 (check "L1 index now EMPTY (all keys gone)" '() (lease-keys L1))
-(check "L1 prefix scan count = 0" 0 (length (kv-scan CTX (lease-prefix L1))))
+; L1 is still GRANTED (only its keys are gone), so its meta sentinel remains: the
+; raw prefix scan is 1 (just the meta), mvcc-lease-keys is 0 (sentinel skipped).
+(check "L1 prefix scan count = 1 (meta only, keys gone)" 1 (length (kv-scan CTX (lease-prefix L1))))
 ; L2 still holds k2 (untouched by k3's delete).
 (check "L2 index still = {k2}" '("k2") (lease-keys L2))
 

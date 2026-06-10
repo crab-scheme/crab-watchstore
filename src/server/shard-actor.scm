@@ -61,6 +61,18 @@
          (round-open? #f)                        ; ReadIndex: a confirmation heartbeat is in flight
          (round-rseq 0)                          ; ReadIndex: the rseq this round's acks must echo (>=)
          (watch-reg (make-watch-registry))       ; Watch backend registry (cw-u4a.13); empty => apply hook is a no-op
+         ; ---- Lease expiry (cw-u4a.17, ADR 0003 §2) — LEADER-LOCAL, never replicated.
+         ; lease-deadlines : id -> deadline-second (wall-clock).  The leader seeds it
+         ; (untracked live leases get now+ttl on the tick) and scans it for expiry.
+         ; lease-revoking  : id -> #t for a revoke proposed-but-not-yet-applied, so the
+         ; tick does NOT re-seed/re-propose it every tick until its LEASE-REVOKE
+         ; commits (ADR §2 "remove id at propose time").  Both are EMPTY on a follower
+         ; (only the leader touches them) and cleared on stepdown (fail-pending!), so a
+         ; newly-elected leader re-derives a FRESH full window (§2 failover).  With no
+         ; leases granted, every lease-tick step is a no-op (the meta scan is empty), so
+         ; the sim-cluster / Watch paths are unperturbed.
+         (lease-deadlines (make-eqv-hashtable))   ; id -> deadline-second (leader-local)
+         (lease-revoking  (make-eqv-hashtable))   ; id -> #t  (revoke in flight)
          (solo    (null? (cdr voters)))          ; 1-voter group?
          ; Staggered election timeout, ROTATED by shard so leadership spreads:
          ; for shard S the voter at index S has the shortest timeout and tends to
@@ -152,7 +164,12 @@
       ; new leader (a ReadIndex round we can no longer confirm here).
       (for-each (lambda (e) (send (car e) 'tryagain)) batch)
       (for-each (lambda (e) (send (car e) 'tryagain)) read-q)
-      (set! batch '()) (set! read-q '()) (set! read-acks '()) (set! round-open? #f))
+      (set! batch '()) (set! read-q '()) (set! read-acks '()) (set! round-open? #f)
+      ; Drop the leader-local lease deadlines + in-flight revokes on stepdown — the
+      ; replicated TTLs are safe in the meta entries, and the next leader re-derives a
+      ; fresh full window (ADR 0003 §2).  Harmless to discard.
+      (hashtable-clear! lease-deadlines)
+      (hashtable-clear! lease-revoking))
 
     ; ---- ReadIndex: linearizable read (Raft §6.4) ----
     ; A read is served only after a quorum heartbeat round confirms we are STILL
@@ -244,6 +261,69 @@
       (table-insert! 'ws-shard-leader (qk) leader)
       (table-insert! 'ws-shard-commit (qk) (raft-commit st))
       (table-insert! 'ws-shard-applied (qk) (raft-applied st)))
+
+    ; ---- Lease expiry: leader-driven scan + replicated revoke (cw-u4a.17) ----
+    ;
+    ; Propose ONE internally-generated command (no client conn, so NO `pending`
+    ; slot — nothing to ack) through the SAME path a client write takes: append to
+    ; the log, AE to followers (emit!), solo-commit (maybe-commit), persist the
+    ; applied index, and group-commit-settle.  Returns (st' . flush-base').  Used
+    ; for ("LEASE-REVOKE" id) — explicit/keepalive/expiry all converge on this entry.
+    (define (propose-internal! st cmd flush-base)
+      (let ((old (raft-applied st)))
+        (let* ((r (raft-propose st cmd)) (st1 (car r)))
+          (emit! (cdr r))                 ; AE to followers (cluster) / none (solo)
+          (let ((st2 (maybe-commit st1))) ; solo commits+applies now; cluster waits for AERs
+            (if (> (raft-applied st2) old) (persist-applied! st2))
+            (cons st2 (settle! #t old flush-base))))))   ; this runs only on the leader
+
+    ; The leader's per-tick lease pass.  THREE steps, all leader-local, all a strict
+    ; no-op when no leases are granted (the meta scan is empty):
+    ;   1. RECONCILE: drop any `lease-revoking` id whose meta entry is gone (its
+    ;      LEASE-REVOKE has applied) — self-heals the in-flight set.
+    ;   2. SEED:  for every live lease (meta entry present) not already tracked AND
+    ;      not revoke-in-flight, seed deadline = now + granted_ttl.  This seeds a
+    ;      freshly-granted lease (its meta is now durable) AND, on a NEW leader whose
+    ;      maps were cleared at stepdown/start, re-derives the FULL set as a fresh
+    ;      window (ADR §2 failover).
+    ;   3. EXPIRE: for every tracked id with deadline <= now, PROPOSE
+    ;      ("LEASE-REVOKE" id) through Raft (propose-internal!), drop it from
+    ;      lease-deadlines, and mark it revoke-in-flight (so it isn't re-proposed
+    ;      before the entry commits).  The authoritative meta+keys removal happens on
+    ;      apply, every replica, at one revision.
+    ; Returns (st' . flush-base').
+    (define (lease-tick! st flush-base)
+      (let ((now  (current-second))
+            (live (mvcc-all-lease-ids ctx)))
+        ; (1) reconcile in-flight revokes whose meta is gone (applied)
+        (vector-for-each
+         (lambda (id)
+           (if (not (mvcc-lease-exists? ctx id)) (hashtable-delete! lease-revoking id)))
+         (hashtable-keys lease-revoking))
+        ; (2) seed untracked live leases with a fresh full window
+        (for-each
+         (lambda (id)
+           (if (and (not (hashtable-contains? lease-deadlines id))
+                    (not (hashtable-contains? lease-revoking id)))
+               (let ((ttl (mvcc-lease-meta-get ctx id)))
+                 (if ttl (hashtable-set! lease-deadlines id (+ now ttl))))))
+         live)
+        ; (3) collect expired ids, then propose a revoke for each (threading st/fb)
+        (let ((expired
+               (let collect ((ks (vector->list (hashtable-keys lease-deadlines))) (out '()))
+                 (cond ((null? ks) out)
+                       ((<= (hashtable-ref lease-deadlines (car ks) 0) now)
+                        (collect (cdr ks) (cons (car ks) out)))
+                       (else (collect (cdr ks) out))))))
+          (let loop ((ids expired) (st st) (fb flush-base))
+            (if (null? ids)
+                (cons st fb)
+                (let ((id (car ids)))
+                  (hashtable-delete! lease-deadlines id)   ; stop scanning it
+                  (hashtable-set! lease-revoking id #t)    ; mark in flight
+                  (let ((res (propose-internal!
+                              st (list (string->utf8 "LEASE-REVOKE") (int->bytes id)) fb)))
+                    (loop (cdr ids) (car res) (cdr res)))))))))
 
     (let* ((loaded (ctx-load-applied ctx))                 ; (idx . term) from RocksDB
            (p (car loaded)) (pt (cdr loaded))
@@ -361,8 +441,14 @@
                   (if (raft-leader? cq)
                       (let ((r (raft-tick cq)))
                         (emit! (cdr r))
-                        ; safe to compact: we just flushed+drained (pending is empty)
-                        (loop (maybe-compact (car r) #f) node-name 0 #f))
+                        ; Lease expiry (cw-u4a.17, ADR 0003 §2): RIDES this same tick.
+                        ; Seed/re-derive deadlines + propose ("LEASE-REVOKE" id) for any
+                        ; expired lease.  propose-internal! threads the state + emits the
+                        ; revoke AEs (+ solo-commits) itself; returns (st' . flush-base').
+                        ; A strict no-op when no leases are granted (empty meta scan), so
+                        ; the heartbeat path is unchanged for the leaseless sim-cluster.
+                        (let ((lr (lease-tick! (car r) #f)))
+                          (loop (maybe-compact (car lr) (cdr lr)) node-name 0 (cdr lr))))
                       (begin (fail-pending!) (publish! cq #f)
                              (loop cq #f 0 #f)))))
                (solo (loop (maybe-compact st #f) leader elapsed #f))
@@ -390,6 +476,30 @@
                          (list (kv-rec-value r) (kv-rec-create-rev r)
                                (kv-rec-mod-rev r) (kv-rec-version r))
                          #f)))
+             (loop st leader elapsed flush-base))
+
+            ;; ---- test-support: (lease-probe CONN ID KEYS) -> revoke proof on THIS
+            ;; replica.  Reads THIS node's committed MVCC state and replies a small
+            ;; serializable summary so a test can assert the LINEARIZABLE replicated
+            ;; revoke (cw-u4a.17): the lease meta is gone + each attached key's NEWEST
+            ;; version is a tombstone at the SAME mod_rev on every voter.  Reply shape:
+            ;;   (lease-exists? current-rev ((KEY-BYTES TOMBSTONE? MOD-REV) ...))
+            ;; where, per key, we read the NEWEST KEY-CF version directly (the first
+            ;; INV-ordered row), so a tombstone's delete-revision is visible (the `get`
+            ;; probe hides tombstones as #f).  A harness probe only, not consensus.
+            ((eq? (car m) 'lease-probe)
+             (let* ((conn (cadr m)) (id (caddr m)) (keys (cadddr m)))
+               (send conn
+                     (list (mvcc-lease-exists? ctx id)
+                           (mvcc-current-rev ctx)
+                           (map
+                            (lambda (k)
+                              (let ((rows (kv-scan ctx (key-cf-prefix k))))
+                                (if (null? rows)
+                                    (list k 'absent 0)        ; never written
+                                    (let ((rec (kv-record-decode (cdar rows))))  ; newest version
+                                      (list k (kv-rec-tombstone? rec) (kv-rec-mod-rev rec))))))
+                            keys))))
              (loop st leader elapsed flush-base))
 
             ;; ---- Watch register: (watch-register REPLY-PID SPEC) ----  (cw-u4a.14)
@@ -436,6 +546,62 @@
                    (let ((ok (watch-cancel! watch-reg wid)))
                      (send reply-pid (cons 'watch-canceled (if ok wid #f)))))
                (loop st leader elapsed flush-base)))
+
+            ;; ---- Lease grant: (lease-grant REPLY-PID TTL ID) ----  (cw-u4a.17)
+            ;; The client's LeaseGrant.  LEADER-GATED exactly like watch-register /
+            ;; reads (ADR 0003 §1/§2: only the leader applies + owns the deadline map),
+            ;; so a non-leader REDIRECTS — ('lease-not-leader . LEADER) — rather than
+            ;; serving a grant no one would expire.  The leader PROPOSES
+            ;; ("LEASE-GRANT" id ttl) through Raft (id=0 ⇒ apply auto-assigns from the
+            ;; replicated lease-id-seq); the apply result (cons "LEASE-GRANT" assigned-id)
+            ;; is drained back to REPLY-PID via `pending` (same async commit->ack bridge
+            ;; as a client PUT), so the client learns the assigned id only after the
+            ;; grant commits on a quorum.  The leader-local deadline is seeded by the
+            ;; lease-tick (the meta entry is durable once applied), so failover re-derives
+            ;; it identically — no special-casing here.
+            ((eq? (car m) 'lease-grant)
+             (let ((reply-pid (cadr m)) (ttl (caddr m)) (id (cadddr m)))
+               (cond
+                 ((not (raft-leader? st))
+                  (send reply-pid (cons 'lease-not-leader leader))
+                  (loop st leader elapsed flush-base))
+                 (else
+                  (let ((old (raft-applied st)) (idx (+ 1 (log-len st)))
+                        (cmd (list (string->utf8 "LEASE-GRANT") (int->bytes id) (int->bytes ttl))))
+                    (hashtable-set! pending idx reply-pid)
+                    (let* ((r (raft-propose st cmd)) (st1 (car r)))
+                      (emit! (cdr r))
+                      (let ((st2 (maybe-commit st1)))
+                        (if (> (raft-applied st2) old) (persist-applied! st2))
+                        (let ((nb (settle! #t old flush-base)))
+                          (loop (maybe-compact st2 nb) node-name elapsed nb)))))))))
+
+            ;; ---- Lease revoke: (lease-revoke REPLY-PID ID) ----  (cw-u4a.17)
+            ;; The client's explicit LeaseRevoke.  Takes the SAME replicated path as
+            ;; expiry (ADR 0003 §2/§5): the leader PROPOSES ("LEASE-REVOKE" id), whose
+            ;; apply tombstones all attached keys + drops the meta at one revision on
+            ;; every replica.  Leader-gated (redirect on a non-leader).  The apply
+            ;; result (cons "LEASE-REVOKE" (cons rev count)) is drained to REPLY-PID via
+            ;; `pending`.  (Mark it revoke-in-flight so the concurrent tick scan doesn't
+            ;; also propose it.)
+            ((eq? (car m) 'lease-revoke)
+             (let ((reply-pid (cadr m)) (id (caddr m)))
+               (cond
+                 ((not (raft-leader? st))
+                  (send reply-pid (cons 'lease-not-leader leader))
+                  (loop st leader elapsed flush-base))
+                 (else
+                  (let ((old (raft-applied st)) (idx (+ 1 (log-len st)))
+                        (cmd (list (string->utf8 "LEASE-REVOKE") (int->bytes id))))
+                    (hashtable-delete! lease-deadlines id)   ; stop the tick scanning it
+                    (hashtable-set! lease-revoking id #t)    ; mark in flight (no double-propose)
+                    (hashtable-set! pending idx reply-pid)
+                    (let* ((r (raft-propose st cmd)) (st1 (car r)))
+                      (emit! (cdr r))
+                      (let ((st2 (maybe-commit st1)))
+                        (if (> (raft-applied st2) old) (persist-applied! st2))
+                        (let ((nb (settle! #t old flush-base)))
+                          (loop (maybe-compact st2 nb) node-name elapsed nb)))))))))
 
             ;; ---- linearizable read probe: (read CONN) ----
             ;; Solo serves inline (a round would never complete); multi-voter

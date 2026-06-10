@@ -92,6 +92,19 @@
 (define (lease-prefix leaseId)          ; NS-LEASE || u64be(leaseId)  (revoke scan)
   (bytevector-append (mvcc-byte NS-LEASE) (u64->bytes leaseId)))
 
+; PURE READ (no write-path change; the LEASE write path is cw-u4a.6, validated).
+; Enumerate the user-keys currently attached to a lease — exactly the set the
+; revoke path (cw-u4a.17 "LEASE-REVOKE") will iterate and tombstone.  The lease
+; index entry is 0x03 || u64be(leaseId) || K, so the user-key K is everything
+; after the 1-byte tag + 8-byte leaseId (offset 9).  Returns a list of user-key
+; bytevectors in on-disk (ascending-K) order; '() if the lease has no keys.
+(define (mvcc-lease-keys ctx leaseId)
+  (let ((pfx-len 9))   ; NS-LEASE(1) + u64be(leaseId)(8)
+    (map (lambda (row)
+           (let ((fk (car row)))           ; full index key 0x03||u64be(id)||K
+             (subbv fk pfx-len (bytevector-length fk))))
+         (kv-scan ctx (lease-prefix leaseId)))))
+
 ; ---------------------------------------------------------------------------
 ; META keys
 ; ---------------------------------------------------------------------------

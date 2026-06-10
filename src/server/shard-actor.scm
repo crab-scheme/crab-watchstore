@@ -41,6 +41,7 @@
 (include "src/encoding.scm")
 (include "src/store-ctx.scm")
 (include "src/mvcc.scm")
+(include "src/watch.scm")     ; Watch backend: registry + replay->live dispatch (cw-u4a.13)
 (include "src/raft.scm")
 
 (define (raft-applied st) (aget st 'applied))
@@ -59,6 +60,7 @@
          (read-acks '())                         ; ReadIndex: peers acked (fresh) since round opened
          (round-open? #f)                        ; ReadIndex: a confirmation heartbeat is in flight
          (round-rseq 0)                          ; ReadIndex: the rseq this round's acks must echo (>=)
+         (watch-reg (make-watch-registry))       ; Watch backend registry (cw-u4a.13); empty => apply hook is a no-op
          (solo    (null? (cdr voters)))          ; 1-voter group?
          ; Staggered election timeout, ROTATED by shard so leadership spreads:
          ; for shard S the voter at index S has the shortest timeout and tends to
@@ -76,10 +78,19 @@
     ; as that waiter's client ack. The '() become-leader no-op barrier (§5.4.2) is a
     ; pure barrier: it does NO MVCC write and MUST NOT bump the revision — it only
     ; contributes an #f `acc` slot so drain!'s positional index alignment still holds.
+    ; Watch backend hook (cw-u4a.13, ADR 0002 §3/§4): capture current-rev BEFORE and
+    ; AFTER the MVCC write, then notify the watch registry of the (pre, post] window
+    ; so SYNCED watchers get their live events.  watch-on-apply! has a no-op fast path
+    ; (empty registry OR post==pre => returns immediately, no REV-CF read), so when no
+    ; watcher is registered this is strictly additive and perturbs nothing — the
+    ; sim-cluster / group-commit / apply path behaves exactly as before.  The register/
+    ; cancel mailbox protocol, leader-gating, and streaming are .14, NOT here.
     (define (apply-fn sm cmd)
       (if (null? cmd)
           (set! acc (cons #f acc))                       ; no-op barrier: acc slot only, no rev bump
-          (set! acc (cons (mvcc-apply ctx cmd) acc)))     ; MVCC write; client waiter gets the result
+          (let ((pre (mvcc-current-rev ctx)))
+            (set! acc (cons (mvcc-apply ctx cmd) acc))    ; MVCC write; client waiter gets the result
+            (watch-on-apply! watch-reg ctx pre (mvcc-current-rev ctx))))
       (+ sm 1))
     ; Persist the applied index (+ its term) into the SAME group-commit batch as
     ; the entry's mutations, so a restart restores base/applied/commit and never

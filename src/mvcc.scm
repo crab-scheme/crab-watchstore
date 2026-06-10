@@ -557,6 +557,71 @@
                        (collect (cdr rs) uk (list row) new-results)))))))))))
 
 ; ---------------------------------------------------------------------------
+; mvcc-watch-events  (cw-u4a.12 — Watch historical-replay query, ADR 0002 §3)
+; ---------------------------------------------------------------------------
+;
+; A PURE READ over the REV-CF event log: returns every event in the revision
+; range (start-rev, current] whose key falls in the watcher's [key, range-end)
+; and that passes the watcher's NOPUT/NODELETE filters, IN STRICT REVISION ORDER.
+; This is the historical half of a Watch (ADR 0002): replay before going live.
+; The live replay->live handoff is built on this by .13/.14 (not here).
+;
+;   (mvcc-watch-events ctx start-rev key range-end filters)
+;        -> a list of decoded event vectors (from event-decode), revision-ascending
+;         | (cons 'err-compacted compact-rev)   when 0 < start-rev < compact-rev
+;
+;   start-rev   EXCLUSIVE lower bound (etcd start_revision is the first rev the
+;               client has NOT seen; events with main-rev > start-rev replay).
+;               start-rev = 0 means "current/future-only": no historical floor is
+;               crossed, so it is NEVER ErrCompacted.
+;   key/range-end : SAME semantics as mvcc-range (range-in-range?):
+;               - #f / empty end      => single key (key == event-key exactly)
+;               - #u8(0) end          => to-end-of-keyspace (and key=#u8(0) => all)
+;               - otherwise           => half-open [key, range-end)
+;   filters     : a list possibly containing 'noput and/or 'nodelete (symbols);
+;               'noput drops PUT events, 'nodelete drops DELETE events.
+;
+; REV-CF keys are NS-REV || u64be(main) || u64be(sub), PLAIN ascending, so a scan
+; of the NS-REV namespace already yields events in exactly Watch's stream order
+; (oldest->newest, intra-Txn sub order preserved).  We read the main rev out of
+; the on-disk key (byte 1) for the (start-rev, current] window test, then decode
+; the event for key/filter matching.  A future perf pass can replace the
+; whole-namespace scan with a bounded seek to NS-REV || rev16(start-rev+epsilon)
+; (a thin kv-seek the layout already supports — ADR 0001 §3 (a)); the result set
+; is identical, so this stays the source of truth for the replay contract.
+
+(define (event-passes-filter? kind filters)
+  (cond
+    ((and (= kind EV-PUT)    (memq 'noput    filters)) #f)
+    ((and (= kind EV-DELETE) (memq 'nodelete filters)) #f)
+    (else #t)))
+
+(define (mvcc-watch-events ctx start-rev key range-end filters)
+  (let ((compact-rev (mvcc-compact-rev ctx))
+        (cur-rev     (mvcc-current-rev ctx)))
+    ; ErrCompacted: a from-revision watch whose floor is below compact-rev can no
+    ; longer be served historically.  start-rev = 0 (current/future) never trips it.
+    (if (and (> start-rev 0) (< start-rev compact-rev))
+        (cons 'err-compacted compact-rev)
+        (let ((rows (kv-scan ctx (mvcc-byte NS-REV))))   ; ascending = revision order
+          (let loop ((rs rows) (out '()))
+            (if (null? rs)
+                (reverse out)
+                (let* ((row  (car rs))
+                       (fk   (car row))
+                       ; fk = NS-REV(1) || u64be(main) || u64be(sub); main at byte 1
+                       (main (bytes->u64 fk 1)))
+                  (if (and (> main start-rev) (<= main cur-rev))
+                      (let* ((ev   (event-decode (cdr row)))
+                             (k    (ev-key ev))
+                             (kind (ev-kind ev)))
+                        (if (and (range-in-range? k key range-end)
+                                 (event-passes-filter? kind filters))
+                            (loop (cdr rs) (cons ev out))
+                            (loop (cdr rs) out)))
+                      (loop (cdr rs) out)))))))))
+
+; ---------------------------------------------------------------------------
 ; mvcc-compact  (cw-u4a.8 — etcd-style MVCC history GC)
 ; ---------------------------------------------------------------------------
 ;

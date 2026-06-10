@@ -478,6 +478,72 @@
                          #f)))
              (loop st leader elapsed flush-base))
 
+            ;; ---- KV read seam: (kv-range CONN OPTS) -> RangeResponse data  (cw-u4a.22)
+            ;; The etcd KV gRPC binding (.22) serves Range/point reads here, where the
+            ;; ctx lives.  OPTS is a SENDABLE assoc-list carrying the mvcc-range request:
+            ;;   key / range-end (bytevectors) + the range opts (revision/limit/
+            ;;   count-only/keys-only/sort-order/sort-target/min-max revs) as the
+            ;;   symbols mvcc-range already consumes.  LEADER-GATED like reads: a
+            ;;   non-leader replies 'tryagain (the gRPC handler maps that to Unavailable
+            ;;   so the client retries another endpoint — single-node is always leader,
+            ;;   so this is the served path for THIS task).  We reply a fully SENDABLE
+            ;;   summary the handler turns into protobuf:
+            ;;     (kv-range-ok current-rev raft-term err-or-#f total
+            ;;                  ((key-bytes value-bytes create-rev mod-rev version lease) ...))
+            ;;   where err-or-#f is 'compacted (ErrCompacted -> gRPC OutOfRange) else #f,
+            ;;   total is the pre-limit match count (etcd's `count`), and each kv is a
+            ;;   flat list (kv-view records can't cross `send`).  count-only yields the
+            ;;   total with an empty kv list; keys-only blanks the value bytes.
+            ;;   A pure read over THIS node's committed ctx — not a Raft entry.
+            ((eq? (car m) 'kv-range)
+             (let ((conn (cadr m)) (opts (caddr m)))
+               (if (not (raft-leader? st))
+                   (send conn 'tryagain)
+                   (let* ((key (range-opt opts 'key (make-bytevector 0 0)))
+                          (rend (range-opt opts 'range-end #f))
+                          (res (mvcc-range ctx key rend opts)))
+                     (if (and (pair? res) (eq? (car res) 'err-compacted))
+                         (send conn (list 'kv-range-ok (mvcc-current-rev ctx)
+                                          (raft-term st) 'compacted 0 '()))
+                         (send conn
+                               (list 'kv-range-ok (mvcc-current-rev ctx) (raft-term st) #f
+                                     (car res)
+                                     (map (lambda (item)
+                                            (let ((uk (car item)) (rec (cdr item)))
+                                              (list uk (kv-rec-value rec)
+                                                    (kv-rec-create-rev rec) (kv-rec-mod-rev rec)
+                                                    (kv-rec-version rec) (kv-rec-lease rec))))
+                                          (cdr res))))))) )
+             (loop st leader elapsed flush-base))
+
+            ;; ---- KV prev-kv seam: (kv-prev CONN KEY) -> the key's CURRENT live record
+            ;; (cw-u4a.22).  etcd Put/DeleteRange prev_kv returns the value BEFORE the op;
+            ;; the handler snapshots it through here just before proposing the write.
+            ;; Reply: (kv-prev-ok (key-bytes value create-rev mod-rev version lease) | #f).
+            ;; Single-node, single-writer, so this read-then-propose is atomic enough for
+            ;; v1 (real etcd resolves prev_kv inside the apply txn; noted as a v1 gap).
+            ((eq? (car m) 'kv-prev)
+             (let* ((conn (cadr m)) (k (caddr m))
+                    (rec (mvcc-get-latest ctx k)))
+               (send conn
+                     (list 'kv-prev-ok
+                           (if rec
+                               (list k (kv-rec-value rec) (kv-rec-create-rev rec)
+                                     (kv-rec-mod-rev rec) (kv-rec-version rec) (kv-rec-lease rec))
+                               #f))))
+             (loop st leader elapsed flush-base))
+
+            ;; ---- KV header seam: (cur-rev CONN) -> (cur-rev-ok current-rev raft-term)
+            ;; (cw-u4a.22).  Every etcd response carries a ResponseHeader{revision,
+            ;; raft_term, ...}.  After an async write ack (whose result shape — ("PUT" .
+            ;; rev) etc. — is fixed by the existing apply contract and must not change),
+            ;; the handler reads the store's CURRENT revision + the Raft term here to
+            ;; fill the header.  A trivial leader-local read; never a Raft entry.
+            ((eq? (car m) 'cur-rev)
+             (let ((conn (cadr m)))
+               (send conn (list 'cur-rev-ok (mvcc-current-rev ctx) (raft-term st))))
+             (loop st leader elapsed flush-base))
+
             ;; ---- test-support: (lease-probe CONN ID KEYS) -> revoke proof on THIS
             ;; replica.  Reads THIS node's committed MVCC state and replies a small
             ;; serializable summary so a test can assert the LINEARIZABLE replicated

@@ -105,6 +105,47 @@
 (display (table-lookup 'ws-shard-leader (qk))) (display ", role=")
 (display (table-lookup 'ws-shard-role (qk))) (display ")") (newline)
 
-; The consensus substrate is up. No client listener yet (cw-u4a.5/.6). Park so
-; the node process stays alive serving Raft RPCs to its peers.
+; ---- etcd v3 KV gRPC service (cw-u4a.22) ----
+; The clientport in the --cluster spec (long parsed-but-unused) is THIS node's etcd
+; gRPC client endpoint.  Spawn the KV handler actor (src/server/grpc-kv.scm) against
+; this node's shard-0 replica, then start the h2c gRPC server (cw-u4a.20) bound to
+; host:clientport routing every etcd KV call (Range/Put/DeleteRange/Txn/Compact +
+; minimal Status/MemberList stubs) to it.  A SINGLE-NODE cluster (1 voter) is always
+; leader, so reads + writes serve here with no leader-forwarding (that is cw-u4a.24).
+;
+;   ResponseHeader cluster_id / member_id: deterministic, stable, nonzero values
+;   derived from the node config (a hash of the cluster spec / the node name) — etcdctl
+;   only needs them present + consistent across responses, not etcd-bit-exact.
+;
+; Dedicated thread: the handler does a blocking (raw-receive) between shard round-trips
+; (it asks the shard for reads / prev-kv / current-rev and awaits the reply), so keep
+; it off the shared green pool — same rationale as the shard + poller (green-threads
+; INV-2/3).  grpc-serve registers the handler PID; we look up the shard PID (already
+; published to ws-shard-pid by now) and pass it in.
+(define (stable-id s)
+  ; a small deterministic nonzero u32-ish id from a string (FNV-1a-style fold).
+  (let loop ((i 0) (h 2166136261))
+    (if (= i (string-length s))
+        (+ 1 (modulo h 1000000000))             ; keep nonzero, bounded
+        (loop (+ i 1)
+              (modulo (* (bitwise-xor h (char->integer (string-ref s i))) 16777619)
+                      4294967296)))))
+(define cluster-id (stable-id cluster-spec))
+(define member-id  (stable-id (symbol->string me)))
+(define client-host (node-field me 1))
+(define client-port (node-field me 3))
+(define client-addr (string-append client-host ":" (number->string client-port)))
+(define shard-pid   (table-lookup 'ws-shard-pid (qk)))
+
+(define grpc-handler
+  (spawn-source-dedicated "(include \"src/server/grpc-kv.scm\")" 'grpc-kv-main
+                          shard-pid cluster-id member-id))
+(define grpc-sid (grpc-serve client-addr grpc-handler))
+
+(display "node ") (display me) (display ": etcd KV gRPC serving on ")
+(display client-addr) (display " (cluster-id=") (display cluster-id)
+(display " member-id=") (display member-id) (display ")") (newline)
+
+; The consensus substrate + etcd KV API are up. Park so the node process stays alive
+; serving Raft RPCs to peers and gRPC calls to clients.
 (let park () (yield) (park))

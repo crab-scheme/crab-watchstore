@@ -545,7 +545,15 @@
       (hashtable-set! stream-workers h wpid)))
 
   (define (dispatch! h)
-    (let ((path (grpc-request-path h)))
+    (let ((path (grpc-request-path h))
+          (peer (grpc-request-peer-identity h)))
+      ; cw-u4a.21: surface the verified mTLS client identity (or #f over h2c /
+      ; a TLS connection with no client cert).  This is the hook etcd Auth (.26)
+      ; maps to a user; here we only LOG it so the mTLS proof can assert the
+      ; server saw the client's SAN/CN.
+      (when peer
+        (display "grpc-kv: mTLS peer ") (display peer)
+        (display " -> ") (display path) (newline))
       (cond
         ((string=? path "/etcdserverpb.Watch/Watch")
          (start-stream-worker! h 'grpc-watch-worker))

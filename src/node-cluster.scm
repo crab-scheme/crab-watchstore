@@ -40,6 +40,19 @@
 (define durable (string=? (arg-after "--durable" "no") "yes"))
 (define cluster-spec (arg-after "--cluster" "a:127.0.0.1:7001:6001"))
 
+; ---- optional TLS / mutual-TLS for the etcd gRPC CLIENT port (cw-u4a.21) ----
+; When --tls-cert is supplied the client port is served over TLS instead of
+; cleartext h2c.  --tls-ca + --tls-require-client-cert (default "yes") turn on
+; MUTUAL TLS: a client must present a certificate chaining to the CA, else it is
+; rejected at the TLS layer.  The verified peer identity (SAN/CN) is then exposed
+; to the KV handler via (grpc-request-peer-identity h) — the etcd-Auth hook (.26).
+; Raft inter-node transport is unaffected (this is the client port only).
+(define tls-cert (arg-after "--tls-cert" #f))
+(define tls-key  (arg-after "--tls-key"  #f))
+(define tls-ca   (arg-after "--tls-ca"   #f))
+(define tls-require-client
+  (not (string=? (arg-after "--tls-require-client-cert" "yes") "no")))
+
 ; parse "name:host:raftport:clientport,..." -> list of (name host raftport clientport)
 (define nodes
   (map (lambda (e)
@@ -140,9 +153,20 @@
 (define grpc-handler
   (spawn-source-dedicated "(include \"src/server/grpc-kv.scm\")" 'grpc-kv-main
                           shard-pid cluster-id member-id))
-(define grpc-sid (grpc-serve client-addr grpc-handler))
+; TLS path (cw-u4a.21) iff --tls-cert was given; otherwise the original h2c
+; server.  grpc-serve-tls reuses the SAME handler actor — TLS only wraps the IO.
+(define grpc-sid
+  (if tls-cert
+      (grpc-serve-tls client-addr grpc-handler tls-cert tls-key tls-ca tls-require-client)
+      (grpc-serve client-addr grpc-handler)))
 
-(display "node ") (display me) (display ": etcd KV gRPC serving on ")
+; Banner: keep the exact "etcd KV gRPC serving on" substring for the h2c path
+; (the existing etcd-kv-grpc.sh proof waits on it); add a "(mTLS)"/"(TLS)" tag
+; only when TLS is on.
+(display "node ") (display me) (display ": etcd KV gRPC ")
+(when tls-cert
+  (display "(") (display (if tls-require-client "mTLS" "TLS")) (display ") "))
+(display "serving on ")
 (display client-addr) (display " (cluster-id=") (display cluster-id)
 (display " member-id=") (display member-id) (display ")") (newline)
 

@@ -59,8 +59,22 @@
 ; node construction + accessors
 ; ============================================================
 
+; `ids` is the INITIAL VOTER SET (back-compat: existing 4-arg callers pass the
+; full member list as the voters; no learners). The voter set is DYNAMIC from here
+; on (cw-u4a.28 joint consensus): `voters` is the current/incoming voter set,
+; `voters-old` is #f when the config is SIMPLE and the OUTGOING voter set while a
+; joint config is in flight, and `learners` are non-voting members that receive
+; AppendEntries but never count for quorum/elections. `peers` (everyone the leader
+; replicates to = voters ∪ voters-old ∪ learners, minus self) and `all` (= voters,
+; kept so the legacy `majority` reader stays correct for a fixed/simple config) are
+; DERIVED and recomputed by `recompute-config` whenever a ConfChange entry is
+; appended or truncated. `base-voters`/`base-voters-old`/`base-learners` snapshot
+; the config covered by `base` (the compacted prefix), so a truncation that drops
+; every in-memory ConfChange reverts to the snapshot's config.
 (define (make-raft id ids apply-fn sm0)
   (list (cons 'id id) (cons 'peers (others id ids)) (cons 'all ids)
+        (cons 'voters ids) (cons 'voters-old #f) (cons 'learners '())
+        (cons 'base-voters ids) (cons 'base-voters-old #f) (cons 'base-learners '())
         (cons 'role 'follower) (cons 'term 0) (cons 'voted-for #f)
         (cons 'log '()) (cons 'commit 0) (cons 'applied 0) (cons 'votes '())
         (cons 'next '()) (cons 'match '()) (cons 'apply apply-fn) (cons 'sm sm0)
@@ -97,7 +111,111 @@
 (define (entries-from st i)                               ; i in base+1..len+1
   (list-tail (aget st 'log) (- i (aget st 'base) 1)))
 
+; Legacy fixed-config majority (count threshold), still used by the actor
+; (shard-actor) and PreVote/ReadIndex tallies, which only ever run a SIMPLE config
+; where `all` = the voter set. Joint-aware decisions use the predicates below.
 (define (majority st) (+ 1 (quotient (length (aget st 'all)) 2)))
+
+; ============================================================
+; dynamic membership: config representation + joint quorum (cw-u4a.28)
+; ============================================================
+;
+; ConfChange log entries (Ongaro thesis §4.3). A log entry is (term . command);
+; a ConfChange command is the tagged pair (cons 'conf SPEC) — distinguishable from
+; the no-op barrier ('()) and from a real command (a list of bytevectors), and
+; flat enough to survive node-send (symbols + nested lists round-trip through
+; to_sendable_in/from_sendable). SPEC is one of:
+;   (joint  OLD NEW LEARNERS)  ; enter joint consensus (Cold,new)
+;   (simple NEW LEARNERS)      ; leave joint / single-phase change (Cnew)
+(define (conf-cmd? cmd) (and (pair? cmd) (eq? (car cmd) 'conf)))
+(define (conf-spec cmd) (cdr cmd))
+
+; --- small set utilities (eqv? element identity; the dialect has no `filter`) ---
+(define (subset? a b)
+  (cond ((null? a) #t) ((memv (car a) b) (subset? (cdr a) b)) (else #f)))
+(define (equal-set? a b) (and (subset? a b) (subset? b a)))
+(define (count-in members ids)                ; how many of `members` are in `ids`
+  (cond ((null? members) 0)
+        ((memv (car members) ids) (+ 1 (count-in (cdr members) ids)))
+        (else (count-in (cdr members) ids))))
+(define (dedup lst)                            ; keep the LAST occurrence of each id
+  (cond ((null? lst) '())
+        ((memv (car lst) (cdr lst)) (dedup (cdr lst)))
+        (else (cons (car lst) (dedup (cdr lst))))))
+(define (union3 a b c) (dedup (append a (if b b '()) c)))
+(define (assq-def k al default) (let ((e (assq k al))) (if e (cdr e) default)))
+
+; A node is a voter iff it appears in the current OR outgoing voter set. Used to
+; gate elections so a learner / removed node never campaigns.
+(define (is-voter? st id)
+  (and (or (memv id (aget st 'voters))
+           (let ((old (aget st 'voters-old))) (and old (memv id old))))
+       #t))
+
+; --- joint quorum (Ongaro §4.3): a decision needs a STRICT majority of the NEW
+;     voters AND, while joint, a strict majority of the OLD voters. Learners never
+;     count (they are in neither set). 2*count > N is a strict majority of N. ---
+(define (set-majority? voters granted) (> (* 2 (count-in voters granted)) (length voters)))
+(define (votes-quorum? st granted)            ; election tally (granted = voter ids)
+  (and (set-majority? (aget st 'voters) granted)
+       (let ((old (aget st 'voters-old))) (or (not old) (set-majority? old granted)))))
+; commit tally: a voter "acks" index n if it is self (the leader always holds it)
+; or its matchIndex >= n. Every voter (minus self) is a peer, hence present in
+; `match` after sync-progress, so count-acks never sees a missing key.
+(define (voter-majority? st voters n)
+  (> (* 2 (+ (if (memv (aget st 'id) voters) 1 0)
+             (count-acks (aget st 'match) (others (aget st 'id) voters) n)))
+     (length voters)))
+(define (committed-by-quorum? st n)
+  (and (voter-majority? st (aget st 'voters) n)
+       (let ((old (aget st 'voters-old))) (or (not old) (voter-majority? st old n)))))
+
+; --- config adoption: takes effect on APPEND, not commit (the §4.3 safety rule).
+;     `recompute-config` rederives voters/voters-old/learners (and peers/all) from
+;     the NEWEST ConfChange still in the in-memory log; if none remains (e.g. a
+;     truncation discarded it, or all are compacted), it reverts to the base/
+;     snapshot config. Called after every log mutation that can add/remove a
+;     ConfChange (conf-change propose, on-ae append/truncate, Cnew auto-append). ---
+(define (latest-conf-spec log)                ; newest (conf . spec) in the log, or #f
+  (let loop ((l log) (found #f))
+    (if (null? l) found
+        (let ((cmd (cdr (car l))))
+          (loop (cdr l) (if (conf-cmd? cmd) (conf-spec cmd) found))))))
+(define (set-config st voters voters-old learners)
+  (aset* st (list 'voters voters 'voters-old voters-old 'learners learners
+                  'all voters
+                  'peers (others (aget st 'id) (union3 voters voters-old learners)))))
+(define (apply-conf-spec st spec)
+  (case (car spec)
+    ((joint)  (set-config st (caddr spec) (cadr spec) (cadddr spec)))  ; voters=NEW, old=OLD
+    ((simple) (set-config st (cadr spec) #f (caddr spec)))             ; voters=NEW, old=#f
+    (else st)))
+(define (recompute-config st)
+  (let ((spec (latest-conf-spec (aget st 'log))))
+    (if spec (apply-conf-spec st spec)
+        (set-config st (aget st 'base-voters) (aget st 'base-voters-old)
+                    (aget st 'base-learners)))))
+
+; A leader must hold next/match for EXACTLY the current peers: seed a freshly-added
+; peer (new voter/learner) and drop a removed one. Preserves existing progress.
+(define (sync-progress st)
+  (if (not (raft-leader? st)) st
+      (let ((nx (aget st 'next)) (mt (aget st 'match)) (peers (aget st 'peers))
+            (dflt (+ 1 (log-len st))))
+        (aset* st (list
+          'next  (map (lambda (p) (cons p (assq-def p nx dflt))) peers)
+          'match (map (lambda (p) (cons p (assq-def p mt 0)))   peers))))))
+
+; --- conf-change pacing: one in flight at a time. Pending iff we're mid-joint
+;     (voters-old set) or any uncommitted entry above commit is a ConfChange. ---
+(define (entry-cmd st i) (cdr (list-ref (aget st 'log) (- i (aget st 'base) 1))))
+(define (uncommitted-conf? st)
+  (let loop ((i (+ 1 (aget st 'commit))))
+    (cond ((> i (log-len st)) #f)
+          ((conf-cmd? (entry-cmd st i)) #t)
+          (else (loop (+ 1 i))))))
+(define (conf-change-pending? st)
+  (or (aget st 'voters-old) (uncommitted-conf? st)))
 
 ; ============================================================
 ; leader replication helpers
@@ -140,40 +258,119 @@
   (let loop ((st st))
     (if (>= (aget st 'applied) (aget st 'commit)) st
         (let* ((i (+ 1 (aget st 'applied)))
-               (cmd (cdr (list-ref (aget st 'log) (- i (aget st 'base) 1))))
-               (sm2 ((aget st 'apply) (aget st 'sm) cmd)))
-          (loop (aset* st (list 'applied i 'sm sm2)))))))
+               (cmd (cdr (list-ref (aget st 'log) (- i (aget st 'base) 1)))))
+          ; ConfChange entries are engine-internal metadata (the config was already
+          ; adopted on append) — advance `applied` past them WITHOUT calling apply-fn,
+          ; so the state machine (e.g. the MVCC apply-fn) never sees config payloads.
+          ; The no-op barrier ('()) is NOT a conf entry, so it still reaches apply-fn
+          ; (which skips it), preserving the §5.4.2 behaviour.
+          (if (conf-cmd? cmd)
+              (loop (aset st 'applied i))
+              (let ((sm2 ((aget st 'apply) (aget st 'sm) cmd)))
+                (loop (aset* st (list 'applied i 'sm sm2)))))))))
 
 ; Leader: advance commit to the highest index replicated on a quorum AND from
-; the current term (Raft §5.4.2), then apply.
+; the current term (Raft §5.4.2), then apply. Quorum is config-aware
+; (committed-by-quorum?): a JOINT config needs both an old- and a new-majority.
+; After commit advances, react to any ConfChange that newly committed.
 (define (maybe-commit st)
-  (let loop ((n (log-len st)))
-    (cond
-      ((<= n (aget st 'commit)) st)
-      ((and (= (entry-term st n) (aget st 'term))
-            (>= (+ 1 (count-acks (aget st 'match) (aget st 'peers) n)) (majority st)))
-       (apply-committed (aset st 'commit n)))
-      (else (loop (- n 1))))))
+  (let ((c0 (aget st 'commit)))
+    (let loop ((n (log-len st)))
+      (cond
+        ((<= n c0) st)
+        ((and (= (entry-term st n) (aget st 'term))
+              (committed-by-quorum? st n))
+         (after-commit (apply-committed (aset st 'commit n)) c0))
+        (else (loop (- n 1)))))))
+
+; Two-phase membership transition driver, run after the leader's commit advances
+; from `old-commit`. For each ConfChange that newly committed:
+;   * a JOINT entry  -> auto-append the matching Cnew (leave-joint) entry, so the
+;     transition proceeds to the new config. (The Cnew is replicated by the caller
+;     — on-aer broadcasts when it sees the log grow.)
+;   * a SIMPLE entry -> the transition is done; a LEADER no longer in the new voter
+;     set steps down (Ongaro §4.3: a leader outside Cnew relinquishes leadership
+;     only AFTER Cnew commits).
+; Followers never drive transitions (they adopt every config by replication), so
+; this is leader-only.
+(define (after-commit st old-commit)
+  (let ((c (aget st 'commit)))
+    (let loop ((i (+ 1 old-commit)) (st st))
+      (if (> i c) st
+          (let ((cmd (entry-cmd st i)))
+            (loop (+ 1 i)
+                  (if (conf-cmd? cmd) (react-to-committed-conf st (conf-spec cmd) i) st)))))))
+
+(define (react-to-committed-conf st spec idx)
+  (cond
+    ((not (raft-leader? st)) st)
+    ((eq? (car spec) 'joint)
+     (if (no-conf-after? st idx) (append-cnew st spec) st))
+    ((eq? (car spec) 'simple)
+     (if (memv (aget st 'id) (aget st 'voters)) st
+         (aset* st (list 'role 'follower 'voted-for #f))))   ; removed leader steps down
+    (else st)))
+
+(define (no-conf-after? st idx)                ; is this joint still the log's tail conf?
+  (let loop ((i (+ 1 idx)))
+    (cond ((> i (log-len st)) #t)
+          ((conf-cmd? (entry-cmd st i)) #f)
+          (else (loop (+ 1 i))))))
+
+; Append Cnew (leave-joint): voters = the joint's NEW set, with its learners. The
+; config is adopted on this append (recompute-config) and progress re-seeded; the
+; broadcast is left to the caller so maybe-commit stays (node)->(node').
+(define (append-cnew st spec)
+  (let ((new (caddr spec)) (lrn (cadddr spec)))
+    (sync-progress
+     (recompute-config
+      (aset st 'log (append (aget st 'log)
+                            (list (cons (aget st 'term) (cons 'conf (list 'simple new lrn))))))))))
 
 ; ============================================================
 ; public transitions: each returns (node' . outputs)
 ; ============================================================
 
 (define (raft-campaign st)
-  (let* ((term (+ 1 (aget st 'term)))
-         (id (aget st 'id))
-         (st (aset* st (list 'role 'candidate 'term term 'voted-for id 'votes (list id)))))
-    (if (>= (length (aget st 'votes)) (majority st))
-        (become-leader st)                       ; single-node: instant majority
-        (cons st (map (lambda (p)
-                        (cons p (list 'rv term id (log-len st) (last-log-term st))))
-                      (aget st 'peers))))))
+  (if (not (is-voter? st (aget st 'id)))
+      (cons st '())                              ; a learner / removed node never campaigns
+      (let* ((term (+ 1 (aget st 'term)))
+             (id (aget st 'id))
+             (st (aset* st (list 'role 'candidate 'term term 'voted-for id 'votes (list id)))))
+        (if (votes-quorum? st (aget st 'votes))
+            (become-leader st)                   ; single-node: instant (joint) majority
+            (cons st (map (lambda (p)
+                            (cons p (list 'rv term id (log-len st) (last-log-term st))))
+                          (aget st 'peers)))))))
 
 (define (raft-propose st command)
   (if (not (raft-leader? st))
       (cons st '())
       (broadcast-append
        (aset st 'log (append (aget st 'log) (list (cons (aget st 'term) command)))))))
+
+; Leader-side membership change (cw-u4a.28). TARGET-VOTERS / TARGET-LEARNERS describe
+; the desired final config. Refused (no-op) if we don't lead or a change is already
+; in flight (one at a time). If the VOTER set is unchanged (a learner-only add/remove)
+; the change is safe in one phase -> append a SIMPLE entry directly. Otherwise enter
+; joint consensus -> append a JOINT (Cold,new) entry; when it commits the leader
+; auto-appends Cnew (see after-commit). Config is adopted on append; progress is
+; re-seeded for any new peer; the entry is broadcast immediately.
+(define (raft-propose-conf-change st target-voters target-learners)
+  (cond
+    ((not (raft-leader? st)) (cons st '()))
+    ((conf-change-pending? st) (cons st '()))
+    ((equal-set? target-voters (aget st 'voters))
+     (append-conf st (list 'simple target-voters target-learners)))
+    (else
+     (append-conf st (list 'joint (aget st 'voters) target-voters target-learners)))))
+
+(define (append-conf st spec)
+  (broadcast-append
+   (sync-progress
+    (recompute-config
+     (aset st 'log (append (aget st 'log)
+                           (list (cons (aget st 'term) (cons 'conf spec)))))))))
 
 (define (raft-tick st)
   (if (raft-leader? st) (broadcast-append st) (cons st '())))
@@ -204,12 +401,14 @@
 ; leader via term inflation — the cure for spurious-election churn. Pure: returns
 ; (pre-candidate-node . prv-outputs).
 (define (raft-prevote st)
-  (let* ((id (aget st 'id))
-         (st (aset* st (list 'role 'pre-candidate 'pre-votes (list id)))))
-    (cons st (map (lambda (p)
-                    (cons p (list 'prv (+ 1 (aget st 'term)) id
-                                  (log-len st) (last-log-term st))))
-                  (aget st 'peers)))))
+  (if (not (is-voter? st (aget st 'id)))
+      (cons st '())                              ; a learner / removed node does not pre-vote
+      (let* ((id (aget st 'id))
+             (st (aset* st (list 'role 'pre-candidate 'pre-votes (list id)))))
+        (cons st (map (lambda (p)
+                        (cons p (list 'prv (+ 1 (aget st 'term)) id
+                                      (log-len st) (last-log-term st))))
+                      (aget st 'peers))))))
 
 (define (raft-step st from msg)
   (case (car msg)
@@ -241,7 +440,8 @@
        (let* ((votes (if (memv from (aget st 'votes)) (aget st 'votes)
                          (cons from (aget st 'votes))))
               (st (aset st 'votes votes)))
-         (if (>= (length votes) (majority st)) (become-leader st) (cons st '()))))
+         ; Config-aware: a joint config needs an old- AND a new-majority of grants.
+         (if (votes-quorum? st votes) (become-leader st) (cons st '()))))
       (else (cons st '())))))
 
 (define (on-ae st msg)
@@ -259,7 +459,10 @@
                      (kept (take-n (aget st 'log) (- pidx b)))   ; keep base+1..pidx
                      (newlog (append kept entries))
                      (midx (+ pidx (length entries)))
-                     (st (aset st 'log newlog))
+                     ; Adopt config on APPEND, not commit (§4.3): if these entries add
+                     ; a ConfChange, or the truncation dropped one, recompute-config
+                     ; switches us to the right config for all subsequent quorum votes.
+                     (st (recompute-config (aset st 'log newlog)))
                      (st (if (> lc (aget st 'commit))
                              (apply-committed (aset st 'commit (min lc (+ b (length newlog)))))
                              st)))
@@ -274,10 +477,17 @@
       ; Any AER (success OR rejection) proves this peer reached us this window —
       ; record it for CheckQuorum (raft-checkquorum counts `heard` + self).
       (succ
-       (let ((st (aset* st (list 'match (aset (aget st 'match) from midx)
-                                 'next (aset (aget st 'next) from (+ midx 1))
-                                 'heard (add-mem from (aget st 'heard))))))
-         (cons (maybe-commit st) '())))
+       (let* ((st1 (aset* st (list 'match (aset (aget st 'match) from midx)
+                                   'next (aset (aget st 'next) from (+ midx 1))
+                                   'heard (add-mem from (aget st 'heard)))))
+              (st2 (maybe-commit st1)))
+         ; maybe-commit auto-appends Cnew when a joint config commits — replicate it
+         ; now so the transition settles. (Stepping down on a committed Cnew shrinks
+         ; the log? no — Cnew was already present, so the log only grows on the joint
+         ; commit, while we are still leader.)
+         (if (and (raft-leader? st2) (> (log-len st2) (log-len st1)))
+             (broadcast-append st2)
+             (cons st2 '()))))
       (else
        ; Back off nextIndex on rejection — floor is base+1, NOT 1: entries <= base
        ; are compacted into the snapshot, so entries-from/append-for cannot serve
@@ -322,6 +532,12 @@
 (define (cluster-campaign c id) (cluster-drive c id raft-campaign))
 (define (cluster-propose c id cmd) (cluster-drive c id (lambda (st) (raft-propose st cmd))))
 (define (cluster-tick c id) (cluster-drive c id raft-tick))
+; Drive a membership change at leader `id` and settle. Because each phase's commit
+; begets further AppendEntries (joint commit -> Cnew broadcast; Cnew replication),
+; cluster-settle carries the WHOLE two-phase transition (and any new-peer log catch-up
+; via reject/backoff) to quiescence in one call.
+(define (cluster-propose-conf-change c id voters learners)
+  (cluster-drive c id (lambda (st) (raft-propose-conf-change st voters learners))))
 
 ; ============================================================
 ; networked driver — DESIGN-DRAFT (needs primops, not yet wired)

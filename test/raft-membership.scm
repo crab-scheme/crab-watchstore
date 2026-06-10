@@ -188,4 +188,96 @@
 (check "change #2 refused: no outputs"    '() (cdr if-r2))
 (check "change #2 refused: node untouched" #t (eq? (car if-r2) if-a1))
 
+; ============================================================
+(section "leader loss mid-joint-config: joint quorum re-elects + completes")
+; ============================================================
+; 5 voters {a,b,c,d,e} SHRINKING to {a,b,c}.  Get a leading, append the JOINT entry
+; (Cold={a,b,c,d,e}, Cnew={a,b,c}) and deliver it to every follower so they ADOPT the
+; joint config, but WITHHOLD their AERs so Cnew never commits — the whole cluster is
+; frozen MID-JOINT.  Then LOSE the leader a (stop using it) and prove the joint quorum
+;   (1) re-elects a new leader, needing an OLD *and* a NEW majority;
+;   (2) lets that leader COMPLETE the transition to a stable Cnew; and
+;   (3) leaves NO split-brain: the deposed a cannot commit a conflicting entry under
+;       its now-stale term.
+(define ll0 (cluster-make '(a b c d e) noop 0))
+(define ll1 (cluster-campaign ll0 'a))
+(check "a leads the initial {a,b,c,d,e}" 'leader (role-of ll1 'a))
+; a appends the joint entry (Cold={a,b,c,d,e}, Cnew={a,b,c}) and broadcasts the AE.
+(define ll-jr (raft-propose-conf-change (cluster-get ll1 'a) '(a b c) '()))  ; (a' . AEs)
+(define ll2 (cluster-set ll1 'a (car ll-jr)))
+; deliver the joint AE to every follower (each ADOPTS the joint config) but WITHHOLD
+; their AERs, so a never commits Cnew / never appends the leave-joint entry — frozen.
+(define ll3
+  (let loop ((cc ll2) (outs (cdr ll-jr)))
+    (if (null? outs) cc
+        (let ((o (car outs)))
+          (loop (car (deliver1 cc 'a (car o) (cdr o))) (cdr outs))))))
+(check "a is mid-joint: old set retained {a,b,c,d,e}" #t (sset= (old-of ll3 'a) '(a b c d e)))
+(check "a's incoming voter set = {a,b,c}"             #t (sset= (voters-of ll3 'a) '(a b c)))
+(check "follower b adopted the joint config"          #t (sset= (old-of ll3 'b) '(a b c d e)))
+(check "leaving node e is still a joint voter"        #t (is-voter? (cluster-get ll3 'e) 'e))
+
+; ---- leader a is now LOST (gone). It holds the joint entry uncommitted. ----
+
+; (1) ELECTION mid-joint: a candidate needs an OLD *and* a NEW majority. b campaigns;
+;     a never votes (it's gone). new-side {b,c} is a majority of Cnew but NOT of Cold,
+;     so b canNOT win on it; adding old-side {d,e} reaches both majorities -> b wins.
+(define ll-b0 (car (raft-campaign (cluster-get ll3 'b))))
+(check "b becomes a candidate (its term bumps)" 'candidate (raft-role ll-b0))
+(define ll-b1 (car (on-rvr ll-b0 'c (list 'rvr (raft-term ll-b0) #t))))   ; + new-side c
+(check "new-side {b,c} alone (a Cnew majority, NOT a Cold majority) does NOT elect"
+       'candidate (raft-role ll-b1))
+(define ll-b2 (car (on-rvr ll-b1 'd (list 'rvr (raft-term ll-b1) #t))))   ; + old-side d
+(define ll-b3 (car (on-rvr ll-b2 'e (list 'rvr (raft-term ll-b2) #t))))   ; + old-side e
+(check "old-side votes complete BOTH majorities -> b is elected mid-joint"
+       'leader (raft-role ll-b3))
+(check "the new leader b is itself in the incoming config {a,b,c}" #t (is-voter? ll-b3 'b))
+
+; (2) COMPLETE the transition. b's own-term no-op barrier commits under the JOINT quorum,
+;     which indirectly commits the joint entry beneath it (Raft 5.4.2); committing the
+;     joint auto-appends the leave-joint Cnew, which then commits under the new SIMPLE
+;     quorum -> a stable Cnew={a,b,c}, no pending change, b still leading.
+(define n-noop (log-len ll-b3))                  ; index of b's no-op barrier
+(check "b appended a no-op barrier in its OWN term" (raft-term ll-b3) (entry-term ll-b3 n-noop))
+; a is gone: b(self)+c form the NEW majority {a,b,c}; b,c,d form the OLD majority {a,b,c,d,e}.
+(define ll-m1 (aset ll-b3 'match (aset* (aget ll-b3 'match) (list 'c n-noop 'd n-noop))))
+(define ll-c1 (maybe-commit ll-m1))
+(check "b's own-term no-op commits -> joint entry commits beneath it (5.4.2)"
+       #t (>= (aget ll-c1 'commit) n-noop))
+(check "committing the joint auto-appended the leave-joint Cnew (b LEFT joint)"
+       #f (aget ll-c1 'voters-old))
+(check "b's voters are now Cnew {a,b,c}" #t (sset= (aget ll-c1 'voters) '(a b c)))
+(define n-cnew (log-len ll-c1))                  ; the auto-appended leave-joint entry
+(check "the leave-joint Cnew entry sits above the no-op" #t (> n-cnew n-noop))
+; commit the Cnew under the new SIMPLE quorum {a,b,c} (maj 2): b(self)+c.
+(define ll-m2 (aset ll-c1 'match (aset (aget ll-c1 'match) 'c n-cnew)))
+(define ll-c2 (maybe-commit ll-m2))
+(check "b commits Cnew -> the two-phase transition completes" #t (>= (aget ll-c2 'commit) n-cnew))
+(check "b ends as LEADER of the new config" 'leader (raft-role ll-c2))
+(check "b's config is a STABLE non-joint Cnew {a,b,c}"
+       #t (and (sset= (aget ll-c2 'voters) '(a b c)) (not (aget ll-c2 'voters-old))))
+(check "no conf-change pending after the transition completes" #f (conf-change-pending? ll-c2))
+
+; (3) NO SPLIT-BRAIN. The deposed a still BELIEVES it leads the joint (its stale view).
+;     It cannot commit a conflicting entry: with only its stale matchIndex it has no
+;     fresh quorum, and the instant it contacts a peer on b's term the higher term
+;     deposes it — a's term can never out-commit b's.
+(define a-frozen (cluster-get ll3 'a))
+(check "the deposed a still BELIEVES it leads (its stale joint view)" 'leader (raft-role a-frozen))
+(check "a's term is now STALE — strictly behind the new leader b's"
+       #t (< (raft-term a-frozen) (raft-term ll-c2)))
+; a, isolated, proposes a NEW client entry: it would CONFLICT with b's no-op at the same index.
+(define a-stale (car (raft-propose a-frozen (cmd "stale"))))
+(check "a's conflicting entry lands at the SAME index b used for its no-op"
+       n-noop (log-len a-stale))
+; but a cannot commit it: its matchIndex holds no fresh acks (the freeze withheld them),
+; so no joint quorum exists -> maybe-commit does NOT advance a's commit.
+(check "a canNOT commit its conflicting entry (no fresh joint quorum under the stale term)"
+       (aget a-stale 'commit) (aget (maybe-commit a-stale) 'commit))
+; and the instant a contacts a peer that has moved to b's term, the higher term deposes it.
+(define a-deposed (car (on-aer a-stale 'c (list 'aer (raft-term ll-c2) #f 0 0))))
+(check "contacting a current-term peer deposes the stale leader a" 'follower (raft-role a-deposed))
+(check "deposed a adopts the new term — it can never out-commit b"
+       (raft-term ll-c2) (raft-term a-deposed))
+
 (done!)

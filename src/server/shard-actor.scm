@@ -939,6 +939,50 @@
              (send (cadr m) (list 'member-list (aget st 'voters) (aget st 'learners)))
              (loop st leader elapsed flush-base))
 
+            ;; ---- Maintenance read/flush seams (cw-u4a.32) ----
+            ;; Status / Hash / HashKV / Snapshot are READS; Defragment is an advisory flush.
+            ;; ALL un-gated (NOT leader-gated), exactly like member-list: etcdctl `endpoint
+            ;; status` / `endpoint hashkv` query each endpoint DIRECTLY (Maintenance is
+            ;; endpoint-local), and a cross-member hash comparison REQUIRES every replica to
+            ;; answer from its OWN committed ctx — identical hashes across members prove the
+            ;; replicas hold the identical committed keyspace (the consistency proof).  These
+            ;; read THIS node's ctx via the pure mvcc-* helpers and NEVER propose a Raft entry,
+            ;; so they touch neither the write/consensus path nor `pending`.  Replies are fully
+            ;; SENDABLE (ints / a leader-name symbol / lists of bytevectors).
+            ;;   (status   reply-pid)      -> (status-ok rev term commit applied db-size leader)
+            ;;   (hashkv   reply-pid rev)  -> (hashkv-ok hash compact-rev hash-rev)  (rev 0 = current)
+            ;;   (snapshot reply-pid)      -> (snapshot-ok rev ((key . value) ...))
+            ;;   (defrag   reply-pid)      -> (defrag-ok)
+            ((eq? (car m) 'status)
+             (let ((conn (cadr m))
+                   (dig  (mvcc-digest-at ctx 0)))         ; (hash size count) at current rev
+               (send conn (list 'status-ok (mvcc-current-rev ctx) (raft-term st)
+                                (raft-commit st) (raft-applied st) (cadr dig) leader)))
+             (loop st leader elapsed flush-base))
+            ((eq? (car m) 'hashkv)
+             (let* ((conn (cadr m)) (req-rev (caddr m))
+                    (at   (if (= req-rev 0) (mvcc-current-rev ctx) req-rev))
+                    (dig  (mvcc-digest-at ctx at)))
+               (send conn (list 'hashkv-ok (car dig) (mvcc-compact-rev ctx) at)))
+             (loop st leader elapsed flush-base))
+            ;; A CONSISTENT point-in-time logical snapshot: because the shard is
+            ;; single-threaded, this read sees no interleaved write — the kvs are the live
+            ;; keyspace at one revision.  (Materialises the whole keyspace into one reply —
+            ;; fine for v1; a chunked store-iter stream is a future refinement.)
+            ((eq? (car m) 'snapshot)
+             (let ((conn (cadr m)))
+               (send conn (list 'snapshot-ok (mvcc-current-rev ctx)
+                                (mvcc-snapshot-kvs ctx 0))))
+             (loop st leader elapsed flush-base))
+            ;; Defragment: advisory.  RocksDB has no bbolt-style page defragmentation, so the
+            ;; closest honest analogue is flushing memtables to SSTs + fsyncing the WAL.
+            ((eq? (car m) 'defrag)
+             (let ((conn (cadr m)))
+               (guard (e (#t #f)) (store-flush (shard-ctx-handle ctx)))
+               (ctx-flush! ctx)
+               (send conn (list 'defrag-ok)))
+             (loop st leader elapsed flush-base))
+
             ;; ---- linearizable read probe: (read CONN) ----
             ;; Solo serves inline (a round would never complete); multi-voter
             ;; ReadIndex: enqueue + (if idle) open a confirmation round; serve-batch!

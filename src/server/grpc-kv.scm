@@ -103,16 +103,60 @@
 ; ===========================================================================
 ;
 ; etcdserverpb.StatusResponse{header=1, version=2(string), dbSize=3, leader=4(u64),
-;   raftIndex=5, raftTerm=6, raftAppliedIndex=7, ...} — header+version+raft scalars
-;   are enough for etcdctl endpoint health / `endpoint status`.
+;   raftIndex=5, raftTerm=6, raftAppliedIndex=7, errors=8(rep string), dbSizeInUse=9}.
+;   cw-u4a.32 fills the full set with REAL values so `etcdctl endpoint status` is honest.
 (define StatusResponse-schema
   (list
-    (list 1 'header     '(message ResponseHeader-schema-ref) 'optional)
-    (list 2 'version    'string 'optional)
-    (list 3 'dbSize     'int64  'optional)
-    (list 4 'leader     'uint64 'optional)
-    (list 5 'raftIndex  'uint64 'optional)
-    (list 6 'raftTerm   'uint64 'optional)))
+    (list 1 'header           '(message ResponseHeader-schema-ref) 'optional)
+    (list 2 'version          'string 'optional)
+    (list 3 'dbSize           'int64  'optional)
+    (list 4 'leader           'uint64 'optional)
+    (list 5 'raftIndex        'uint64 'optional)
+    (list 6 'raftTerm         'uint64 'optional)
+    (list 7 'raftAppliedIndex 'uint64 'optional)
+    (list 8 'errors           'string 'repeated)
+    (list 9 'dbSizeInUse      'int64  'optional)))
+
+; ---- Maintenance service request/response messages (cw-u4a.32; etcd rpc.proto fields) ----
+; Hash / HashKV are keyspace-content checksums; a cross-member equality of the uint32 hash
+; is a real corruption/consistency proof.  HashKVRequest.revision=0 => current rev.
+(define HashRequest-schema '())
+(define HashResponse-schema
+  (list
+    (list 1 'header '(message ResponseHeader-schema-ref) 'optional)
+    (list 2 'hash   'uint32 'optional)))
+(define HashKVRequest-schema
+  '((1 revision int64 optional)))
+(define HashKVResponse-schema
+  (list
+    (list 1 'header           '(message ResponseHeader-schema-ref) 'optional)
+    (list 2 'hash             'uint32 'optional)
+    (list 3 'compact_revision 'int64  'optional)
+    (list 4 'hashRevision     'int64  'optional)))
+; Defragment — empty request; header-only response.
+(define DefragmentRequest-schema  '())
+(define DefragmentResponse-schema
+  (list (list 1 'header '(message ResponseHeader-schema-ref) 'optional)))
+; Alarm — action(GET=0/ACTIVATE=1/DEACTIVATE=2), memberID, alarm(NONE=0/NOSPACE=1/CORRUPT=2).
+; AlarmMember is the only NESTED schema here (registered below as AlarmMember-schema-ref).
+(define AlarmMember-schema
+  (list
+    (list 1 'memberID 'uint64 'optional)
+    (list 2 'alarm    'enum   'optional)))
+(define AlarmRequest-schema
+  (list
+    (list 1 'action   'enum   'optional)
+    (list 2 'memberID 'uint64 'optional)
+    (list 3 'alarm    'enum   'optional)))
+(define AlarmResponse-schema
+  (list
+    (list 1 'header '(message ResponseHeader-schema-ref) 'optional)
+    (list 2 'alarms '(message AlarmMember-schema-ref)    'repeated)))
+; MoveLeader{targetID} -> {header}.
+(define MoveLeaderRequest-schema
+  '((1 targetID uint64 optional)))
+(define MoveLeaderResponse-schema
+  (list (list 1 'header '(message ResponseHeader-schema-ref) 'optional)))
 
 ; etcdserverpb.Member{ID=1, name=2, peerURLs=3(rep string), clientURLs=4(rep string),
 ;   isLearner=5(bool)}.  isLearner (cw-u4a.30) distinguishes a non-voting learner.
@@ -174,6 +218,11 @@
 ; appending here (once, at include time) is additive and order-independent.
 (set! schema-ref-table
       (cons (cons 'Member-schema-ref (lambda () Member-schema)) schema-ref-table))
+
+; Register AlarmMember-schema-ref so the repeated `alarms` field (AlarmResponse) resolves
+; (cw-u4a.32; same lazy-thunk append pattern as Member-schema-ref above).
+(set! schema-ref-table
+      (cons (cons 'AlarmMember-schema-ref (lambda () AlarmMember-schema)) schema-ref-table))
 
 ; ===========================================================================
 ; uint64 member-ID <-> node-name bijection (cw-u4a.30) — deterministic, stateless.
@@ -1097,6 +1146,10 @@
                (start-stream-worker! h 'grpc-watch-worker))))
         ((string=? path "/etcdserverpb.Lease/LeaseKeepAlive")
          (start-stream-worker! h 'grpc-lease-keepalive-worker))
+        ; Maintenance/Snapshot (cw-u4a.32) is SERVER-STREAMING: one request -> many
+        ; response chunks -> close.  Spawn the snapshot stream worker exactly like Watch.
+        ((string=? path "/etcdserverpb.Maintenance/Snapshot")
+         (start-stream-worker! h 'grpc-snapshot-worker))
         (else (dispatch-unary! h path)))))
 
   (define (dispatch-unary! h path)
@@ -1142,9 +1195,14 @@
                       ((string=? path "/etcdserverpb.Cluster/MemberRemove")  (handle-member-remove bytes))
                       ((string=? path "/etcdserverpb.Cluster/MemberUpdate")  (handle-member-update bytes))
                       ((string=? path "/etcdserverpb.Cluster/MemberPromote") (handle-member-promote bytes))
-                      ; minimal Maintenance/Status STUB so etcdctl's balancer connects +
-                      ; `endpoint status` prints (full Maintenance is cw-u4a.32).
-                      ((string=? path "/etcdserverpb.Maintenance/Status") (handle-status bytes))
+                      ; Maintenance service (cw-u4a.32): Status/Hash/HashKV/Defragment/
+                      ; Alarm/MoveLeader unary; Snapshot is server-streaming (in dispatch!).
+                      ((string=? path "/etcdserverpb.Maintenance/Status")     (handle-status bytes))
+                      ((string=? path "/etcdserverpb.Maintenance/Hash")       (handle-hash bytes))
+                      ((string=? path "/etcdserverpb.Maintenance/HashKV")     (handle-hashkv bytes))
+                      ((string=? path "/etcdserverpb.Maintenance/Defragment") (handle-defragment bytes))
+                      ((string=? path "/etcdserverpb.Maintenance/Alarm")      (handle-alarm bytes))
+                      ((string=? path "/etcdserverpb.Maintenance/MoveLeader") (handle-move-leader bytes))
                       (else (cons 'unimplemented path))))))
       (cond
         ((and (pair? res) (eq? (car res) 'ok))
@@ -1156,17 +1214,120 @@
                               (string-append "unimplemented method: " (cdr res))))
         (else (grpc-respond-error! h GRPC-INTERNAL "handler produced no response")))))
 
-  ; ---- Maintenance/Status STUB (schema is at module top) ----
-  ; Just enough for etcdctl's balancer to connect + `endpoint status` to print.
+  ; ===========================================================================
+  ; Maintenance service handlers (cw-u4a.32) — Status/Hash/HashKV/Defragment/Alarm/
+  ; MoveLeader (UNARY).  Snapshot is server-STREAMING (dispatch! -> grpc-snapshot-worker,
+  ; server/grpc-watch.scm), like Watch.  Each handler returns the (cons 'ok bytes) /
+  ; (cons 'err (status . msg)) protocol.  All read seams are un-gated, so these serve on
+  ; ANY node (which is required for the cross-member hashkv consistency check).
+  ; ===========================================================================
+
+  ; ask the shard's .32 status seam -> (status-ok rev term commit applied db-size leader)
+  (define (shard-status) (ask-shard (list 'status (self))))
+
+  ; leader-local alarm set (etcd REPLICATES alarms via Raft; a faithful replicated version
+  ; is a documented follow-up — this is leader-local, dropped on restart, NOT consensus).
+  ; Keyed "memberID:alarmType" (string) so GET/ACTIVATE/DEACTIVATE are set semantics; the
+  ; value is the AlarmMember alist returned in AlarmResponse.alarms.
+  (define alarm-table (make-hashtable string-hash string=?))
+  (define ALARM-ACTIVATE 1)
+  (define ALARM-DEACTIVATE 2)
+  (define (alarm-key mid atype)
+    (string-append (number->string mid) ":" (number->string atype)))
+  (define (alarm-active-members) (vector->list (hashtable-values alarm-table)))
+
+  ; ---- Maintenance/Status (UPGRADE of the .22 stub) ----
+  ; Real raft scalars (raftIndex=commit, raftAppliedIndex=applied, raftTerm) + a LOGICAL
+  ; db size (sum of keylen+valuelen over the live keyspace) from the shard's status seam,
+  ; so `etcdctl endpoint status` shows REAL data per endpoint.  leader = the member-id of
+  ; the Raft leader (name->id), 0 if this node currently sees no leader.  dbSize ==
+  ; dbSizeInUse (no bbolt free-page notion).  Served on any node (un-gated seam).
   (define (handle-status bytes)
-    (let ((hdr (shard-header)))
-      (cons 'ok (pb-encode StatusResponse-schema
-                           (list (cons 'header hdr)
-                                 (cons 'version "3.6.0")
-                                 (cons 'dbSize 0)
-                                 (cons 'leader member-id)
-                                 (cons 'raftIndex (galist 'revision hdr 0))
-                                 (cons 'raftTerm (galist 'raft_term hdr 0)))))))
+    (let ((r (shard-status)))
+      (if (and (pair? r) (eq? (car r) 'status-ok))
+          (let* ((rev    (list-ref r 1)) (term    (list-ref r 2))
+                 (commit (list-ref r 3)) (applied (list-ref r 4))
+                 (dbsize (list-ref r 5)) (ldr     (list-ref r 6))
+                 (leader-id (if ldr (member-name->id (symbol->string ldr)) 0)))
+            (cons 'ok (pb-encode StatusResponse-schema
+                                 (list (cons 'header (make-header cluster-id member-id rev term))
+                                       (cons 'version "3.6.0")
+                                       (cons 'dbSize dbsize)
+                                       (cons 'leader leader-id)
+                                       (cons 'raftIndex commit)
+                                       (cons 'raftTerm term)
+                                       (cons 'raftAppliedIndex applied)
+                                       (cons 'dbSizeInUse dbsize)))))
+          (cons 'err (cons GRPC-INTERNAL "status: unexpected ack")))))
+
+  ; ---- Maintenance/HashKV + Hash ----  deterministic 32-bit keyspace checksum (mvcc-digest-at).
+  ; Un-gated: a cross-member `etcdctl endpoint hashkv` reaches every replica, each answering
+  ; from its OWN committed ctx — identical hashes prove the replicas hold the identical
+  ; committed keyspace.  Hash = HashKV at the current rev.
+  (define (handle-hashkv bytes)
+    (let* ((req (pb-decode HashKVRequest-schema bytes))
+           (rev (galist 'revision req 0))
+           (r   (ask-shard (list 'hashkv (self) rev))))
+      (if (and (pair? r) (eq? (car r) 'hashkv-ok))
+          (cons 'ok (pb-encode HashKVResponse-schema
+                               (list (cons 'header (shard-header))
+                                     (cons 'hash (list-ref r 1))
+                                     (cons 'compact_revision (list-ref r 2))
+                                     (cons 'hashRevision (list-ref r 3)))))
+          (cons 'err (cons GRPC-INTERNAL "hashkv: unexpected ack")))))
+  (define (handle-hash bytes)
+    (let ((r (ask-shard (list 'hashkv (self) 0))))   ; Hash == HashKV at current rev
+      (if (and (pair? r) (eq? (car r) 'hashkv-ok))
+          (cons 'ok (pb-encode HashResponse-schema
+                               (list (cons 'header (shard-header))
+                                     (cons 'hash (list-ref r 1)))))
+          (cons 'err (cons GRPC-INTERNAL "hash: unexpected ack")))))
+
+  ; ---- Maintenance/Defragment ----  advisory RocksDB flush (memtables->SSTs + WAL fsync);
+  ; RocksDB has NO bbolt-style page defragmentation, so this is the closest honest analogue.
+  (define (handle-defragment bytes)
+    (let ((r (ask-shard (list 'defrag (self)))))
+      (if (and (pair? r) (eq? (car r) 'defrag-ok))
+          (cons 'ok (pb-encode DefragmentResponse-schema
+                               (list (cons 'header (shard-header)))))
+          (cons 'err (cons GRPC-INTERNAL "defragment: unexpected ack")))))
+
+  ; ---- Maintenance/Alarm ----  leader-local alarm set.  GET (action 0, or unknown) lists
+  ; active alarms; ACTIVATE adds (alarm type > NONE); DEACTIVATE removes.  Empty by default,
+  ; so `etcdctl alarm list` shows nothing and `etcdctl alarm disarm` succeeds (no-op).
+  (define (handle-alarm bytes)
+    (let* ((req    (pb-decode AlarmRequest-schema bytes))
+           (action (galist 'action req 0))
+           (mid    (galist 'memberID req 0))
+           (atype  (galist 'alarm req 0)))
+      (cond
+        ((and (= action ALARM-ACTIVATE) (> atype 0))
+         (hashtable-set! alarm-table (alarm-key mid atype)
+                         (list (cons 'memberID mid) (cons 'alarm atype))))
+        ((= action ALARM-DEACTIVATE)
+         (hashtable-delete! alarm-table (alarm-key mid atype))))
+      (cons 'ok (pb-encode AlarmResponse-schema
+                           (list (cons 'header (shard-header))
+                                 (cons 'alarms (alarm-active-members)))))))
+
+  ; ---- Maintenance/MoveLeader ----  the Raft engine has NO leadership-transfer / TimeoutNow
+  ; primitive.  targetID == the current leader => trivial no-op success; any other target =>
+  ; UNIMPLEMENTED with a clear message.  We do NOT fake it with a blind stepdown (that cannot
+  ; TARGET a specific member, so it would be dishonest); real engine leadership transfer is a
+  ; filed follow-up bead.
+  (define (handle-move-leader bytes)
+    (let* ((req    (pb-decode MoveLeaderRequest-schema bytes))
+           (target (galist 'targetID req 0))
+           (st     (shard-status))
+           (ldr    (and (pair? st) (eq? (car st) 'status-ok) (list-ref st 6)))
+           (leader-id (if ldr (member-name->id (symbol->string ldr)) 0)))
+      (if (and (> leader-id 0) (= target leader-id))
+          (cons 'ok (pb-encode MoveLeaderResponse-schema
+                               (list (cons 'header (shard-header)))))
+          (cons 'err (cons GRPC-UNIMPLEMENTED
+            (string-append "leadership transfer not supported: the Raft engine has no "
+                           "TimeoutNow; remove the leader via MemberRemove to force "
+                           "re-election"))))))
 
   ; ===========================================================================
   ; Cluster service handlers (cw-u4a.30)

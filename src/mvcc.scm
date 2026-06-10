@@ -626,6 +626,55 @@
                        (collect (cdr rs) uk (list row) new-results)))))))))))
 
 ; ---------------------------------------------------------------------------
+; mvcc-digest-at / mvcc-snapshot-kvs  (cw-u4a.32 — Maintenance Status/Hash/HashKV/Snapshot)
+; ---------------------------------------------------------------------------
+;
+; PURE reads over the VISIBLE keyspace at `at-rev` (0 => current), reusing mvcc-range's
+; visible-version resolution so they fold over EXACTLY the live latest-≤-rev KeyValue of
+; every key, in mvcc-range's canonical (NS-KEY on-disk) order.  Because every replica
+; holds the byte-identical NS-KEY layout for the same committed state, the fold order —
+; hence the hash — is IDENTICAL on every replica.  That cross-member determinism is the
+; whole point of HashKV (a corruption/divergence check), so the exact algorithm need NOT
+; match etcd's — only being deterministic across our replicas matters.
+
+; FNV-1a folded into 32 bits, kept < 2^32 every step to dodge crabscheme's signed-i64
+; bitwise wrap (same trick as grpc-kv's member-name->id / node-cluster's stable-id; the
+; `*` is a true bignum so the 16777619 multiply never overflows before the modulo).
+(define (mvcc-fnv1a-byte h b)
+  (modulo (* (bitwise-xor h b) 16777619) 4294967296))
+(define (mvcc-fnv1a-bytes h bv)
+  (let ((n (bytevector-length bv)))
+    (let loop ((i 0) (h h))
+      (if (= i n) h (loop (+ i 1) (mvcc-fnv1a-byte h (bytevector-u8-ref bv i)))))))
+
+; All live (user-key . record) at at-rev in canonical order (mvcc-range all-keys: key
+; and range-end both = #u8(0)).  '() on an err-compacted result (an explicit at-rev below
+; the compact floor) — Status/HashKV at rev 0 resolve to current-rev and never trip it.
+(define (mvcc-live-kvs ctx at-rev)
+  (let ((res (mvcc-range ctx (mvcc-byte 0) (mvcc-byte 0) (list (cons 'revision at-rev)))))
+    (if (and (pair? res) (integer? (car res))) (cdr res) '())))
+
+; (hash32 total-bytes count) over the live keyspace at at-rev.  The hash folds, per key
+; in canonical order, key-bytes ‖ u64be(mod_rev) ‖ value-bytes; total-bytes sums
+; keylen+valuelen — the LOGICAL db size Status reports (RocksDB exposes no page size).
+(define (mvcc-digest-at ctx at-rev)
+  (let loop ((kvs (mvcc-live-kvs ctx at-rev)) (h 2166136261) (sz 0) (n 0))
+    (if (null? kvs)
+        (list h sz n)
+        (let* ((uk  (caar kvs))
+               (rec (cdar kvs))
+               (val (kv-rec-value rec))
+               (h1  (mvcc-fnv1a-bytes h uk))
+               (h2  (mvcc-fnv1a-bytes h1 (u64->bytes (kv-rec-mod-rev rec))))
+               (h3  (mvcc-fnv1a-bytes h2 val)))
+          (loop (cdr kvs) h3 (+ sz (bytevector-length uk) (bytevector-length val)) (+ n 1))))))
+
+; Live (key . value) pairs at at-rev, canonical order — the LOGICAL snapshot payload.
+(define (mvcc-snapshot-kvs ctx at-rev)
+  (map (lambda (item) (cons (car item) (kv-rec-value (cdr item))))
+       (mvcc-live-kvs ctx at-rev)))
+
+; ---------------------------------------------------------------------------
 ; mvcc-watch-events  (cw-u4a.12 — Watch historical-replay query, ADR 0002 §3)
 ; ---------------------------------------------------------------------------
 ;

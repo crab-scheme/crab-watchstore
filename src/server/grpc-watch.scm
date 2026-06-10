@@ -92,6 +92,15 @@
       (if (pair? events)
           (list (cons 'events (map wg-event->event events))) '()))))
 
+; etcdserverpb.SnapshotResponse{header=1, remaining_bytes=2 uint64, blob=3 bytes}
+; (cw-u4a.32).  Defined HERE because the snapshot stream worker (below) lives in this
+; runtime; the nested ResponseHeader resolves via proto.scm's schema-ref-table.
+(define SnapshotResponse-schema
+  (list
+    (list 1 'header          '(message ResponseHeader-schema-ref) 'optional)
+    (list 2 'remaining_bytes 'uint64 'optional)
+    (list 3 'blob            'bytes  'optional)))
+
 ; ===========================================================================
 ; Watch worker — one per /etcdserverpb.Watch/Watch stream
 ; ===========================================================================
@@ -248,3 +257,77 @@
         ((eq? (car m) 'client-msg) (handle-keepalive (cadr m)) (loop))
         ((eq? (car m) 'client-end) (grpc-stream-close! h WG-OK))   ; exit
         (else (loop))))))
+
+; ===========================================================================
+; Snapshot worker — one per /etcdserverpb.Maintenance/Snapshot stream (cw-u4a.32)
+; ===========================================================================
+;   (spawn-source "(include \"src/server/grpc-watch.scm\")" 'grpc-snapshot-worker
+;                 H SHARD-PID CLUSTER-ID MEMBER-ID)
+;
+; Maintenance/Snapshot is SERVER-STREAMING: one (empty) SnapshotRequest -> many
+; SnapshotResponse chunks -> close.  We ask the shard for a CONSISTENT point-in-time
+; logical snapshot (the shard is single-threaded, so the read sees no interleaved write),
+; frame it as length-prefixed key->value records, append a trailing sha256 of those bytes
+; (etcd's Snapshot appends one, and `etcdctl snapshot save` VERIFIES it), and stream it in
+; chunks; the client receives io.EOF when we grpc-stream-close! with OK.
+;
+; LIMITATION (documented): this is a crab-watchstore-NATIVE logical snapshot over the
+; RocksDB backend — NOT etcd's bbolt .db file.  `etcdctl snapshot save` DOWNLOADS +
+; checksum-verifies it (proving the server-stream works end-to-end), but `etcdctl snapshot
+; restore/status` (which parse bbolt) will NOT accept it — restore is crab-watchstore-native.
+
+(define SNAP-CHUNK 32768)   ; 32 KiB logical chunks
+
+; one snapshot record: u64be(len key) ‖ key ‖ u64be(len value) ‖ value
+(define (snap-record k v)
+  (bytevector-append (u64->bytes (bytevector-length k)) k
+                     (u64->bytes (bytevector-length v)) v))
+
+; Pad a bytevector up to the next multiple of 512 with zero bytes.  etcdctl `snapshot save`
+; gates the download on hasChecksum(size): (size % 512) == sha256.Size(32) — a real bbolt db
+; is 512-sector aligned, then a 32-byte trailing sha256 is appended.  Padding the logical
+; body to a 512 multiple makes (padded-len + 32) % 512 == 32, so the save verifies + writes.
+(define (snap-pad-512 bv)
+  (let ((rem (modulo (bytevector-length bv) 512)))
+    (if (= rem 0) bv (bytevector-append bv (make-bytevector (- 512 rem) 0)))))
+
+(define (grpc-snapshot-worker h shard-pid cluster-id member-id)
+  ; ask-shard tolerant of a racing client half-close: a server-streaming call's
+  ; ('*grpc-stream-end* h) may arrive while we await the shard reply, so loop until
+  ; we see one of OUR shard reply tags (discarding any client-end — we close the
+  ; stream ourselves once the chunks are sent).
+  (define (ask-shard msg)
+    (send shard-pid msg)
+    (let wait ()
+      (let ((r (raw-receive)))
+        (if (and (pair? r) (memq (car r) '(cur-rev-ok snapshot-ok))) r (wait)))))
+  (define hdr
+    (let ((r (ask-shard (list 'cur-rev (self)))))
+      (if (and (pair? r) (eq? (car r) 'cur-rev-ok))
+          (wg-make-header cluster-id member-id (cadr r) (caddr r))
+          (wg-make-header cluster-id member-id 0 1))))
+  ; pull the consistent logical snapshot: (snapshot-ok rev ((key . value) ...)).
+  (let* ((snap (ask-shard (list 'snapshot (self))))
+         (kvs  (if (and (pair? snap) (eq? (car snap) 'snapshot-ok)) (list-ref snap 2) '()))
+         ; logical snapshot body (every length-prefixed key->value record, canonical order),
+         ; padded to a 512-byte multiple so the etcdctl `snapshot save` size gate accepts it.
+         (body (snap-pad-512 (apply bytevector-append
+                                    (map (lambda (kv) (snap-record (car kv) (cdr kv))) kvs))))
+         ; etcd's Maintenance/Snapshot appends a sha256 of the streamed bytes as the final
+         ; chunk; `etcdctl snapshot save` writes db++sha256 and accepts it when (size % 512)
+         ; == 32.  We append the REAL sha256(body) (our 32-bit content hash is HashKV's
+         ; separate cross-member proof).
+         (blob (bytevector-append body (hash-sha256 body)))
+         (total (bytevector-length blob)))
+    ; stream the blob in chunks; remaining_bytes = bytes left AFTER each chunk.
+    (let stream ((off 0))
+      (if (< off total)
+          (let* ((end       (min total (+ off SNAP-CHUNK)))
+                 (chunk      (subbv blob off end))
+                 (remaining  (- total end)))
+            (grpc-stream-send! h (pb-encode SnapshotResponse-schema
+                                            (list (cons 'header hdr)
+                                                  (cons 'remaining_bytes remaining)
+                                                  (cons 'blob chunk))))
+            (stream end))
+          (grpc-stream-close! h WG-OK)))))

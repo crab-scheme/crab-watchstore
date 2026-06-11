@@ -64,3 +64,27 @@ time bytevector ops + list building with reverse/append).
    but will need for load=l.
 5. **Acceptance for cw-b5w.5 moves up**: load=m already passes, so the re-run target is
    "sustain load=m comfortably + report best sustainable point toward load=l (~8000 w/s)".
+
+## After cw-b5w.2 (native etcdserverpb codec for Put/Range)
+
+`handle-put`/`handle-range` now decode requests and encode responses through native
+crabscheme builtins (`etcd-pb-decode-put/range`, `etcd-pb-encode-put/range-resp` —
+`crates/cs-runtime/src/builtins/etcdpb.rs`, `grpc` feature), removing the interpreted
+per-byte codec from the two hot RPCs. Proven equivalent by `test/etcdpb-native.scm`
+(70 differential checks vs proto.scm, byte-for-byte) + 6 Rust unit tests; all four
+etcdctl conformance suites stay green (KV 25, Maintenance 25, Watch+Lease 18, Auth 22).
+
+Ladder after (`bench/ladder-cws.sh`, same machine/day):
+
+| load | before (cw-b5w.1 baseline) | after |
+|---|---|---|
+| s | PASS | PASS (slowest 81ms, stddev 12.6ms) |
+| m | PASS (1000 w/s, slowest 82ms) | PASS (968 w/s, slowest 124ms, stddev 12.9ms) |
+| l | not attempted (was: FAIL pre-.38) | FAIL — but **1911 w/s sustained** (target 8000; slowest 523ms) |
+
+Net: the codec change holds m and **roughly doubles the demonstrated ceiling to
+~1900 w/s at load=l pressure** (etcd: 7971 w/s → gap now ~4×, down from ~8×+).
+At this point the server is concurrency-limited, not codec-limited — the next
+levers are cw-b5w.3 (proposal batching through the single shard actor) and
+cw-b5w.4 (multi-shard). The check-perf cleanup DeleteRange still times out on
+60k keys (bulk-delete apply cost; noted for cw-b5w.3).

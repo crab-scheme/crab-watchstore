@@ -686,12 +686,36 @@
   ; ---- KV/Range ----
   ; Decode RangeRequest, route the read through the shard's ReadIndex/leader gate,
   ; build RangeResponse{header, kvs, more, count}.  ErrCompacted -> OutOfRange(11).
+  ;
+  ; HOT PATH (cw-b5w.2): decode + response encode go through the NATIVE
+  ; etcdserverpb codec builtins (etcd-pb-decode-range / etcd-pb-encode-range-resp,
+  ; crabscheme `grpc` feature — always present, grpc-serve rides the same gate).
+  ; Profiling (docs/perf-profile-load-m.md) showed proto.scm's interpreted
+  ; byte-at-a-time codec dominated on-CPU time; the native builtins read/write
+  ; the payload bytes directly.  proto.scm stays authoritative for every other
+  ; message.  The decoded list is POSITIONAL, in RangeRequest field order:
+  ;   (key range_end limit revision sort_order sort_target
+  ;    serializable keys_only count_only min_mod max_mod min_create max_create)
   (define (handle-range h bytes)
-    (let* ((rr   (pb-decode RangeRequest-schema bytes))
-           (opts (range-request->opts rr))
-           (deny (authz-deny? h (galist 'key opts EMPTY) (galist 'range-end opts #f) 'read)))
+    (let* ((rl   (etcd-pb-decode-range bytes))
+           (key  (list-ref rl 0))
+           (rend (let ((re (list-ref rl 1)))
+                   (if (= (bytevector-length re) 0) #f re)))
+           (deny (authz-deny? h key rend 'read)))
       (if deny (cons 'err deny)
-      (let ((res (shard-range opts)))
+      (let* ((opts (list (cons 'key key)
+                         (cons 'range-end rend)
+                         (cons 'revision       (list-ref rl 3))
+                         (cons 'limit          (list-ref rl 2))
+                         (cons 'count-only     (list-ref rl 8))
+                         (cons 'keys-only      (list-ref rl 7))
+                         (cons 'sort-order     (etcd-sort-order->sym  (list-ref rl 4)))
+                         (cons 'sort-target    (etcd-sort-target->sym (list-ref rl 5)))
+                         (cons 'min-create-rev (list-ref rl 11))
+                         (cons 'max-create-rev (list-ref rl 12))
+                         (cons 'min-mod-rev    (list-ref rl 9))
+                         (cons 'max-mod-rev    (list-ref rl 10))))
+             (res (shard-range opts)))
       (cond
         ((not (pair? res)) (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: not leader")))
         ((eq? (car res) 'kv-range-ok)
@@ -700,26 +724,25 @@
                (tuples  (list-ref res 5)))
            (if (eq? err 'compacted)
                (cons 'err (cons GRPC-OUT-OF-RANGE ETCD-ERR-COMPACTED))
-               (let* ((limit (galist 'limit rr 0))
+               (let* ((limit (list-ref rl 2))
                       ; etcd `more` = a limit was applied AND more keys exist past it.
-                      (more  (and (> limit 0) (> total (length tuples))))
-                      (resp  (list (cons 'header (make-header cluster-id member-id cur-rev term))
-                                   (cons 'kvs   (map tuple->keyvalue tuples))
-                                   (cons 'more  more)
-                                   (cons 'count total))))
-                 (cons 'ok (pb-encode RangeResponse-schema resp))))))
+                      (more  (and (> limit 0) (> total (length tuples)))))
+                 (cons 'ok (etcd-pb-encode-range-resp cluster-id member-id cur-rev term
+                                                      tuples more total))))))
         (else (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: not leader")))))))) ; +let +if (authz)
 
   ; ---- KV/Put ----
   ; prev_kv snapshot (if requested) -> propose ("PUT" key value lease) -> PutResponse.
   ; lease is decimal-ASCII bytes (apply-fn convention).  A put to a dead lease comes
   ; back (cons 'err-lease-not-found id) -> a gRPC error (FailedPrecondition 9, etcd's).
+  ; HOT PATH (cw-b5w.2): native decode/encode, same rationale as handle-range.
+  ; Decoded list is positional: (key value lease prev_kv ignore_value ignore_lease).
   (define (handle-put h bytes)
-    (let* ((pr    (pb-decode PutRequest-schema bytes))
-           (key   (galist 'key pr EMPTY))
-           (value (galist 'value pr EMPTY))
-           (lease (galist 'lease pr 0))
-           (want-prev (galist 'prev_kv pr #f))
+    (let* ((pr    (etcd-pb-decode-put bytes))
+           (key   (list-ref pr 0))
+           (value (list-ref pr 1))
+           (lease (list-ref pr 2))
+           (want-prev (list-ref pr 3))
            (deny  (authz-deny? h key #f 'write)))
       (if deny (cons 'err deny)
       (let* ((prev  (and want-prev (shard-prev key)))
@@ -727,9 +750,10 @@
       (cond
         ((and (pair? ack) (string? (car ack)) (string=? (car ack) "PUT"))
          (let* ((rev  (cdr ack))
-                (resp (append (list (cons 'header (header-at rev)))
-                              (if prev (list (cons 'prev_kv (tuple->keyvalue prev))) '()))))
-           (cons 'ok (pb-encode PutResponse-schema resp))))
+                (term (let ((r (ask-shard (list 'cur-rev (self)))))
+                        (if (and (pair? r) (eq? (car r) 'cur-rev-ok)) (caddr r) 1))))
+           (cons 'ok (etcd-pb-encode-put-resp cluster-id member-id rev term
+                                              (or prev #f)))))
         ((and (pair? ack) (eq? (car ack) 'err-lease-not-found))
          (cons 'err (cons 9 (string-append "etcdserver: requested lease not found"))))
         ((eq? ack 'tryagain)      (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: not leader")))

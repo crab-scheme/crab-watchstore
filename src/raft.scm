@@ -343,6 +343,36 @@
                             (cons p (list 'rv term id (log-len st) (last-log-term st))))
                           (aget st 'peers)))))))
 
+; cw-u4a.42 — leadership transfer (Ongaro thesis §3.10).  A node that receives a
+; 'timeout-now from the current leader campaigns IMMEDIATELY: it skips its
+; election-timeout wait AND PreVote and calls raft-campaign directly.  This is safe
+; because the election itself still follows every normal rule (new term, and on-rv's
+; voted-for / log-up-to-date checks) — the only effect is a faster, directed
+; re-election that the leader cooperatively yields to (so there is no term-inflation
+; risk that PreVote otherwise guards against).  A node already leading, or not a
+; voter, ignores it (raft-campaign self-guards the voter check too).
+(define (on-timeout-now st msg)
+  (if (raft-leader? st) (cons st '()) (raft-campaign st)))
+
+; cw-u4a.42 — leader-side initiation of a leadership transfer.  Emits a 'timeout-now
+; to TARGET iff we lead, TARGET is a voter other than ourselves, and TARGET is fully
+; CAUGHT UP (its match index >= our last log index).  An out-of-date target would
+; campaign but fail the log-up-to-date vote check, so we refuse rather than trigger a
+; doomed, disruptive election (etcd would first replicate to catch it up; here the
+; caller may retry once replication advances).  Pure: returns
+;   (list 'ok (output ...))   — the 'timeout-now to send; OR
+;   (list 'err REASON)        — REASON in {not-leader, self, not-voter, not-caught-up}.
+(define (raft-transfer-leadership st target)
+  (cond
+    ((not (raft-leader? st))      (list 'err 'not-leader))
+    ((eqv? target (aget st 'id))  (list 'err 'self))
+    ((not (is-voter? st target))  (list 'err 'not-voter))
+    ((let ((m (assv target (aget st 'match))))
+       (or (not m) (< (cdr m) (log-len st))))
+     (list 'err 'not-caught-up))
+    (else
+     (list 'ok (list (cons target (list 'timeout-now (aget st 'term))))))))
+
 (define (raft-propose st command)
   (if (not (raft-leader? st))
       (cons st '())
@@ -416,6 +446,7 @@
     ((rvr) (on-rvr st from msg))
     ((ae)  (on-ae st msg))
     ((aer) (on-aer st from msg))
+    ((timeout-now) (on-timeout-now st msg))   ; cw-u4a.42 leadership transfer
     (else  (cons st '()))))
 
 (define (on-rv st msg)

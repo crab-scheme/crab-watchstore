@@ -167,9 +167,13 @@
 ; (adopted on append), overriding this bootstrap set.
 (define shard-voters (if join? existing-members all-names))
 ; --shards N (cw-b5w.4, ADR 0005 B): apply-worker count for parallel PUT
-; materialization. 1 = the original fully-serial apply path; default 4.
+; materialization. DEFAULT 1 (serial): on darwin-arm64 the measured ladder
+; REGRESSED with 4 workers (load=l 2707 -> 1603 w/s) — the per-batch barrier
+; round-trips + the SingleThreaded-RocksDB mutex outweigh the parallelized VM
+; work. The machinery is correct (all suites green at N=4) and stays available
+; for retuning (bigger batches / Linux / multi-DB); see docs/adr/0005 + cw-b5w.5.
 (define apply-shards
-  (let ((n (string->number (arg-after "--shards" "4")))) (if (and n (> n 0)) n 1)))
+  (let ((n (string->number (arg-after "--shards" "1")))) (if (and n (> n 0)) n 1)))
 (spawn-source-dedicated "(include \"src/server/shard-actor.scm\")" 'shard-main
               "0" shard-voters me (string-append dbbase "-shard0") durable apply-shards)
 

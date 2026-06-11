@@ -236,6 +236,12 @@
     ; until ctx-flush! (the single fsync) has returned for its write. Cap the batch
     ; so a non-stop write stream still bounds ack latency/memory.
     (define FLUSH-CAP 256)
+    ; GROUP COMMIT (cw-b5w.3): max client writes proposed per emit!/commit/settle
+    ; round (the mailbox drain in the client-command branch), bounding the extra
+    ; latency the last write in a batch can pick up under a flooded mailbox.
+    (define PROPOSE-BATCH-CAP 64)
+    ; the non-write message the drain stopped on, replayed before the mailbox.
+    (define backlog '())
     ; fsync the batch, then ack every buffered waiter from `base`.
     (define (flush-and-drain! base)
       (ctx-flush! ctx)
@@ -396,8 +402,15 @@
       ; batch (one fsync) and acks all waiters at once; a steady stream keeps
       ; batching until a tick or FLUSH-CAP. Relaxed mode never sets flush-base, so
       ; it always blocks and acks inline.
+      ; `backlog`: the (at most one per batch) NON-write message the group-commit
+      ; drain (cw-b5w.3, client-command branch below) pulled off the mailbox while
+      ; collecting a write batch. Consumed BEFORE the mailbox so its order w.r.t.
+      ; later messages is preserved.
       (let loop ((st stI) (leader ldr0) (elapsed 0) (flush-base #f))
-        (let ((m (if flush-base (raw-receive 0) (raw-receive))))
+        (let ((m (cond ((pair? backlog)
+                        (let ((b (car backlog))) (set! backlog (cdr backlog)) b))
+                       (flush-base (raw-receive 0))
+                       (else (raw-receive)))))
           (cond
             ;; mailbox empty while acks are pending -> flush the batch + ack now
             ((eq? m '*timeout*)
@@ -1036,18 +1049,39 @@
             ;; ---- local client command: (conn-pid . cmd) ----
             ;; EVERY client proposal is a write routed through Raft in this Phase-0
             ;; stub (no Redis write/read classification).
+            ;;
+            ;; GROUP COMMIT (cw-b5w.3): after this write, greedily DRAIN any further
+            ;; client writes already queued in the mailbox (non-blocking) and propose
+            ;; them too, then do ONE emit!/commit/settle round for the whole batch.
+            ;; Safe without touching raft.scm: broadcast-append sends each peer its
+            ;; full uncommitted tail from next[p], so the LAST propose's AEs carry
+            ;; every batched entry.  Leadership cannot change mid-drain (no RPC is
+            ;; processed inside the drain).  The drain stops at the first NON-write
+            ;; message, which is stashed in `backlog` and processed next iteration
+            ;; (before the mailbox), preserving its order w.r.t. later messages.
+            ;; PROPOSE-BATCH-CAP bounds added latency under a flooded mailbox.
             (else
              (let* ((conn (car m)) (cmd (cdr m)))
                (cond
                  ((not (raft-leader? st))
                   (send conn 'tryagain) (loop st leader elapsed flush-base))
                  (else
-                  (let ((old (raft-applied st)) (idx (+ 1 (log-len st))))
-                    (hashtable-set! pending idx conn)
-                    (let* ((r (raft-propose st cmd)) (st1 (car r)))
-                      (emit! (cdr r))                 ; AE to followers (cluster) / none (solo)
-                      (let ((st2 (maybe-commit st1)))  ; solo commits now; cluster waits for AERs
-                        (if (> (raft-applied st2) old) (persist-applied! st2))
-                        ; this branch only runs on the leader -> #t
-                        (let ((nb (settle! #t old flush-base)))  ; defer ack (durable) or ack now
-                          (loop (maybe-compact st2 nb) node-name elapsed nb)))))))))))))))
+                  (let ((old (raft-applied st)))
+                    (let drain ((stx st) (conn conn) (cmd cmd) (n 1))
+                      (hashtable-set! pending (+ 1 (log-len stx)) conn)
+                      (let* ((r (raft-propose stx cmd)) (st1 (car r)) (outs1 (cdr r))
+                             (nxt (if (< n PROPOSE-BATCH-CAP) (raw-receive 0) '*timeout*)))
+                        (cond
+                          ;; another queued client write -> append it to the batch
+                          ((and (pair? nxt) (not (symbol? (car nxt))))
+                           (drain st1 (car nxt) (cdr nxt) (+ n 1)))
+                          ;; mailbox empty / cap hit / non-write -> close the batch
+                          (else
+                           (if (not (eq? nxt '*timeout*))
+                               (set! backlog (append backlog (list nxt))))
+                           (emit! outs1)              ; ONE AE round for the whole batch
+                           (let ((st2 (maybe-commit st1))) ; solo commits now; cluster waits for AERs
+                             (if (> (raft-applied st2) old) (persist-applied! st2))
+                             ; this branch only runs on the leader -> #t
+                             (let ((nb (settle! #t old flush-base)))  ; defer ack (durable) or ack now
+                               (loop (maybe-compact st2 nb) node-name elapsed nb))))))))))))))))))

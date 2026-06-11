@@ -45,6 +45,7 @@
 
 (define WG-EMPTY (make-bytevector 0 0))
 (define WG-OK 0)
+(define WG-INTERNAL 13)
 (define WG-UNAVAILABLE 14)
 
 (define (wg-galist key alist default)
@@ -240,23 +241,40 @@
           (wg-make-header cluster-id member-id (cadr r) (caddr r))
           (wg-make-header cluster-id member-id 0 1))))
 
+  ; Process one keepalive request.  Returns #t to keep the stream open, #f after it
+  ; has CLOSED the stream (the caller must then stop the receive loop).
   (define (handle-keepalive bytes)
     (let* ((req (pb-decode LeaseKeepAliveRequest-schema bytes))
            (id  (wg-galist 'id req 0))
-           (r   (ask-shard (list 'lease-keepalive (self) id)))
-           ; (keepalive-ok id ttl) | (lease-not-leader . L); ttl=0 => lease gone
-           (ttl (if (and (pair? r) (eq? (car r) 'keepalive-ok)) (caddr r) 0)))
-      (grpc-stream-send! h (pb-encode LeaseKeepAliveResponse-schema
-                                      (list (cons 'header hdr) (cons 'id id) (cons 'ttl ttl))))))
-
-  (handle-keepalive (grpc-request-bytes h))   ; the first LeaseKeepAliveRequest
-  (let loop ()
-    (let ((m (raw-receive)))
+           (r   (ask-shard (list 'lease-keepalive (self) id))))
       (cond
-        ((not (pair? m)) (loop))
-        ((eq? (car m) 'client-msg) (handle-keepalive (cadr m)) (loop))
-        ((eq? (car m) 'client-end) (grpc-stream-close! h WG-OK))   ; exit
-        (else (loop))))))
+        ; (keepalive-ok id ttl); ttl=0 => lease gone (etcd's TTL-zero signal).
+        ((and (pair? r) (eq? (car r) 'keepalive-ok))
+         (grpc-stream-send! h (pb-encode LeaseKeepAliveResponse-schema
+                                         (list (cons 'header hdr) (cons 'id id)
+                                               (cons 'ttl (caddr r)))))
+         #t)
+        ; cw-u4a.43: on a FOLLOWER the shard replies (lease-not-leader . L).  REDIRECT
+        ; with UNAVAILABLE not-leader — do NOT stream ttl=0, which etcd reads as "the
+        ; lease expired" and would make the client drop a still-live lease.  Mirrors the
+        ; Watch worker's watch-not-leader close + the KV write path's not-leader status.
+        ((and (pair? r) (eq? (car r) 'lease-not-leader))
+         (grpc-stream-close! h WG-UNAVAILABLE "etcdserver: not leader")
+         #f)
+        ; Contract violation (the shard only ever replies keepalive-ok / lease-not-leader).
+        (else
+         (grpc-stream-close! h WG-INTERNAL "lease-keepalive: unexpected ack")
+         #f))))
+
+  ; first LeaseKeepAliveRequest; if it redirected (closed the stream), do not loop.
+  (if (handle-keepalive (grpc-request-bytes h))
+      (let loop ()
+        (let ((m (raw-receive)))
+          (cond
+            ((not (pair? m)) (loop))
+            ((eq? (car m) 'client-msg) (if (handle-keepalive (cadr m)) (loop)))
+            ((eq? (car m) 'client-end) (grpc-stream-close! h WG-OK))   ; exit
+            (else (loop)))))))
 
 ; ===========================================================================
 ; Snapshot worker — one per /etcdserverpb.Maintenance/Snapshot stream (cw-u4a.32)

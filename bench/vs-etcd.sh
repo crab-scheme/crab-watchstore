@@ -101,7 +101,7 @@ start_etcd(){
 checkperf(){ # endpoint loadlevel
   local ep="$1" load="$2"
   local raw="$WORK/cp-${ep//[:.]/_}-${load}.txt"
-  timeout 80 "$ETCDCTL" --endpoints="$ep" check perf --load="$load" >"$raw" 2>&1
+  timeout 180 "$ETCDCTL" --endpoints="$ep" check perf --load="$load" >"$raw" 2>&1
   local rc=$?
   local clean="$raw.clean"
   tr '\r' '\n' <"$raw" >"$clean"
@@ -115,7 +115,10 @@ checkperf(){ # endpoint loadlevel
   t="$(sed -n 's/.*Throughput is \([0-9]*\) writes\/s.*/\1/p' "$clean" | tail -1)"
   s="$(sed -n 's/.*Slowest request took \([0-9.]*\)s.*/\1/p' "$clean" | tail -1)"
   d="$(sed -n 's/.*Stddev is \([0-9.]*\)s.*/\1/p' "$clean" | tail -1)"
-  [ "$rc" = 124 ] && v="TIMEOUT"
+  # rc=124 only means TIMEOUT if the verdict never printed: check perf prints its
+  # PASS/FAIL summary BEFORE the (slow on cws) 60k-key cleanup DeleteRange, so a
+  # kill during cleanup must not poison an already-delivered verdict.
+  [ "$rc" = 124 ] && [ -z "$v" ] && v="TIMEOUT"
   printf '%s|%s|%s|%s' "${v:-INCOMPLETE}" "${t:-?}" "${s:-?}" "${d:-?}"
 }
 load_target(){ case "$1" in s) echo 150;; m) echo 1000;; l) echo 8000;; xl) echo 15000;; *) echo '?';; esac; }

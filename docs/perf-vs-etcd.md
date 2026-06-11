@@ -44,10 +44,14 @@ both servers, so the per-op delta is the server's own work. Mean of 20 runs, mil
 
 | op | etcd (ms) | crab-watchstore (ms) | |
 |---|---|---|---|
-| put   | 10.4 | 6.7 | crab-watchstore **faster** |
-| get   | 6.0  | 7.1 | etcd faster by ~1 ms |
-| range (prefix, 10 keys) | 6.2 | 7.5 | etcd faster by ~1.3 ms |
-| txn (1 put) | 11.0 | 7.4 | crab-watchstore **faster** |
+| put   | 12.2 | 7.6 | crab-watchstore **faster** |
+| get   | 7.8  | 7.6 | parity |
+| range (prefix, 10 keys) | 7.1 | 8.2 | etcd faster by ~1 ms |
+| txn (1 put) | 11.8 | 8.7 | crab-watchstore **faster** |
+
+_(2026-06-11 re-run after the cw-b5w perf epic; the original cw-u4a.36 numbers were put
+10.4/6.7, get 6.0/7.1, range 6.2/7.5, txn 11.0/7.4 — same shape, `get` moved to parity
+after the .38 O(log n) point-read seek + the native codec.)_
 
 **crab-watchstore is competitive on single-op latency — and faster on writes.** At one
 operation at a time the cold-dial cost dominates, so the interpreted server's per-op overhead
@@ -64,15 +68,32 @@ sustained it at acceptable tail latency. So a PASS means *"sustained the target 
 
 | load (target writes/s, clients) | etcd | crab-watchstore |
 |---|---|---|
-| `s` (~150 w/s, 50 clients)  | **PASS** · 151 w/s · slowest 0.024 s  | **PASS** · 151 w/s · slowest 0.013 s |
-| `m` (~1000 w/s, 200 clients) | **PASS** · 1000 w/s · slowest 0.177 s | **did not sustain** (timed out at 80 s) |
-| `l` (~8000 w/s, 500 clients) | **PASS** · 7971 w/s · slowest 0.104 s | _skipped (did not sustain `m`)_ |
+| `s` (~150 w/s, 50 clients)  | **PASS** · 150 w/s  | **PASS** · 151 w/s |
+| `m` (~1000 w/s, 200 clients) | **PASS** · 1000 w/s · slowest 0.063 s | **PASS** · 1000 w/s |
+| `l` (~8000 w/s, 500 clients) | **PASS** · 7935 w/s · slowest 0.075 s | **FAIL** — sustains **~2,700 w/s** (slowest 0.245 s) |
 
-**crab-watchstore sustains ~150 writes/s at a tail latency on par with etcd's**
-(13 ms vs 24 ms at `load=s` in this run), but **cannot sustain 1000 writes/s**, where etcd is comfortable
-all the way to ~8000 writes/s. So on **sustained concurrent write throughput** crab-watchstore
-trails by roughly **one order of magnitude** (single-node ceiling between 150 and 1000 w/s vs
-etcd's ~8000+), while its **tail latency at a load it can sustain is on par with etcd's**.
+**2026-06-11, after the cw-b5w perf epic** (the original cw-u4a.36 run did not sustain
+`load=m`; see history below). crab-watchstore now **PASSes `load=m`** — measured solo it
+holds 1000 w/s with a **37 ms** worst case (etcd's same-day solo tail: ~40–63 ms) — and at
+`load=l` pressure it sustains **~2,700 w/s** against the 8,000 target (`bench/ladder-cws.sh`,
+three runs 1.9k–2.7k). The sustained-write gap to etcd is now **~3×**, down from ~8×+
+pre-epic. Tail-latency numbers in the combined back-to-back run above are noisier than the
+solo measurements (both servers + population phases share the box); the solo ladder + the
+profiling doc (`docs/perf-profile-load-m.md`) carry the clean per-level tails.
+
+What moved it (the cw-b5w epic):
+1. **cw-u4a.38** — O(log n) RocksDB point reads (`store-seek`): `load=m` went from
+   not-sustaining to PASS before this epic even started measuring.
+2. **cw-b5w.2** — native etcdserverpb codec builtins for Put/Range (the interpreted
+   per-byte proto codec was the #1 on-CPU cost): `load=l` pressure 1.9k w/s.
+3. **cw-b5w.3** — group commit (one AE/commit/settle round per mailbox batch of up to 64
+   proposals): 2.7k w/s and the `load=m` tail collapsed 124 ms → 37 ms.
+4. **cw-b5w.4** — parallel apply workers (ADR 0005 B) shipped + proven correct, but
+   **regressed** `load=l` on darwin-arm64 (2.7k → 1.6k: barrier round-trips + the
+   SingleThreaded-RocksDB mutex), so the default stays `--shards 1`; retune issue open.
+
+Historical (cw-u4a.36, pre-epic): `s` PASS (slowest 13 ms vs etcd 24 ms), `m` did not
+sustain, `l` skipped — i.e. a single-node ceiling between 150 and 1000 w/s.
 
 ## Interpretation
 
@@ -80,21 +101,24 @@ etcd's ~8000+), while its **tail latency at a load it can sustain is on par with
   round-trip; the server's per-op CPU (proto decode → Raft append → MVCC put → proto encode,
   all in interpreted Scheme on the VM tier) is small next to it. crab-watchstore's
   pure-in-memory single-node Raft append even edges etcd's bbolt write path on `put`/`txn`.
-- **Why throughput trails:** under 200+ concurrent clients the per-request interpreter cost
-  stops hiding behind the network. Every request runs Scheme on the cooperative green-actor
-  runtime (one shard actor serializes the Raft group), so the server saturates at a far lower
-  rate than etcd's compiled, batched, multi-core write pipeline. This is the same lesson
-  crab-cache surfaced (actor bodies on the VM tier, native fast-paths for the hot reply path) —
-  the sustained-throughput lever is a native/batched request path, not the consensus core.
-- **The ceiling is the single shard.** crab-watchstore runs one shard actor per node here;
-  the Raft group is single-writer by design. Throughput scales with shards/nodes (as crab-cache
-  showed), which this single-node, single-shard probe does not exercise.
+- **Why throughput trails (and by how much now):** under 200+ concurrent clients the
+  per-request interpreter cost stops hiding behind the network. The cw-b5w epic removed the
+  two biggest serial costs — the interpreted protobuf codec (native builtins, cw-b5w.2) and
+  the per-proposal Raft round (group commit, cw-b5w.3) — taking the gap from ~8×+ to ~3×.
+  What remains is the single shard actor's per-write VM execution (Raft state alist rebuilds,
+  MVCC bookkeeping) — see `docs/perf-profile-load-m.md` for the ranked profile.
+- **The ceiling is still the single sequencer.** Parallel apply workers (cw-b5w.4 /
+  ADR 0005 option B) are implemented and correctness-proven but currently net-negative on
+  darwin-arm64 (the process-global SingleThreaded RocksDB mutex re-serializes worker writes);
+  they stay behind `--shards` pending a retune. True multi-Raft was rejected for v1 — it
+  breaks etcd's single-revision-domain semantics (ADR 0005 §A/§C).
 
 ## What this does and does not claim
 
 - **Does:** the official etcd client and load generator run unmodified against crab-watchstore;
-  single-op latency is on par with etcd (writes faster); sustained single-node write throughput
-  is ~1 order of magnitude below etcd at a comparable tail latency.
+  single-op latency is on par with etcd (writes faster, reads at parity); crab-watchstore
+  sustains etcd's own `load=m` health bar (1000 w/s) with a better solo tail, and trails
+  etcd ~3× at `load=l` (2.7k vs 7.9k w/s).
 - **Does not:** claim durable-write parity (not measured on a real fsync barrier — Linux TODO),
   multi-shard/multi-node scaling, large-value or read-heavy mixes, or max-throughput via a
   persistent-connection benchmark (check perf is rate-limited; a saturating gRPC bench is future

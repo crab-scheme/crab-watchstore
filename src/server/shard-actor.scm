@@ -939,6 +939,28 @@
              (send (cadr m) (list 'member-list (aget st 'voters) (aget st 'learners)))
              (loop st leader elapsed flush-base))
 
+            ;; ---- MoveLeader: leadership transfer (cw-u4a.42, etcd Maintenance/MoveLeader) ----
+            ;;   (move-leader REPLY-PID TARGET-NAME)  transfer leadership to TARGET-NAME (symbol)
+            ;; Leader-gated.  raft-transfer-leadership refuses (self/not-voter/not-caught-up)
+            ;; WITHOUT sending; on 'ok we emit! the 'timeout-now and TARGET campaigns + wins,
+            ;; deposing us through the normal higher-term election machinery (no special
+            ;; stepdown here).  Replies: 'move-leader-ok | (move-leader-not-leader . LEADER) |
+            ;; (move-leader-err . REASON).
+            ((eq? (car m) 'move-leader)
+             (let ((reply-pid (cadr m)) (target (caddr m)))
+               (if (not (raft-leader? st))
+                   (begin (send reply-pid (cons 'move-leader-not-leader leader))
+                          (loop st leader elapsed flush-base))
+                   (let ((r (raft-transfer-leadership st target)))
+                     (cond
+                       ((eq? (car r) 'ok)
+                        (emit! (cadr r))                 ; 'timeout-now -> TARGET
+                        (send reply-pid 'move-leader-ok)
+                        (loop st leader elapsed flush-base))
+                       (else
+                        (send reply-pid (cons 'move-leader-err (cadr r)))
+                        (loop st leader elapsed flush-base)))))))
+
             ;; ---- Maintenance read/flush seams (cw-u4a.32) ----
             ;; Status / Hash / HashKV / Snapshot are READS; Defragment is an advisory flush.
             ;; ALL un-gated (NOT leader-gated), exactly like member-list: etcdctl `endpoint

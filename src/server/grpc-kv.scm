@@ -1330,24 +1330,33 @@
                            (list (cons 'header (shard-header))
                                  (cons 'alarms (alarm-active-members)))))))
 
-  ; ---- Maintenance/MoveLeader ----  the Raft engine has NO leadership-transfer / TimeoutNow
-  ; primitive.  targetID == the current leader => trivial no-op success; any other target =>
-  ; UNIMPLEMENTED with a clear message.  We do NOT fake it with a blind stepdown (that cannot
-  ; TARGET a specific member, so it would be dishonest); real engine leadership transfer is a
-  ; filed follow-up bead.
+  ; ---- Maintenance/MoveLeader ----  real leadership transfer (cw-u4a.42) via the raft.scm
+  ; TimeoutNow primitive.  Resolve targetID -> node-name, then ask THIS node's shard to
+  ; transfer: the leader sends 'timeout-now to the (caught-up) target, which campaigns + wins.
+  ; Must be invoked on the leader (a follower returns UNAVAILABLE not-leader so the client
+  ; retargets).  targetID == the current leader is a trivial no-op success; a non-voter or a
+  ; not-caught-up target is FailedPrecondition "bad leader transferee" (etcd's error).
   (define (handle-move-leader bytes)
     (let* ((req    (pb-decode MoveLeaderRequest-schema bytes))
            (target (galist 'targetID req 0))
-           (st     (shard-status))
-           (ldr    (and (pair? st) (eq? (car st) 'status-ok) (list-ref st 6)))
-           (leader-id (if ldr (member-name->id (symbol->string ldr)) 0)))
-      (if (and (> leader-id 0) (= target leader-id))
-          (cons 'ok (pb-encode MoveLeaderResponse-schema
-                               (list (cons 'header (shard-header)))))
-          (cons 'err (cons GRPC-UNIMPLEMENTED
-            (string-append "leadership transfer not supported: the Raft engine has no "
-                           "TimeoutNow; remove the leader via MemberRemove to force "
-                           "re-election"))))))
+           (tname  (resolve-id->name target)))
+      (if (not tname)
+          (cons 'err (cons 9 "etcdserver: bad leader transferee"))   ; unknown member ID
+          (let ((ack (ask-shard (list 'move-leader (self) tname))))
+            (cond
+              ((eq? ack 'move-leader-ok)
+               (cons 'ok (pb-encode MoveLeaderResponse-schema
+                                    (list (cons 'header (shard-header))))))
+              ; target IS the current leader -> already there (etcd treats this as success).
+              ((and (pair? ack) (eq? (car ack) 'move-leader-err) (eq? (cdr ack) 'self))
+               (cons 'ok (pb-encode MoveLeaderResponse-schema
+                                    (list (cons 'header (shard-header))))))
+              ((and (pair? ack) (eq? (car ack) 'move-leader-not-leader))
+               (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: not leader")))
+              ; not-voter / not-caught-up -> FailedPrecondition, etcd's "bad leader transferee".
+              ((and (pair? ack) (eq? (car ack) 'move-leader-err))
+               (cons 'err (cons 9 "etcdserver: bad leader transferee")))
+              (else (cons 'err (cons GRPC-INTERNAL "move-leader: unexpected ack"))))))))
 
   ; ===========================================================================
   ; grpc.health.v1.Health/Check (cw-u4a.33) — standard gRPC health protocol (UNARY)

@@ -1,0 +1,47 @@
+# deploy/docker/docker-compose.yml — a 3-node crab-watchstore cluster (cw-24e.2).
+#
+#   bash jepsen/bin/stage-docker.sh                       # refresh the Linux binary check
+#   docker compose -f deploy/docker/docker-compose.yml up -d --build
+#   etcdctl --endpoints=127.0.0.1:24791,127.0.0.1:24792,127.0.0.1:24793 endpoint status
+#
+# Each member: etcd v3 gRPC on container :2379 (host 2379x), Raft :7001,
+# health/metrics HTTP :12379 wired to the compose healthcheck (etcd-faithful
+# /health JSON; healthy iff the member sees a leader). durable=yes — Linux
+# fsync is a real barrier here, unlike the macOS dev runs.
+name: crab-watchstore
+
+networks:
+  cws:
+    driver: bridge
+    ipam: {config: [{subnet: 172.28.99.0/24}]}
+
+x-member: &member
+  build: {context: ../.., dockerfile: deploy/docker/Dockerfile}
+  image: crab-watchstore:local
+  networks: [cws]
+  restart: unless-stopped
+
+services:
+  cws-a:
+    <<: *member
+    hostname: cws-a
+    networks: {cws: {ipv4_address: 172.28.99.11}}
+    volumes: [./conf/a.conf:/etc/crab-watchstore.conf:ro, cws-a-data:/data]
+    ports: ["24791:2379", "34791:12379"]
+  cws-b:
+    <<: *member
+    hostname: cws-b
+    networks: {cws: {ipv4_address: 172.28.99.12}}
+    volumes: [./conf/b.conf:/etc/crab-watchstore.conf:ro, cws-b-data:/data]
+    ports: ["24792:2379", "34792:12379"]
+  cws-c:
+    <<: *member
+    hostname: cws-c
+    networks: {cws: {ipv4_address: 172.28.99.13}}
+    volumes: [./conf/c.conf:/etc/crab-watchstore.conf:ro, cws-c-data:/data]
+    ports: ["24793:2379", "34793:12379"]
+
+volumes:
+  cws-a-data: {}
+  cws-b-data: {}
+  cws-c-data: {}

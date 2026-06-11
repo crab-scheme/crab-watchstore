@@ -228,7 +228,19 @@
 (define member-id  (stable-id (symbol->string me)))
 (define client-host (node-field me 1))
 (define client-port (node-field me 3))
-(define client-addr (string-append client-host ":" (number->string client-port)))
+; grpc-serve / the metrics listener bind via Rust SocketAddr parse — NUMERIC IPs
+; only.  A --cluster row may carry a HOSTNAME (compose service names, cw-24e.2):
+; peers dial it through DNS fine, but we cannot BIND to it — so a non-numeric
+; host binds 0.0.0.0:<port> (all interfaces) instead.  Numeric specs (every
+; existing test: 127.0.0.1) keep the original exact-address bind.
+(define (numeric-host? s)
+  (let loop ((i 0))
+    (or (= i (string-length s))
+        (let ((c (string-ref s i)))
+          (and (or (char-numeric? c) (char=? c #\.) (char=? c #\:))
+               (loop (+ i 1)))))))
+(define bind-host (if (numeric-host? client-host) client-host "0.0.0.0"))
+(define client-addr (string-append bind-host ":" (number->string client-port)))
 (define shard-pid   (table-lookup 'ws-shard-pid (qk)))
 
 ; ---- endpoint metrics/health/version HTTP port (cw-u4a.33) ----
@@ -280,7 +292,7 @@
 ; the shard / poller / grpc-kv handler.  Reads this node's shard-0 replica via the un-gated .32
 ; status seam; a bind failure is contained inside the actor (the node keeps serving gRPC).
 (spawn-source-dedicated "(include \"src/server/metrics-http.scm\")" 'metrics-http-main
-                        shard-pid (symbol->string me) client-host metrics-port)
+                        shard-pid (symbol->string me) bind-host metrics-port)
 
 ; The consensus substrate + etcd KV API + metrics endpoint are up. Park so the node process
 ; stays alive serving Raft RPCs to peers and gRPC calls to clients.

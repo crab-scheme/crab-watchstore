@@ -1,0 +1,5 @@
+# member "c" of the 3-node compose cluster (cw-24e.2)
+node     c
+db       /data/c
+durable  yes
+cluster  a:cws-a:7001:2379,b:cws-b:7001:2379,c:cws-c:7001:2379

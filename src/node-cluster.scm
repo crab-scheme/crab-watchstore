@@ -23,7 +23,7 @@
 
 (include "src/encoding.scm")
 
-(define (arg-after flag default)
+(define (cli-after flag default)
   (let loop ((a (command-line)))
     (cond ((or (null? a) (null? (cdr a))) default)
           ((string=? (car a) flag) (cadr a))
@@ -34,6 +34,45 @@
     (cond ((= i (string-length s)) (reverse (cons (substring s start i) acc)))
           ((char=? (string-ref s i) ch) (loop (+ i 1) (+ i 1) (cons (substring s start i) acc)))
           (else (loop (+ i 1) start acc)))))
+
+; ---- config file (cw-24e.1) ----
+; `--config FILE` loads defaults for every flag from a plain `key value` file
+; (one option per line; the key is the flag name without the leading "--";
+; blank lines and `#` comments ignored).  CLI flags OVERRIDE config values, so
+; `crab-watchstore --config a.conf --durable yes` works as expected.  Example:
+;     node     a
+;     db       /var/lib/crab-watchstore/a
+;     cluster  a:10.0.0.1:7001:2379,b:10.0.0.2:7001:2379,c:10.0.0.3:7001:2379
+;     durable  yes
+(define config-alist
+  (let ((path (cli-after "--config" #f)))
+    (if (not path) '()
+        (let ((p (open-input-file path)))
+          (let loop ((acc '()))
+            (let ((line (read-line p)))
+              (if (eof-object? line)
+                  (begin (close-port p) (reverse acc))
+                  (let* ((trimmed (string-trim line))
+                         (skip? (or (= 0 (string-length trimmed))
+                                    (char=? (string-ref trimmed 0) #\#)))
+                         (sp (and (not skip?)
+                                  (let find ((i 0))
+                                    (cond ((= i (string-length trimmed)) #f)
+                                          ((or (char=? (string-ref trimmed i) #\space)
+                                               (char=? (string-ref trimmed i) #\tab)) i)
+                                          (else (find (+ i 1))))))))
+                    (if (not sp)
+                        (loop acc)
+                        (loop (cons (cons (substring trimmed 0 sp)
+                                          (string-trim (substring trimmed sp (string-length trimmed))))
+                                    acc)))))))))))
+
+; option lookup: CLI flag wins, then the config file, then the default.
+(define (arg-after flag default)
+  (let ((cli (cli-after flag #f)))
+    (or cli
+        (let ((hit (assoc (substring flag 2 (string-length flag)) config-alist)))
+          (if hit (cdr hit) default)))))
 
 (define me      (string->symbol (arg-after "--node" "a")))
 (define dbbase  (arg-after "--db" "/tmp/cws-node"))

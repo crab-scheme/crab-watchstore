@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# bin/crab-watchstore — the supported entrypoint for one crab-watchstore member
+# (cw-24e.1). Thin wrapper: resolves the crabscheme binary + repo root and execs
+# the node with every argument passed through. Typical use:
+#
+#   crab-watchstore --config /etc/crab-watchstore/a.conf
+#   crab-watchstore --node a --db /tmp/cws-a --cluster a:127.0.0.1:7001:2379
+#
+# Env: CRABSCHEME=/path/to/crabscheme overrides binary discovery (a build with
+# --features stdlib-store,grpc is required).
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BIN="${CRABSCHEME:-$(command -v crabscheme || true)}"
+[ -z "$BIN" ] && [ -x /Users/ztaylor/repos/workspaces/crabscheme/target/release/crabscheme ] && \
+  BIN=/Users/ztaylor/repos/workspaces/crabscheme/target/release/crabscheme
+[ -n "$BIN" ] && [ -x "$BIN" ] || { echo "crab-watchstore: crabscheme binary not found (set \$CRABSCHEME)"; exit 1; }
+exec "$BIN" run "$ROOT/src/node-cluster.scm" -- "$@"

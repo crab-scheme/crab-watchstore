@@ -1008,11 +1008,17 @@
                (mvcc-set-current-rev! ctx main)
                (cons "PUT" main)))))
       ((string=? op "DEL")
+       ; cw-u4a.40 / ADR-0001 §2: a DeleteRange removing ZERO live keys has no
+       ; keyspace effect, so it must NOT advance current-rev (etcd parity) — exactly
+       ; like a zero-key LEASE-REVOKE above.  Bump (and report) main iff ≥1 key was
+       ; deleted; otherwise the revision is unchanged and the ack carries prev-rev.
        (let* ((K        (list-ref cmd 1))
               (rangeEnd (if (>= (length cmd) 3) (list-ref cmd 2) #f))
               (deleted  (mvcc-delete-range! ctx K rangeEnd main 0)))
-         (mvcc-set-current-rev! ctx main)
-         (cons "DEL" (cons main deleted))))
+         (if (> deleted 0)
+             (begin (mvcc-set-current-rev! ctx main)
+                    (cons "DEL" (cons main deleted)))
+             (cons "DEL" (cons prev-rev 0)))))   ; no effect => no bump
       ((string=? op "COMPACT")
        ; COMPACT does NOT bump current-rev — call mvcc-compact directly.
        ; The rev argument is a decimal-ASCII bytevector (same convention as leaseId).

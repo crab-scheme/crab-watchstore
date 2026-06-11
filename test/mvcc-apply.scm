@@ -192,4 +192,22 @@
 (section "auth mutations NEVER bumped the keyspace current-rev (still 9)")
 (check "current-rev still 9 after all auth ops" 9 (mvcc-current-rev CTX))
 
+; ===========================================================================
+(section "zero-effect DEL does NOT bump the revision (cw-u4a.40, etcd parity)")
+; A DeleteRange that removes no LIVE key has no keyspace effect, so current-rev
+; must NOT advance — etcd returns the unchanged store revision in the response
+; header with deleted=0.  current-rev is 9 here; every no-op DEL leaves it at 9,
+; then a real DEL still bumps to 10 — proving the no-ops consumed no revision.
+(check "current-rev = 9 before zero-effect dels" 9 (mvcc-current-rev CTX))
+(check "DEL a never-existed key -> rev unchanged (9), 0 deleted"
+       (cons "DEL" (cons 9 0)) (del "DEL" "no-such-key"))
+(check "DEL an already-deleted key (a) -> rev unchanged (9), 0 deleted"
+       (cons "DEL" (cons 9 0)) (del "DEL" "a"))
+(check "DEL an empty range [xx,xz) -> rev unchanged (9), 0 deleted"
+       (cons "DEL" (cons 9 0)) (del "DEL" "xx" "xz"))
+(check "current-rev STILL 9 after three zero-effect dels" 9 (mvcc-current-rev CTX))
+(check "DEL c (live since rev 7) -> rev 10, 1 deleted"
+       (cons "DEL" (cons 10 1)) (del "DEL" "c"))
+(check "current-rev = 10 after the real del (no number skipped)" 10 (mvcc-current-rev CTX))
+
 (done!)

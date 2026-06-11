@@ -115,3 +115,12 @@
       (if (store-iter-next it)
           (loop (+ n 1))
           (begin (store-iter-close it) n)))))
+
+; ---- point seek (cw-u4a.38) ----
+;
+; One RocksDB Seek to the first key >= `seekkey` that still starts with `prefix`
+; (the bounding group); returns that single (fullkey . value) | #f.  O(log n) — it
+; does NOT materialise the whole prefix range like kv-scan, so it is the right
+; primitive for a "latest version <= readRev" MVCC point read.
+(define (kv-seek ctx seekkey prefix)
+  (store-seek (shard-ctx-handle ctx) (shard-ctx-cf ctx) seekkey prefix))

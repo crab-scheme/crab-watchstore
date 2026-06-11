@@ -62,6 +62,10 @@
                  (loop (+ i 1)))))
     c))
 
+; Largest u64 (2^64-1).  Used as the `sub` in a latest-<=-readRev seek key so the
+; seek lands at/before the largest-sub record at a given main (cw-u4a.38).
+(define MAX-U64 (- (expt 2 64) 1))
+
 ; ---------------------------------------------------------------------------
 ; KEY-CF key:  NS-KEY || u64be(lenK) || K || INV(rev16)
 ; ---------------------------------------------------------------------------
@@ -277,17 +281,25 @@
 ; create_rev/version AND the seed for .7 Range / point reads.
 
 (define (mvcc-get-latest ctx K . at)
-  (let ((at-rev (if (pair? at) (car at) #f)))
-    (let loop ((rows (kv-scan ctx (key-cf-prefix K))))
-      (if (null? rows)
-          #f
-          (let ((r (kv-record-decode (cdar rows))))
-            (cond
-              ; skip versions newer than the requested read revision
-              ((and at-rev (> (kv-rec-mod-rev r) at-rev)) (loop (cdr rows)))
-              ; first visible version is a tombstone -> key absent at this rev
-              ((kv-rec-tombstone? r) #f)
-              (else r)))))))
+  ; cw-u4a.38: a single O(log n) RocksDB seek instead of materialising K's whole
+  ; version group with kv-scan and walking it.  KEY-CF sorts a key's versions
+  ; newest-first via INV(rev16), so the latest version with mod_rev <= at-rev is the
+  ; FIRST on-disk key >= prefix || INV(rev16(at-rev, MAX-sub)).  Maxing the sub
+  ; (INV -> 0x00..) makes the target sort at/before the largest-sub record at at-rev,
+  ; so the first hit is exactly that version — or, if none exists at at-rev, the
+  ; next-older one (records with mod_rev > at-rev sort BEFORE the target and are
+  ; skipped by the seek).  A current read (no at-rev) seeks to the prefix itself =
+  ; the newest version.  A tombstone as the first visible version => key absent.
+  (let* ((at-rev  (if (pair? at) (car at) #f))
+         (prefix  (key-cf-prefix K))
+         (seekkey (if at-rev
+                      (bytevector-append prefix (inv16 (rev->16 at-rev MAX-U64)))
+                      prefix))
+         (hit     (kv-seek ctx seekkey prefix)))
+    (if (not hit)
+        #f
+        (let ((r (kv-record-decode (cdr hit))))
+          (if (kv-rec-tombstone? r) #f r)))))
 
 ; ---------------------------------------------------------------------------
 ; mvcc-put!  (ADR §3/§4/§5/§8)

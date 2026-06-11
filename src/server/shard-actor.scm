@@ -1008,6 +1008,13 @@
                (ctx-flush! ctx)
                (send conn (list 'defrag-ok)))
              (loop st leader elapsed flush-base))
+            ;; Alarm list (cw-u4a.42): un-gated read of the REPLICATED NS-ALARM set, so any
+            ;; member answers and `etcdctl alarm list` agrees cluster-wide. ACTIVATE/DEACTIVATE
+            ;; are ALARM-SET/ALARM-DISARM Raft writes (the normal commit->apply path), not here.
+            ;;   (alarm-list reply-pid) -> (alarm-list-ok ((memberID . alarmType) ...))
+            ((eq? (car m) 'alarm-list)
+             (send (cadr m) (list 'alarm-list-ok (mvcc-alarm-list ctx)))
+             (loop st leader elapsed flush-base))
 
             ;; ---- linearizable read probe: (read CONN) ----
             ;; Solo serves inline (a round would never complete); multi-voter

@@ -12,7 +12,7 @@
 #   defrag (one endpoint)             -> Finished defragmenting (advisory RocksDB flush)      [Defragment]
 #   snapshot save <file>              -> the server-stream downloads to a non-empty file      [Snapshot]
 #                                        (bbolt restore/status is NOT supported — see note)
-#   move-leader <non-leader-id>       -> Unimplemented (the engine has no TimeoutNow)         [MoveLeader]
+#   move-leader <caught-up follower>  -> leadership transferred (real TimeoutNow, cw-u4a.42)   [MoveLeader]
 #
 # QUORUM REASONING: a/b/c are all live for the whole run (never killed); every write commits
 # on the 3-voter quorum.  Maintenance reads (status/hashkv/snapshot) are endpoint-LOCAL and
@@ -216,7 +216,7 @@ fi
 
 # ---------------------------------------------------------------------------
 echo
-echo "== Maintenance/MoveLeader: transfer to a NON-leader id is Unimplemented =="
+echo "== Maintenance/MoveLeader: transfer to a caught-up follower succeeds (cw-u4a.42) =="
 find_leader
 LEADER_NAME="$(name_of_ep "$LEADER_EP")"
 # pick a follower name (a/b/c that is not the leader) and its hex member id.
@@ -225,10 +225,15 @@ FOLLOWER_HEX="$(id_of "$LEADER_EP" "$FOLLOWER_NAME")"
 echo "  leader=$LEADER_NAME  target follower=$FOLLOWER_NAME (id=$FOLLOWER_HEX)"
 ml="$(ectl1 "$LEADER_EP" move-leader "$FOLLOWER_HEX")"
 echo "  move-leader $FOLLOWER_HEX -> $ml"
-if echo "$ml" | grep -qiE "Unimplemented|not supported|TimeoutNow"; then
-  ok "move-leader to a non-leader returns Unimplemented (no engine TimeoutNow)"
+# real leadership transfer via the raft TimeoutNow primitive — must NOT be the old
+# "Unimplemented", and a caught-up voter transfer reports success (thorough coverage is
+# in the dedicated test/etcd-moveleader-grpc.sh).
+if echo "$ml" | grep -qiF "Leadership transferred"; then
+  ok "move-leader transfers leadership to a caught-up follower"
+elif echo "$ml" | grep -qiE "Unimplemented|not supported|no .*TimeoutNow"; then
+  bad "move-leader should be implemented now (cw-u4a.42)" "got: $ml"
 else
-  bad "move-leader to a non-leader returns Unimplemented" "got: $ml"
+  bad "move-leader did not report a leadership transfer" "got: $ml"
 fi
 
 # ---------------------------------------------------------------------------

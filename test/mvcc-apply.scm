@@ -210,4 +210,25 @@
        (cons "DEL" (cons 10 1)) (del "DEL" "c"))
 (check "current-rev = 10 after the real del (no number skipped)" 10 (mvcc-current-rev CTX))
 
+; ===========================================================================
+(section "alarms (cw-u4a.42): ALARM-SET / list / ALARM-DISARM, NS-ALARM, no rev bump")
+; ALARM-SET/DISARM apply on every replica via the committed Raft command (the same path
+; PUT/AUTH use — proven to replicate by membership-load.scm); here we test the apply +
+; NS-ALARM storage + the list, and that alarms NEVER bump the keyspace current-rev (10).
+; Args are decimal-ASCII bytevectors (the leaseId convention); atypes: NOSPACE=1 CORRUPT=2.
+(check "no alarms initially" '() (mvcc-alarm-list CTX))
+(check "ALARM-SET 4242/NOSPACE -> (ALARM-OK . #t)" (cons "ALARM-OK" #t)
+       (mvcc-apply CTX (list (b "ALARM-SET") (b "4242") (b "1"))))
+(check "the alarm is now listed" (list (cons 4242 1)) (mvcc-alarm-list CTX))
+(check "current-rev STILL 10 (an alarm is not a keyspace revision)" 10 (mvcc-current-rev CTX))
+(mvcc-apply CTX (list (b "ALARM-SET") (b "4242") (b "2")))   ; + CORRUPT
+(mvcc-apply CTX (list (b "ALARM-SET") (b "4242") (b "1")))   ; re-SET NOSPACE (idempotent, set semantics)
+(check "two distinct alarms for the member" 2 (length (mvcc-alarm-list CTX)))
+(check "ALARM-DISARM 4242/NOSPACE -> (ALARM-OK . #f)" (cons "ALARM-OK" #f)
+       (mvcc-apply CTX (list (b "ALARM-DISARM") (b "4242") (b "1"))))
+(check "only CORRUPT remains" (list (cons 4242 2)) (mvcc-alarm-list CTX))
+(mvcc-apply CTX (list (b "ALARM-DISARM") (b "4242") (b "2")))
+(check "list empty after disarming all" '() (mvcc-alarm-list CTX))
+(check "current-rev STILL 10 after every alarm op" 10 (mvcc-current-rev CTX))
+
 (done!)

@@ -39,6 +39,8 @@
 (define NS-KEY   #x01)   ; key-ordered store:    K || INV(rev) -> KeyValue record
 (define NS-REV   #x02)   ; revision-ordered idx: rev           -> event record
 (define NS-LEASE #x03)   ; lease -> keys index:  leaseId || K  -> ()
+; NS-AUTH = 0x04 (src/auth.scm)
+(define NS-ALARM #x05)   ; alarm set (cw-u4a.42): u64be(memberID) || atype -> ()
 
 (define (mvcc-byte b)
   (let ((v (make-bytevector 1 0))) (bytevector-u8-set! v 0 b) v))
@@ -162,6 +164,30 @@
         (let ((fk (caar rows)))
           (if (= (bytevector-length fk) 9)               ; 0x03 || u64be(id), K empty
               (loop (cdr rows) (cons (bytes->u64 fk 1) out))
+              (loop (cdr rows) out))))))
+
+; ---------------------------------------------------------------------------
+; Alarms (cw-u4a.42) — NOSPACE/CORRUPT, Raft-REPLICATED so every member agrees and
+; they survive restart (etcd-faithful; replaces the old leader-local in-memory set).
+; KEY: NS-ALARM || u64be(memberID) || atype-byte.  VALUE: empty (presence = active).
+; ALARM-SET / ALARM-DISARM apply identically on every replica via the committed Raft
+; command and write ONLY this namespace — they do NOT bump current-rev (an alarm is
+; not a keyspace revision), exactly like the AUTH / LEASE-GRANT meta writes.
+; ---------------------------------------------------------------------------
+(define (alarm-key mid atype)
+  (bytevector-append (mvcc-byte NS-ALARM) (u64->bytes mid) (mvcc-byte atype)))
+(define (mvcc-alarm-set! ctx mid atype)
+  (kv-put! ctx (alarm-key mid atype) (make-bytevector 0 0)))
+(define (mvcc-alarm-disarm! ctx mid atype)
+  (kv-del! ctx (alarm-key mid atype)))
+; all active alarms as a list of (memberID . alarmType), scanning NS-ALARM.
+(define (mvcc-alarm-list ctx)
+  (let loop ((rows (kv-scan ctx (mvcc-byte NS-ALARM))) (out '()))
+    (if (null? rows)
+        (reverse out)
+        (let ((k (caar rows)))      ; NS-ALARM(1) || u64be(mid)(8) || atype(1) = 10 bytes
+          (if (= (bytevector-length k) 10)
+              (loop (cdr rows) (cons (cons (bytes->u64 k 1) (bytevector-u8-ref k 9)) out))
               (loop (cdr rows) out))))))
 
 ; ---------------------------------------------------------------------------
@@ -1164,6 +1190,18 @@
                (cons 'err-role-not-found role)
                (begin (auth-put-role! ctx role (auth-perms-drop-range perms key rend))
                       (cons "AUTH-OK" (auth-bump-rev! ctx)))))))
+
+      ;; ===== Alarms (cw-u4a.42) — Raft-replicated NOSPACE/CORRUPT =====
+      ;; ("ALARM-SET" memberID alarmType) / ("ALARM-DISARM" memberID alarmType): args are
+      ;; decimal-ASCII bytevectors (the leaseId convention).  Writes NS-ALARM on EVERY
+      ;; replica via the committed command; NO current-rev bump (alarms aren't keyspace
+      ;; revisions).  Ack ("ALARM-OK" . active?) — usable as the client ack.
+      ((string=? op "ALARM-SET")
+       (mvcc-alarm-set! ctx (bytes->int (list-ref cmd 1)) (bytes->int (list-ref cmd 2)))
+       (cons "ALARM-OK" #t))
+      ((string=? op "ALARM-DISARM")
+       (mvcc-alarm-disarm! ctx (bytes->int (list-ref cmd 1)) (bytes->int (list-ref cmd 2)))
+       (cons "ALARM-OK" #f))
 
       (else
        (error "mvcc-apply: unknown command" op)))))

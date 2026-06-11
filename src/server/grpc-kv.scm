@@ -1245,16 +1245,11 @@
   ; ask the shard's .32 status seam -> (status-ok rev term commit applied db-size leader)
   (define (shard-status) (ask-shard (list 'status (self))))
 
-  ; leader-local alarm set (etcd REPLICATES alarms via Raft; a faithful replicated version
-  ; is a documented follow-up — this is leader-local, dropped on restart, NOT consensus).
-  ; Keyed "memberID:alarmType" (string) so GET/ACTIVATE/DEACTIVATE are set semantics; the
-  ; value is the AlarmMember alist returned in AlarmResponse.alarms.
-  (define alarm-table (make-hashtable string-hash string=?))
+  ; Alarm action enums (Raft-REPLICATED alarm set: cw-u4a.42).  The active set lives in
+  ; NS-ALARM (mvcc.scm), written by ALARM-SET/ALARM-DISARM through Raft and read via the
+  ; shard's un-gated alarm-list seam — see handle-alarm below.
   (define ALARM-ACTIVATE 1)
   (define ALARM-DEACTIVATE 2)
-  (define (alarm-key mid atype)
-    (string-append (number->string mid) ":" (number->string atype)))
-  (define (alarm-active-members) (vector->list (hashtable-values alarm-table)))
 
   ; ---- Maintenance/Status (UPGRADE of the .22 stub) ----
   ; Real raft scalars (raftIndex=commit, raftAppliedIndex=applied, raftTerm) + a LOGICAL
@@ -1312,9 +1307,27 @@
                                (list (cons 'header (shard-header)))))
           (cons 'err (cons GRPC-INTERNAL "defragment: unexpected ack")))))
 
-  ; ---- Maintenance/Alarm ----  leader-local alarm set.  GET (action 0, or unknown) lists
-  ; active alarms; ACTIVATE adds (alarm type > NONE); DEACTIVATE removes.  Empty by default,
-  ; so `etcdctl alarm list` shows nothing and `etcdctl alarm disarm` succeeds (no-op).
+  ; ---- Maintenance/Alarm ----  Raft-replicated alarm set (cw-u4a.42).  ACTIVATE (alarm >
+  ; NONE) and DEACTIVATE propose ALARM-SET / ALARM-DISARM through Raft (leader-gated) so the
+  ; alarm state is agreed by every member + survives restart; GET (action 0, or unknown)
+  ; reads the replicated set from THIS node (un-gated).  AlarmResponse.alarms is always the
+  ; full active set, read back via the shard's alarm-list seam.
+  (define (alarm-members)            ; replicated NS-ALARM set -> AlarmMember alists
+    (let ((r (ask-shard (list 'alarm-list (self)))))
+      (if (and (pair? r) (eq? (car r) 'alarm-list-ok))
+          (map (lambda (a) (list (cons 'memberID (car a)) (cons 'alarm (cdr a)))) (cadr r))
+          '())))
+  (define (alarm-resp)
+    (cons 'ok (pb-encode AlarmResponse-schema
+                         (list (cons 'header (shard-header))
+                               (cons 'alarms (alarm-members))))))
+  (define (alarm-write cmd)          ; propose ALARM-SET/DISARM; map the ack
+    (let ((ack (shard-write cmd)))
+      (cond
+        ((and (pair? ack) (string? (car ack)) (string=? (car ack) "ALARM-OK")) (alarm-resp))
+        ((eq? ack 'tryagain)      (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: not leader")))
+        ((eq? ack 'indeterminate) (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: leader changed")))
+        (else (cons 'err (cons GRPC-INTERNAL "alarm: unexpected ack"))))))
   (define (handle-alarm bytes)
     (let* ((req    (pb-decode AlarmRequest-schema bytes))
            (action (galist 'action req 0))
@@ -1322,13 +1335,10 @@
            (atype  (galist 'alarm req 0)))
       (cond
         ((and (= action ALARM-ACTIVATE) (> atype 0))
-         (hashtable-set! alarm-table (alarm-key mid atype)
-                         (list (cons 'memberID mid) (cons 'alarm atype))))
+         (alarm-write (list (string->utf8 "ALARM-SET")    (int->bytes mid) (int->bytes atype))))
         ((= action ALARM-DEACTIVATE)
-         (hashtable-delete! alarm-table (alarm-key mid atype))))
-      (cons 'ok (pb-encode AlarmResponse-schema
-                           (list (cons 'header (shard-header))
-                                 (cons 'alarms (alarm-active-members)))))))
+         (alarm-write (list (string->utf8 "ALARM-DISARM") (int->bytes mid) (int->bytes atype))))
+        (else (alarm-resp)))))       ; GET: list the replicated active set
 
   ; ---- Maintenance/MoveLeader ----  real leadership transfer (cw-u4a.42) via the raft.scm
   ; TimeoutNow primitive.  Resolve targetID -> node-name, then ask THIS node's shard to

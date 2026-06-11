@@ -1,6 +1,10 @@
 # ADR 0005 — Multi-shard keyspace: design note (cw-b5w.4)
 
-Status: PROPOSED (awaiting review — cw-b5w.4 requires this note reviewed before code)
+Status: ACCEPTED (option B; user-reviewed 2026-06-11)
+Decisions on the open questions: watch emission stays on the SEQUENCER (workers
+apply storage only); worker count via `--shards N` (default 4) through the
+cw-24e.1 launcher/config; shared column families with worker-agnostic keys
+(no CF-per-worker — revisit only if flush contention shows up).
 Date: 2026-06-11
 
 ## Problem

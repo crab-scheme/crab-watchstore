@@ -26,7 +26,7 @@ done
 sleep 1
 echo "server pid=$SRV up on :$PORT"
 
-"$ETCDCTL" --endpoints="127.0.0.1:${PORT}" check perf --load m >"$OUT/perf.out" 2>&1 &
+"$ETCDCTL" --endpoints="127.0.0.1:${PORT}" check perf --load "${LOAD:-m}" >"$OUT/perf.out" 2>&1 &
 PERF=$!
 sleep 8   # let load ramp
 for i in 1 2 3; do

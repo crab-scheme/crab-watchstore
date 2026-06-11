@@ -166,8 +166,12 @@
 ; A fresh node is a voter in the full set.  Either way the live config arrives by replication
 ; (adopted on append), overriding this bootstrap set.
 (define shard-voters (if join? existing-members all-names))
+; --shards N (cw-b5w.4, ADR 0005 B): apply-worker count for parallel PUT
+; materialization. 1 = the original fully-serial apply path; default 4.
+(define apply-shards
+  (let ((n (string->number (arg-after "--shards" "4")))) (if (and n (> n 0)) n 1)))
 (spawn-source-dedicated "(include \"src/server/shard-actor.scm\")" 'shard-main
-              "0" shard-voters me (string-append dbbase "-shard0") durable)
+              "0" shard-voters me (string-append dbbase "-shard0") durable apply-shards)
 
 (define dial-addrs (map raft-addr dial-peers))
 ; Dedicated thread — the poller is the Raft tick-clock AND sole network drainer;

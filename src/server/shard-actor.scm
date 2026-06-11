@@ -52,9 +52,25 @@
   (let loop ((i 0) (l lst))
     (cond ((null? l) 0) ((eqv? (car l) x) i) (else (loop (+ i 1) (cdr l))))))
 
-(define (shard-main shard-key voters node-name db-path sync?)
-  (let* ((handle  (store-open db-path #t))      ; create-if-missing
+; Optional 6th arg (cw-b5w.4): the apply-worker count. 1 (the default — every
+; existing caller/test) = the original fully-serial apply path, byte-for-byte.
+; >1 = ADR 0005 option B: committed PUTs are revision-stamped here (the
+; sequencer) and materialized in parallel on N key-hash-routed workers, with a
+; per-batch barrier before persist/acks/reads (see flush-materializations!).
+(define (shard-main shard-key voters node-name db-path sync? . rest)
+  (let* ((n-apply-workers (if (and (pair? rest) (number? (car rest)) (> (car rest) 0))
+                              (car rest) 1))
+         (handle  (store-open db-path #t))      ; create-if-missing
          (ctx     (make-ctx handle "default" sync?))
+         (apply-workers
+          (if (< n-apply-workers 2) #f
+              (let spawn-w ((i 0) (acc '()))
+                (if (= i n-apply-workers) (list->vector (reverse acc))
+                    (spawn-w (+ i 1)
+                             (cons (spawn-source-dedicated
+                                    "(include \"src/server/apply-worker.scm\")"
+                                    'apply-worker-main handle "default" sync?)
+                                   acc))))))
          (pending (make-eqv-hashtable))          ; log-index -> conn-pid
          ; ---- dynamic membership (cw-u4a.29) — LEADER-LOCAL, additive. `member-reply-pid`
          ; is the pid of the caller awaiting the in-flight member-add/remove/promote (one at
@@ -111,10 +127,78 @@
     ; watcher is registered this is strictly additive and perturbs nothing — the
     ; sim-cluster / group-commit / apply path behaves exactly as before.  The register/
     ; cancel mailbox protocol, leader-gating, and streaming are .14, NOT here.
+    ; ---- parallel PUT materialization (cw-b5w.4, ADR 0005 option B) ----
+    ; With n-apply-workers > 1, a committed plain PUT is split: the SEQUENCER
+    ; (here) does the order-dependent half — lease guard, revision assignment,
+    ; current-rev bump, the client ack — and queues the heavy half (prev-record
+    ; lookup + record/event encode + RocksDB writes) for a key-hash-routed
+    ; worker.  flush-materializations! dispatches the queues and BARRIERS on
+    ; every worker before anything can observe the batch: persist-applied!
+    ; (crash safety: the applied marker must never outrun the data), any serial
+    ; (non-PUT) apply (DEL/TXN/COMPACT/LEASE/AUTH read live state), and watch
+    ; emission (REV-CF events must exist, in revision order).  Reads/acks are
+    ; per-iteration downstream of persist-applied!, so they never see a gap —
+    ; this barrier is what makes ADR 0005's watermark unnecessary.
+    (define mat-queues (if apply-workers (make-vector n-apply-workers '()) #f))
+    (define mat-count 0)
+    (define mat-pre #f)                    ; current-rev BEFORE the first queued PUT
+    (define (kbucket K)                    ; stable per-key worker route (djb2 mod N)
+      (let loop ((i 0) (h 5381))
+        (if (= i (bytevector-length K)) (modulo h n-apply-workers)
+            (loop (+ i 1) (modulo (+ (* h 33) (bytevector-u8-ref K i)) 16777216)))))
+    ; Stamp one committed PUT (mirrors mvcc-apply's PUT branch minus mvcc-put!):
+    ; same dead-lease guard (lease meta is stable during a parallel run — every
+    ; LEASE-* apply is serial and flushes first), same no-write-no-bump on guard
+    ; failure, same ("PUT" . rev) ack.
+    (define (stamp-put! cmd)
+      (let* ((K     (list-ref cmd 1))
+             (V     (list-ref cmd 2))
+             (lease (if (>= (length cmd) 4)
+                        (let ((l (bytes->int (list-ref cmd 3)))) (if l l 0))
+                        0))
+             (main  (+ (mvcc-current-rev ctx) 1)))
+        (if (and (not (= lease 0)) (not (mvcc-lease-exists? ctx lease)))
+            (cons 'err-lease-not-found lease)
+            (begin
+              (if (not mat-pre) (set! mat-pre (mvcc-current-rev ctx)))
+              (let ((w (kbucket K)))
+                (vector-set! mat-queues w
+                             (cons (list K V lease main) (vector-ref mat-queues w))))
+              (set! mat-count (+ mat-count 1))
+              (mvcc-set-current-rev! ctx main)
+              (cons "PUT" main)))))
+    ; Dispatch queued slices (rev-ascending per worker) + barrier on completion.
+    ; Messages that arrive while waiting are stashed onto `backlog` in order.
+    (define (flush-materializations!)
+      (if (> mat-count 0)
+          (let ((sent (let dispatch ((w 0) (n 0))
+                        (if (= w n-apply-workers) n
+                            (if (pair? (vector-ref mat-queues w))
+                                (begin
+                                  (send (vector-ref apply-workers w)
+                                        (list 'apply-slice (self)
+                                              (reverse (vector-ref mat-queues w))))
+                                  (vector-set! mat-queues w '())
+                                  (dispatch (+ w 1) (+ n 1)))
+                                (dispatch (+ w 1) n))))))
+            (let wait ((need sent))
+              (if (> need 0)
+                  (let ((r (raw-receive)))
+                    (if (and (pair? r) (eq? (car r) 'apply-slice-done))
+                        (wait (- need 1))
+                        (begin (set! backlog (append backlog (list r)))
+                               (wait need))))))
+            ; the whole batch is durable-visible: emit its watch window at once
+            (watch-on-apply! watch-reg ctx mat-pre (mvcc-current-rev ctx))
+            (set! mat-count 0)
+            (set! mat-pre #f))))
     (define (apply-fn sm cmd)
       (if (null? cmd)
           (set! acc (cons #f acc))                       ; no-op barrier: acc slot only, no rev bump
+          (if (and apply-workers (string=? (cmd-op cmd) "PUT"))
+              (set! acc (cons (stamp-put! cmd) acc))     ; parallel path: stamp now, materialize on flush
           (let ((pre (mvcc-current-rev ctx)))
+            (flush-materializations!)                    ; serial ops read live state: batch must land first
             (set! acc (cons (mvcc-apply ctx cmd) acc))    ; MVCC write; client waiter gets the result
             (watch-on-apply! watch-reg ctx pre (mvcc-current-rev ctx))
             ; Watch backend (cw-u4a.14, ADR 0002 §5 mid-stream ErrCompacted): a
@@ -128,12 +212,15 @@
             ; with no watchers this is a single hashtable-size check, no scan.
             (if (and (> (reg-count watch-reg) 0)
                      (pair? cmd) (string=? (cmd-op cmd) "COMPACT"))
-                (watch-check-compaction! watch-reg ctx))))
+                (watch-check-compaction! watch-reg ctx)))))
       (+ sm 1))
     ; Persist the applied index (+ its term) into the SAME group-commit batch as
     ; the entry's mutations, so a restart restores base/applied/commit and never
     ; re-applies already-applied committed entries (idempotent recovery/rejoin).
     (define (persist-applied! st)
+      ; cw-b5w.4 barrier: the applied marker must never be persisted (let alone
+      ; fsynced) before every materialized write of the entries it covers.
+      (flush-materializations!)
       (ctx-save-applied! ctx (raft-applied st) (entry-term st (raft-applied st))))
     ; ship engine outputs (target-node . rpc) to peers over the node transport.
     ; A send to a DOWN peer must not crash us — Raft is lossy-tolerant and

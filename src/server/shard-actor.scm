@@ -52,14 +52,22 @@
   (let loop ((i 0) (l lst))
     (cond ((null? l) 0) ((eqv? (car l) x) i) (else (loop (+ i 1) (cdr l))))))
 
-; Optional 6th arg (cw-b5w.4): the apply-worker count. 1 (the default — every
-; existing caller/test) = the original fully-serial apply path, byte-for-byte.
-; >1 = ADR 0005 option B: committed PUTs are revision-stamped here (the
-; sequencer) and materialized in parallel on N key-hash-routed workers, with a
-; per-batch barrier before persist/acks/reads (see flush-materializations!).
+; Optional rest args (positional):
+;   1 (cw-b5w.4)  apply-worker count. 1 (the default — every existing
+;     caller/test) = the original fully-serial apply path, byte-for-byte.
+;     >1 = ADR 0005 option B: sequencer stamping + N hash-routed workers
+;     with a per-batch barrier (see flush-materializations!).
+;   2 (cw-lkq.1)  election-ticks BASE (default 4): the election timeout in
+;     ticks before the deterministic per-node stagger (+3 per rank). One tick
+;     = the poller's tick-ms, so election-timeout-ms = tick-ms * (base+stagger)
+;     — etcd's --election-timeout analogue. CheckQuorum + the PreVote grant
+;     gate use the same value, so WAN profiles scale all three together.
 (define (shard-main shard-key voters node-name db-path sync? . rest)
   (let* ((n-apply-workers (if (and (pair? rest) (number? (car rest)) (> (car rest) 0))
                               (car rest) 1))
+         (election-base (if (and (pair? rest) (pair? (cdr rest))
+                                 (number? (cadr rest)) (> (cadr rest) 0))
+                            (cadr rest) 4))
          (handle  (store-open db-path #t))      ; create-if-missing
          (ctx     (make-ctx handle "default" sync?))
          (apply-workers
@@ -107,7 +115,7 @@
          ; Staggered election timeout, ROTATED by shard so leadership spreads:
          ; for shard S the voter at index S has the shortest timeout and tends to
          ; win it. Deterministic => no split votes, predictable failover.
-         (timeout (+ 4 (* (modulo (- (index-of node-name voters)
+         (timeout (+ election-base (* (modulo (- (index-of node-name voters)
                                      (let ((n (string->number shard-key))) (if n n 0)))
                                   (length voters))
                           3))))

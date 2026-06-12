@@ -174,15 +174,27 @@
 ; for retuning (bigger batches / Linux / multi-DB); see docs/adr/0005 + cw-b5w.5.
 (define apply-shards
   (let ((n (string->number (arg-after "--shards" "1")))) (if (and n (> n 0)) n 1)))
+; ---- Raft timing knobs (cw-lkq.1, etcd analogues for WAN deployments) ----
+; --tick-ms        heartbeat interval / Raft clock (etcd --heartbeat-interval);
+;                  the poller paces ticks by wall clock (cw-b5w.7). Default 120.
+; --election-ticks election timeout BASE in ticks before the per-node stagger
+;                  (etcd --election-timeout ~= tick-ms * election-ticks). Default 4.
+; WAN profile (100-300ms RTT): tick-ms 250, election-ticks 8 — heartbeats
+; tolerate an RTT without eating the election window.
+(define tick-ms
+  (let ((n (string->number (arg-after "--tick-ms" "120")))) (if (and n (> n 0)) n 120)))
+(define election-ticks
+  (let ((n (string->number (arg-after "--election-ticks" "4")))) (if (and n (> n 0)) n 4)))
 (spawn-source-dedicated "(include \"src/server/shard-actor.scm\")" 'shard-main
-              "0" shard-voters me (string-append dbbase "-shard0") durable apply-shards)
+              "0" shard-voters me (string-append dbbase "-shard0") durable apply-shards
+              election-ticks)
 
 (define dial-addrs (map raft-addr dial-peers))
 ; Dedicated thread — the poller is the Raft tick-clock AND sole network drainer;
 ; cooperative parking on a shared worker would slow the protocol (green-threads
 ; INV-3).
 (spawn-source-dedicated "(include \"src/server/peer-poller.scm\")" 'peer-poller
-              me '("0") 120 dial-addrs (- (length nodes) 1))
+              me '("0") tick-ms dial-addrs (- (length nodes) 1))
 
 ; wait until this node has elected/learned a leader for shard 0, so the substrate is ready
 ; before we report up.  A JOINER is not in consensus yet (no leader until MemberAdd lands +

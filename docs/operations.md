@@ -132,3 +132,62 @@ election timeout.
 (status/hashkv/alarm/defrag/snapshot/move-leader), `test/etcd-moveleader-grpc.sh`,
 `test/cluster-config-launch.sh` (bootstrap), `test/docker-cluster.sh` (compose),
 and `docs/jepsen-validation.md` (fault tolerance under partition/kill/membership).
+
+## Multi-region operation (cw-lkq)
+
+A cluster spans regions with one (or more) members per region; writes stay one
+linearizable Raft group; reads/watches are served region-locally
+(docs/specs/multi-region.md). Everything below was executed against the WAN
+compose overlay (`deploy/docker/wan.override.yml`, 150 ms simulated RTT —
+`test/wan-soak.sh` is the repeatable gate).
+
+### Configuration
+
+```text
+# member config — one per region
+locality us-east/1a          # region[/zone]; or spec field name:host:raft:client:REGION
+tick-ms 250                  # WAN raft profile: heartbeat interval (etcd --heartbeat-interval)
+election-ticks 8             # election base; timeout ~= tick-ms * (8 + stagger)
+leader-region us-east        # leaders auto-transfer back into this region
+serializable-max-lag 5000    # optional: redirect serializable reads when > N entries behind
+```
+
+- **Leader placement**: an out-of-region leader hands off (TimeoutNow) to a
+  caught-up voter in `leader-region`, rate-limited; a down preferred region is
+  a no-op (availability wins). Verified live: east leader auto-transferred west.
+- **Reads**: `--consistency=s` (serializable) is served by the LOCAL member, no
+  WAN hop. Linearizable reads AND writes sent to a follower are FORWARDED to
+  the leader transparently (etcd parity) — so kube-apiserver can list every
+  member in `--etcd-servers`. Forwarded calls expire (~3 s) to `tryagain` if
+  the leader dies mid-flight; clients retry.
+- **Watches**: served by the LOCAL member (replay + live, in that member's
+  revision order). Learners (non-voting members added with `member add
+  --learner`) serve serializable reads + watches without affecting quorum —
+  the read-replica pattern for far regions.
+
+### Client routing (kube-apiserver)
+
+Per region, list the LOCAL members first; the gRPC client health-checks and
+fails over. Writes from a non-leader region cost one WAN RTT (~1.5x RTT for a
+persistent client; see test/wan-soak.sh's measured budgets).
+
+### Bootstrap order
+
+Start all members of the QUORUM regions first (the cluster spec is identical
+everywhere); learner regions join afterwards (`--join` + `member add
+--learner`). With a 2+2+1 voter layout the cluster survives any single region
+loss; with 3 voters in one region + learners elsewhere, the voter region is
+the failure domain (choose deliberately).
+
+### Region-loss runbook
+
+1. A quorum-retaining loss (e.g. one region of a 2+2+1 layout): nothing to do —
+   writes continue after one election (terms move by exactly 1; verified at
+   150 ms RTT under load with zero lost acks). If the lost region was
+   `leader-region`, leadership stays out-of-region until it returns, then
+   auto-transfers back.
+2. A learner region loss: zero quorum impact; its clients fail over to the
+   next-nearest region's endpoints.
+3. Recovery: restart members with their data dirs (they catch up by
+   replication); a destroyed member rejoins via the wipe + `--join` +
+   `member add` flow (see Membership above).

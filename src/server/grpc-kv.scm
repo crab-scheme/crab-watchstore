@@ -705,6 +705,9 @@
       (if deny (cons 'err deny)
       (let* ((opts (list (cons 'key key)
                          (cons 'range-end rend)
+                         ; cw-lkq.4: serializable=true -> the shard serves this
+                         ; from local committed state (no leader gate).
+                         (cons 'serializable   (list-ref rl 6))
                          (cons 'revision       (list-ref rl 3))
                          (cons 'limit          (list-ref rl 2))
                          (cons 'count-only     (list-ref rl 8))

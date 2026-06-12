@@ -682,7 +682,12 @@
             ;;   A pure read over THIS node's committed ctx — not a Raft entry.
             ((eq? (car m) 'kv-range)
              (let ((conn (cadr m)) (opts (caddr m)))
-               (if (not (raft-leader? st))
+               ; cw-lkq.4: a SERIALIZABLE read (etcd r.serializable) is served from
+               ; THIS replica's committed ctx with no leader gate / quorum round —
+               ; possibly stale, locally consistent. Linearizable (the default)
+               ; keeps the leader gate.
+               (if (and (not (raft-leader? st))
+                        (not (range-opt opts 'serializable #f)))
                    (send conn 'tryagain)
                    (let* ((key (range-opt opts 'key (make-bytevector 0 0)))
                           (rend (range-opt opts 'range-end #f))

@@ -93,6 +93,7 @@
 ;      and it becomes a full voter — all over the live transport.
 (define join? (string=? (arg-after "--join" "no") "yes"))
 
+
 ; ---- optional TLS / mutual-TLS for the etcd gRPC CLIENT port (cw-u4a.21) ----
 ; When --tls-cert is supplied the client port is served over TLS instead of
 ; cleartext h2c.  --tls-ca + --tls-require-client-cert (default "yes") turn on
@@ -107,16 +108,27 @@
   (not (string=? (arg-after "--tls-require-client-cert" "yes") "no")))
 
 ; parse "name:host:raftport:clientport,..." -> list of (name host raftport clientport)
+; parse "name:host:raftport:clientport[:region]" -> (name host raft client region)
+; — the optional 5th field is the member's region (cw-lkq.7); #f when absent.
 (define nodes
   (map (lambda (e)
          (let ((p (split-on e #\:)))
            (list (string->symbol (car p)) (cadr p)
-                 (string->number (caddr p)) (string->number (cadddr p)))))
+                 (string->number (caddr p)) (string->number (cadddr p))
+                 (if (>= (length p) 5) (list-ref p 4) #f))))
        (split-on cluster-spec #\,)))
 
 (define (node-field nm i)
   (let loop ((ns nodes)) (cond ((null? ns) #f) ((eqv? (caar ns) nm) (list-ref (car ns) i)) (else (loop (cdr ns))))))
 (define (raft-addr nm) (string-append (node-field nm 1) ":" (number->string (node-field nm 2))))
+
+; ---- member locality (cw-lkq.7) ----
+; "region[/zone]" from --locality (or the `locality` config key), falling back
+; to this member's optional 5th cluster-spec field. Exposed in /metrics
+; (crabwatchstore_member_locality) and consumed by leader-region pinning (A2).
+(define locality
+  (let ((l (arg-after "--locality" #f)))
+    (or l (node-field me 4) "")))
 
 (define all-names (map car nodes))
 ; everyone but me — the members this node dials when joining a live cluster (cw-u4a.29).
@@ -311,7 +323,7 @@
 ; the shard / poller / grpc-kv handler.  Reads this node's shard-0 replica via the un-gated .32
 ; status seam; a bind failure is contained inside the actor (the node keeps serving gRPC).
 (spawn-source-dedicated "(include \"src/server/metrics-http.scm\")" 'metrics-http-main
-                        shard-pid (symbol->string me) bind-host metrics-port)
+                        shard-pid (symbol->string me) bind-host metrics-port locality)
 
 ; The consensus substrate + etcd KV API + metrics endpoint are up. Park so the node process
 ; stays alive serving Raft RPCs to peers and gRPC calls to clients.

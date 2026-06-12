@@ -158,6 +158,23 @@
                  name " " (number->string value) "\n"))
 
 ; GET /metrics — Prometheus exposition (text/plain; version=0.0.4) of REAL per-node gauges.
+; member locality (cw-lkq.7): "region[/zone]", set by metrics-http-main from the
+; launcher's --locality / cluster-spec region field; "" = unlabelled member.
+(define metrics-locality "")
+(define (locality-metric me-str)
+  (if (= 0 (string-length metrics-locality)) ""
+      (let* ((parts (let loop ((i 0))
+                      (cond ((= i (string-length metrics-locality)) (list metrics-locality ""))
+                            ((char=? (string-ref metrics-locality i) #\/)
+                             (list (substring metrics-locality 0 i)
+                                   (substring metrics-locality (+ i 1)
+                                              (string-length metrics-locality))))
+                            (else (loop (+ i 1)))))))
+        (string-append "# HELP crabwatchstore_member_locality Member locality labels.\n"
+                       "# TYPE crabwatchstore_member_locality gauge\n"
+                       "crabwatchstore_member_locality{member=\"" me-str
+                       "\",region=\"" (car parts) "\",zone=\"" (cadr parts) "\"} 1\n"))))
+
 (define (route-metrics conn me-str r)
   (let* ((leader     (st-leader r))
          (has-leader (if leader 1 0))
@@ -179,6 +196,7 @@
                         "Total size of the underlying database logically in bytes." (st-dbsize r))
                  (gauge "etcd_debugging_mvcc_keys_total"
                         "Total number of keys in the store." (st-keys r))
+                 (locality-metric me-str)
                  (gauge "up" "1 if the metrics endpoint is serving." 1))))
     (http-send conn 200 "OK" "text/plain; version=0.0.4" body)))
 
@@ -194,7 +212,13 @@
       ((string=? path "/version") (route-version conn))
       (else (http-send conn 404 "Not Found" "text/plain; charset=utf-8" "404 page not found\n")))))
 
-(define (metrics-http-main shard-pid me-str host port)
+(define (metrics-http-main shard-pid me-str host port . rest)
+  ; optional 5th arg (cw-lkq.7): the member's locality string "region[/zone]".
+  ; (a define so it precedes the body's other defines — set! is in expression
+  ; position there and Scheme bodies require defines first.)
+  (define locality-init
+    (if (and (pair? rest) (string? (car rest)))
+        (set! metrics-locality (car rest))))
   ; A bind failure must NOT crash the node — log + exit this actor cleanly (the node keeps
   ; serving gRPC).  spawn-source-dedicated isolates this thread; the guard keeps stderr clean.
   (define listener

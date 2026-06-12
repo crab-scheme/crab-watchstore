@@ -47,9 +47,15 @@ check "get" "v1" "$("$ETCDCTL" --endpoints="$LEADER_EP" get dkr-k --print-value-
 grep -q "v2" /tmp/cws-dkr-watch.out && ok "watch delivered the event" || bad "watch event missing"
 
 echo "== hashkv identical across all 3 members =="
-H1=$("$ETCDCTL" --endpoints="${EPS[0]}" endpoint hashkv -w json 2>/dev/null | sed 's/.*"hash"://;s/[,}].*//')
-H2=$("$ETCDCTL" --endpoints="${EPS[1]}" endpoint hashkv -w json 2>/dev/null | sed 's/.*"hash"://;s/[,}].*//')
-H3=$("$ETCDCTL" --endpoints="${EPS[2]}" endpoint hashkv -w json 2>/dev/null | sed 's/.*"hash"://;s/[,}].*//')
+# A follower applies one AE round behind the commit quorum — retry until all
+# three hashes converge (bounded), then assert equality.
+for _ in $(seq 1 10); do
+  H1=$("$ETCDCTL" --endpoints="${EPS[0]}" endpoint hashkv -w json 2>/dev/null | sed 's/.*"hash"://;s/[,}].*//')
+  H2=$("$ETCDCTL" --endpoints="${EPS[1]}" endpoint hashkv -w json 2>/dev/null | sed 's/.*"hash"://;s/[,}].*//')
+  H3=$("$ETCDCTL" --endpoints="${EPS[2]}" endpoint hashkv -w json 2>/dev/null | sed 's/.*"hash"://;s/[,}].*//')
+  [ -n "$H1" ] && [ "$H1" = "$H2" ] && [ "$H2" = "$H3" ] && break
+  sleep 1
+done
 check "hashkv a==b" "$H1" "$H2"
 check "hashkv b==c" "$H2" "$H3"
 [ -n "$H1" ] && ok "hashkv non-empty ($H1)" || bad "hashkv empty"

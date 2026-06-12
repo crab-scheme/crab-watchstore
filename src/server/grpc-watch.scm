@@ -135,7 +135,13 @@
            (progress? (wg-galist 'progress_notify create-req #f))
            (client-wid (let ((w (wg-galist 'watch_id create-req 0))) (if (= w 0) #f w)))
            (filters (map wg-filter->sym (wg-galist 'filters create-req '())))
-           (internal-start (if (> start-rev 0) (- start-rev 1) 0))
+           ; wire start_revision -> internal EXCLUSIVE bound (deliver main > bound).
+           ; rev>1 -> rev-1; rev=0 -> 0 (the future-only sentinel). rev=1 must NOT
+           ; map to 0 (that IS the sentinel — the cw-24e.5 bug: `watch --rev 1`
+           ; silently became future-only); it maps to -1, "replay everything".
+           (internal-start (cond ((= start-rev 1) -1)
+                                 ((> start-rev 1) (- start-rev 1))
+                                 (else 0)))
            (spec (append
                    (list (cons 'key key) (cons 'start-rev internal-start)
                          (cons 'prev-kv prev-kv?) (cons 'filters filters)

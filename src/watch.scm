@@ -234,6 +234,11 @@
       ; (1) ErrCompacted at creation: 0 < start-rev < compact-rev -> refuse (§5).
       ((and (> start-rev 0) (< start-rev compact))
        (cons 'compacted compact))
+      ; (1b) start-rev < 0 = "replay EVERYTHING" (the wire's rev=1; cw-24e.5 —
+      ; rev 1 cannot use exclusive bound 0, that's the future-only sentinel).
+      ; Any compaction at all means revision 1 is gone -> refuse identically.
+      ((and (< start-rev 0) (> compact 0))
+       (cons 'compacted compact))
       (else
        (let* ((id (let ((sid (spec-ref spec 'watch-id #f)))
                     (if sid sid (reg-alloc-id! reg))))

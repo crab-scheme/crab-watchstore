@@ -372,21 +372,28 @@
                (conn-event-tuples "c2")))
 
 ; ---------------------------------------------------------------------------
-(section "CLUSTER: leader-gating — WatchCreate to a NON-leader is redirected")
+(section "CLUSTER: follower watch serving — create on a NON-leader is SERVED locally (cw-lkq.5)")
+; Pre-cw-lkq.5 this section asserted a watch-not-leader redirect. Watches are now
+; replica-local (etcd-faithful: any member serves watches): the follower applies
+; the same committed entries, so registration succeeds and live events arrive in
+; the follower's own revision order.
 (define FOLL (follower-node LDR))
 (display "  follower: ") (display FOLL) (newline)
 (define conn3
   (spawn-source "(include \"src/server/watch-stream.scm\")" 'watch-stream
                 (shard-pid FOLL) 'ws-watch-out "c3"))
-; create against the FOLLOWER's shard -> not served, redirected with the leader name.
-(let ((r (drv! "r-c3" conn3 'create 300 0
-               (list (cons 'key (b "")) (cons 'range-end (bytevector 0))))))
-  (check "non-leader create redirected (not silently served)"
-         'watch-create-not-leader (car r))
-  (check "redirect names a leader (or #f if unknown)" #t
-         (or (not (cdr r)) (and (member (symbol->string (cdr r)) '("a" "b" "c")) #t))))
-(check "no watcher established on the follower's conn (no CREATED frame)"
-       0 (length (conn-created "c3")))
+(check "follower create wid 300 SERVED (no redirect)"
+       (cons 'watch-create-ok 300)
+       (drv! "r-c3" conn3 'create 300 0
+             (list (cons 'key (b "fw-")) (cons 'range-end (b "fw.")))))
+; a write committed via the LEADER must reach the follower-registered watcher
+; once the follower applies it.
+(put! "fw-1" "v")
+(spin (lambda () (>= (length (conn-event-tuples "c3")) 1))
+      "follower watcher delivered the leader-committed event")
+(check "follower watcher saw fw-1"
+       (list "fw-1")
+       (map caddr (conn-event-tuples "c3")))
 
 ; ---------------------------------------------------------------------------
 (section "CLUSTER: progress_notify — idle synced watch gets an empty advancing frame")

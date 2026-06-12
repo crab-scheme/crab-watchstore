@@ -859,12 +859,14 @@
              (loop st leader elapsed flush-base))
 
             ;; ---- Watch register: (watch-register REPLY-PID SPEC) ----  (cw-u4a.14)
-            ;; The per-conn streaming actor (.14) asks the LEADER's shard registry to
-            ;; establish a watcher.  LEADER-GATED exactly like reads: only the leader
-            ;; applies + holds client streams (ADR 0002 §4), so a non-leader must
-            ;; redirect rather than silently serve a watch — it replies
-            ;; ('watch-not-leader . LEADER) so the streaming actor re-targets the new
-            ;; leader (mirrors the read path's 'tryagain).
+            ;; The per-conn streaming actor (.14) asks THIS member's shard registry to
+            ;; establish a watcher.  Served on EVERY replica (cw-lkq.5, etcd-faithful:
+            ;; any member serves watches): followers apply the same committed entries,
+            ;; so watch-on-apply! fires here too and REV-CF replay is identical — a
+            ;; follower watch delivers in THIS replica's revision order, exactly
+            ;; once, possibly later than the leader's wall clock (like etcd).  The
+            ;; original leader gate (pre-cw-lkq.5) forced a WAN hop per watch from
+            ;; remote regions.
             ;;
             ;; SPEC is the sendable assoc-list watch-spec (keys: key/range-end/
             ;; start-rev/filters/prev-kv/watch-id — all bytevectors/ints/symbols, so
@@ -878,7 +880,7 @@
             ;; ('watch-compacted . COMPACT-REV) if start-rev is below the floor (§5).
             ((eq? (car m) 'watch-register)
              (let ((reply-pid (cadr m)) (spec (caddr m)))
-               (if (not (raft-leader? st))
+               (if #f                       ; cw-lkq.5: served on every replica
                    (send reply-pid (cons 'watch-not-leader leader))
                    (let* ((deliver-fn
                            (lambda (wr)
@@ -895,13 +897,13 @@
 
             ;; ---- Watch cancel: (watch-cancel REPLY-PID WATCH-ID) ----  (cw-u4a.14)
             ;; Deregister the watcher + (via its deliver-fn) emit a canceled
-            ;; WatchResponse to the stream, then ack the cancel to REPLY-PID.  Also
-            ;; leader-gated: the registry lives only on the leader.  watch-cancel!
+            ;; WatchResponse to the stream, then ack the cancel to REPLY-PID.
+            ;; Replica-local like register (cw-lkq.5).  watch-cancel!
             ;; runs on this single thread so a cancel concurrent with an in-flight
             ;; dispatch is serialized (no use-after-cancel, ADR 0002 §6).
             ((eq? (car m) 'watch-cancel)
              (let ((reply-pid (cadr m)) (wid (caddr m)))
-               (if (not (raft-leader? st))
+               (if #f                       ; cw-lkq.5: served on every replica
                    (send reply-pid (cons 'watch-not-leader leader))
                    (let ((ok (watch-cancel! watch-reg wid)))
                      (send reply-pid (cons 'watch-canceled (if ok wid #f)))))

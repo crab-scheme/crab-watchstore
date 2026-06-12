@@ -1,0 +1,17 @@
+# WAN profile overlay (cw-lkq.3):
+#   docker compose -f docker-compose.yml -f wan.override.yml up -d --build
+# 75ms one-way egress per member = ~150ms inter-member RTT; Raft timing widened
+# (tick 250ms, election base 8 -> timeout ~2-4s) per docs/specs/multi-region.md.
+services:
+  cws-a:
+    cap_add: [NET_ADMIN]
+    environment: {WAN_DELAY_MS: "${WAN_DELAY_MS:-75}"}
+    command: ["--config", "/etc/crab-watchstore.conf", "--tick-ms", "250", "--election-ticks", "8"]
+  cws-b:
+    cap_add: [NET_ADMIN]
+    environment: {WAN_DELAY_MS: "${WAN_DELAY_MS:-75}"}
+    command: ["--config", "/etc/crab-watchstore.conf", "--tick-ms", "250", "--election-ticks", "8"]
+  cws-c:
+    cap_add: [NET_ADMIN]
+    environment: {WAN_DELAY_MS: "${WAN_DELAY_MS:-75}"}
+    command: ["--config", "/etc/crab-watchstore.conf", "--tick-ms", "250", "--election-ticks", "8"]

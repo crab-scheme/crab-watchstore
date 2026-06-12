@@ -8,7 +8,7 @@
 FROM debian:bookworm-slim
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends libstdc++6 ca-certificates curl bash \
+ && apt-get install -y --no-install-recommends libstdc++6 ca-certificates curl bash iproute2 \
  && rm -rf /var/lib/apt/lists/*
 
 COPY jepsen/docker/crabscheme /opt/cws/crabscheme
@@ -26,5 +26,10 @@ EXPOSE 2379 7001 12379
 HEALTHCHECK --interval=5s --timeout=3s --start-period=20s --retries=5 \
   CMD curl -fsS "http://$(hostname):12379/health" | grep -q '"health":"true"' || exit 1
 
-ENTRYPOINT ["/opt/cws/bin/crab-watchstore"]
+# WAN_DELAY_MS (cw-lkq.3): one-way egress delay injected via tc netem — with one
+# member per "region" every member<->member path is inter-region (RTT = 2x this).
+# Needs cap_add: [NET_ADMIN]. Fails LOUD if tc cannot install the qdisc.
+COPY deploy/docker/entry.sh /opt/cws/entry.sh
+RUN chmod +x /opt/cws/entry.sh
+ENTRYPOINT ["/opt/cws/entry.sh"]
 CMD ["--config", "/etc/crab-watchstore.conf"]

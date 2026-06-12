@@ -190,6 +190,13 @@
 (define (qk) (string-append (symbol->string me) ":0"))
 (if join?
     (begin
+      ; cw-24e.4: the joiner skips the LEADER wait, but it MUST still wait for
+      ; the shard actor to publish its pid — the gRPC service below captures
+      ; shard-pid once at spawn, and the shard's (include ...) compile takes
+      ; long enough that a joiner raced past it with shard-pid = #f, making
+      ; EVERY gRPC call raise ("handler error") for the life of the process.
+      (let spin ()
+        (if (table-lookup 'ws-shard-pid (qk)) #t (spin)))
       (display "node ") (display me)
       (display ": joined mesh as a non-voter — awaiting MemberAdd (catch-up + promote)") (newline))
     (begin

@@ -1430,7 +1430,18 @@
     (let* ((req       (pb-decode MemberAddRequest-schema bytes))
            (peer-urls (galist 'peerURLs req '()))
            (learner?  (galist 'isLearner req #f))
-           (name      (peer-url->name (if (pair? peer-urls) (car peer-urls) ""))))
+           (url       (if (pair? peer-urls) (car peer-urls) ""))
+           ; cw-24e.4 rejoin fix: a peerURL that matches a KNOWN member's raft
+           ; URL (the --cluster spec) resolves to THAT member's node-name —
+           ; required when hosts are IPs (locally every member is 127.0.0.1, so
+           ; the host-as-name convention below would register a voter named
+           ; "127.0.0.1" and the rejoining node would wait forever).  Unknown
+           ; URLs keep the convention: host == node-name (http://NAME:port).
+           (name      (let loop ((ms cluster-members))
+                        (cond ((null? ms) (peer-url->name url))
+                              ((string=? (cadr (car ms)) url)
+                               (string->symbol (car (car ms))))
+                              (else (loop (cdr ms)))))))
       (if (not name)
           (cons 'err (cons GRPC-INVALID-ARGUMENT "etcdserver: peerURL is required"))
           (member-outcome->resp

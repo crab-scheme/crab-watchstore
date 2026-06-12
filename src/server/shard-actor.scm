@@ -64,6 +64,8 @@
 ;     gate use the same value, so WAN profiles scale all three together.
 ;   3 (cw-lkq.2)  leader-region: preferred leader region string, or #f.
 ;   4 (cw-lkq.2)  region-map: ((node-name . region-or-#f) ...) for all members.
+;   5 (cw-lkq.6)  serializable-max-lag: refuse serializable reads when
+;     commit - applied exceeds this (0 = no freshness gate).
 (define (shard-main shard-key voters node-name db-path sync? . rest)
   (let* ((n-apply-workers (if (and (pair? rest) (number? (car rest)) (> (car rest) 0))
                               (car rest) 1))
@@ -75,6 +77,8 @@
                             (list-ref rest 2) #f))
          (region-map (if (and (pair? rest) (>= (length rest) 4) (list? (list-ref rest 3)))
                          (list-ref rest 3) '()))
+         (ser-max-lag (if (and (>= (length rest) 5) (number? (list-ref rest 4)))
+                          (list-ref rest 4) 0))
          (handle  (store-open db-path #t))      ; create-if-missing
          (ctx     (make-ctx handle "default" sync?))
          (apply-workers
@@ -724,7 +728,12 @@
                ; possibly stale, locally consistent. Linearizable (the default)
                ; keeps the leader gate.
                (if (and (not (raft-leader? st))
-                        (not (range-opt opts 'serializable #f)))
+                        (or (not (range-opt opts 'serializable #f))
+                            ; cw-lkq.6 freshness gate: a serializable read on a
+                            ; replica more than ser-max-lag entries behind the
+                            ; leader's commit redirects instead of serving stale.
+                            (and (> ser-max-lag 0)
+                                 (> (- (raft-commit st) (raft-applied st)) ser-max-lag))))
                    (send conn 'tryagain)
                    (let* ((key (range-opt opts 'key (make-bytevector 0 0)))
                           (rend (range-opt opts 'range-end #f))

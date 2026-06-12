@@ -435,7 +435,10 @@
 ; the actor
 ; ===========================================================================
 
-(define (grpc-kv-main shard-pid cluster-id member-id cluster-members)
+(define (grpc-kv-main shard-pid cluster-id member-id cluster-members . rest)
+  ; optional 5th arg (cw-lkq.6): THIS node's name string, for node-peers-based
+  ; MemberAdd name resolution (#f on old callers/tests -> mesh lookup disabled).
+  (define my-node-name (if (and (pair? rest) (string? (car rest))) (car rest) #f))
   ; cluster-members (cw-u4a.30): the static --cluster spec as a list of
   ; (name-string peerurl-string), e.g. (("a" "http://127.0.0.1:7001") ...).  Used by
   ; the Cluster service to report peerURLs in MemberList and as an extra id->name
@@ -1434,17 +1437,43 @@
            (peer-urls (galist 'peerURLs req '()))
            (learner?  (galist 'isLearner req #f))
            (url       (if (pair? peer-urls) (car peer-urls) ""))
-           ; cw-24e.4 rejoin fix: a peerURL that matches a KNOWN member's raft
-           ; URL (the --cluster spec) resolves to THAT member's node-name —
-           ; required when hosts are IPs (locally every member is 127.0.0.1, so
-           ; the host-as-name convention below would register a voter named
-           ; "127.0.0.1" and the rejoining node would wait forever).  Unknown
-           ; URLs keep the convention: host == node-name (http://NAME:port).
-           (name      (let loop ((ms cluster-members))
-                        (cond ((null? ms) (peer-url->name url))
-                              ((string=? (cadr (car ms)) url)
-                               (string->symbol (car (car ms))))
-                              (else (loop (cdr ms)))))))
+           ; Name resolution (cw-24e.4 + cw-lkq.6), in order:
+           ;   1. a peerURL matching a KNOWN member's spec URL -> that name
+           ;      (rejoin of a spec member on an IP host);
+           ;   2. host-as-name when the URL host IS a spec/mesh name
+           ;      (the http://NAME:port convention);
+           ;   3. exactly ONE connected mesh peer that is NOT in the spec ->
+           ;      that peer (a genuinely-NEW member on an IP host: it dialed
+           ;      the mesh under its real node name before MemberAdd);
+           ;   4. fall back to host-as-name (unresolvable; etcd cannot know).
+           (name      (or (let loop ((ms cluster-members))
+                            (cond ((null? ms) #f)
+                                  ((string=? (cadr (car ms)) url)
+                                   (string->symbol (car (car ms))))
+                                  (else (loop (cdr ms)))))
+                          (let* ((host (peer-url->name url))
+                                 (host-str (and host (symbol->string host)))
+                                 (spec-names (map car cluster-members))
+                                 ; node-peers labels are "name@host" — keep the name.
+                                 (mesh (map (lambda (l)
+                                              (let at ((i 0))
+                                                (cond ((= i (string-length l)) l)
+                                                      ((char=? (string-ref l i) #\@) (substring l 0 i))
+                                                      (else (at (+ i 1))))))
+                                            (if my-node-name
+                                                (guard (e (#t '())) (node-peers my-node-name))
+                                                '()))))
+                            (cond
+                              ((and host-str (or (member host-str spec-names)
+                                                 (member host-str mesh)))
+                               host)
+                              ((let ((new (let keep ((ps mesh) (acc '()))
+                                            (cond ((null? ps) (reverse acc))
+                                                  ((member (car ps) spec-names)
+                                                   (keep (cdr ps) acc))
+                                                  (else (keep (cdr ps) (cons (car ps) acc)))))))
+                                 (and (= (length new) 1) (string->symbol (car new)))))
+                              (else host))))))
       (if (not name)
           (cons 'err (cons GRPC-INVALID-ARGUMENT "etcdserver: peerURL is required"))
           (member-outcome->resp

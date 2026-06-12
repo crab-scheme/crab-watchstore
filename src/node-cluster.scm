@@ -204,9 +204,15 @@
 ; comes from the cluster spec's 5th field / --locality (cw-lkq.7).
 (define leader-region (arg-after "--leader-region" #f))
 (define region-map (map (lambda (n) (cons (car n) (list-ref n 4))) nodes))
+; --serializable-max-lag N (cw-lkq.6): refuse SERIALIZABLE reads when this
+; replica is more than N entries behind the leader's commit (commit - applied
+; > N) — the freshness gate for learner/follower read replicas. 0 = no gate
+; (serve whatever is applied; etcd's default serializable behavior).
+(define serializable-max-lag
+  (let ((n (string->number (arg-after "--serializable-max-lag" "0")))) (if (and n (>= n 0)) n 0)))
 (spawn-source-dedicated "(include \"src/server/shard-actor.scm\")" 'shard-main
               "0" shard-voters me (string-append dbbase "-shard0") durable apply-shards
-              election-ticks leader-region region-map)
+              election-ticks leader-region region-map serializable-max-lag)
 
 (define dial-addrs (map raft-addr dial-peers))
 ; Dedicated thread — the poller is the Raft tick-clock AND sole network drainer;
@@ -303,7 +309,8 @@
 
 (define grpc-handler
   (spawn-source-dedicated "(include \"src/server/grpc-kv.scm\")" 'grpc-kv-main
-                          shard-pid cluster-id member-id cluster-members))
+                          shard-pid cluster-id member-id cluster-members
+                          (symbol->string me)))
 ; TLS path (cw-u4a.21) iff --tls-cert was given; otherwise the original h2c
 ; server.  grpc-serve-tls reuses the SAME handler actor — TLS only wraps the IO.
 (define grpc-sid

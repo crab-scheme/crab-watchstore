@@ -102,6 +102,16 @@ sweep: 64 ≫ 8 (454 w/s), so group commit itself is real and kept; the extra ~1
 under the flood was the artifact. Idle 3-node clusters now hold term 1 indefinitely
 (previously +2–4 terms/s).
 
+**Update (cw-b5w.6):** the parallel-apply investigation found the real lock: the
+crabscheme store registry held its Mutex across every RocksDB operation
+(SingleThreaded mode), serializing ALL store access process-wide. With
+MultiThreaded RocksDB + Arc handles (ops run unlocked), the SERIAL path jumped
+`load=l` **~1,180 → 5,202 w/s** (slowest 0.15 s) — the sustained-write gap to
+etcd (~7,900 w/s) is now **~1.5×**. `--shards 4` measures 3,606 w/s (the
+per-batch barrier still costs more than parallel apply saves), so the default
+remains `--shards 1`. Full suite battery + the cw-24e soak (zero lost acks
+under leader kill + membership cycle) green on the new store layer.
+
 Historical (cw-u4a.36, pre-epic): `s` PASS (slowest 13 ms vs etcd 24 ms), `m` did not
 sustain, `l` skipped — i.e. a single-node ceiling between 150 and 1000 w/s.
 

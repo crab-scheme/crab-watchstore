@@ -17,7 +17,7 @@ for L in $LOADS; do
   pkill -f node-cluster.scm 2>/dev/null; sleep 1
   rm -rf "$OUT/db-$L"
   "$BIN" run "$ROOT/src/node-cluster.scm" -- \
-    --node a --db "$OUT/db-$L" --durable no \
+    --node a --db "$OUT/db-$L" --durable no --shards "${SHARDS:-1}" \
     --cluster "a:127.0.0.1:${RAFT}:${PORT}" >"$OUT/cws-$L.log" 2>&1 &
   PIDS+=($!); SRV=$!
   for _ in $(seq 1 100); do

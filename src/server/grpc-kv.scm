@@ -289,9 +289,12 @@
 ; ===========================================================================
 
 (define (make-header cluster-id member-id revision raft-term)
+  ; etcd never reports a revision below 1 (a fresh store is at revision 1);
+  ; kube-apiserver REJECTS resourceVersion 0 from storage ("illegal resource
+  ; version") — clamp (cw-lkq.9). Internal revision numbering is unchanged.
   (list (cons 'cluster_id cluster-id)
         (cons 'member_id  member-id)
-        (cons 'revision   revision)
+        (cons 'revision   (if (< revision 1) 1 revision))
         (cons 'raft_term  raft-term)))
 
 ; ===========================================================================
@@ -725,7 +728,8 @@
       (cond
         ((not (pair? res)) (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: not leader")))
         ((eq? (car res) 'kv-range-ok)
-         (let ((cur-rev (list-ref res 1)) (term (list-ref res 2))
+         (let ((cur-rev (let ((r (list-ref res 1))) (if (< r 1) 1 r))) ; etcd: never report rev<1 (cw-lkq.9)
+               (term    (list-ref res 2))
                (err     (list-ref res 3)) (total (list-ref res 4))
                (tuples  (list-ref res 5)))
            (if (eq? err 'compacted)

@@ -113,7 +113,7 @@ RPORT=$(case $VICTIM in a) echo 21790;; b) echo 21791;; c) echo 21792;; esac)
 
 wait "$LOADPID" 2>/dev/null
 sleep 8   # let replication + a final watch replay settle
-touch "$WORK/load-done"; sleep 2; pkill -f "watch soak/" 2>/dev/null
+touch "$WORK/load-done"; pkill -f "watch soak/" 2>/dev/null
 ACKED=$(wc -l < "$WORK/acked.txt" | tr -d ' ')
 echo "== load done: $ACKED acknowledged writes =="
 [ "$ACKED" -gt 100 ] && ok "meaningful load ($ACKED acked writes)" || bad "too few acked writes ($ACKED)"
@@ -127,14 +127,28 @@ while read -r i; do
 done < "$WORK/acked.txt"
 check "lost acknowledged writes" 0 "$LOST"
 
-echo "== assert 2: watch continuity =="
+echo "== assert 2a: live watch streamed events through the faults =="
+LIVE=$(grep -c "^v-" "$WORK/watch.out" 2>/dev/null || echo 0)
+[ "$LIVE" -gt 100 ] && ok "live watcher delivered events ($LIVE, reconnecting across faults)" \
+                    || bad "live watcher delivered almost nothing ($LIVE)"
+
+echo "== assert 2b: watch continuity — a fresh --rev 1 replay contains EVERY acked write =="
+LEP=$(leader_ep)
+"$ETCDCTL" --endpoints="$LEP" watch soak/ --prefix --rev 1 >"$WORK/replay.out" 2>"$WORK/replay.err" &
+RPID=$!
+PREV=-1
+for _ in $(seq 1 30); do
+  CUR=$(wc -l < "$WORK/replay.out" 2>/dev/null || echo 0)
+  [ "$CUR" = "$PREV" ] && [ "$CUR" -gt 0 ] && break
+  PREV=$CUR; sleep 2
+done
+kill $RPID 2>/dev/null
+[ -s "$WORK/replay.err" ] && sed 's/^/  replay-err: /' "$WORK/replay.err" | head -2
 WSEEN=0
 while read -r i; do
-  grep -q "^v-$i\$" "$WORK/watch.out" && WSEEN=$((WSEEN+1))
+  grep -q "^v-$i\$" "$WORK/replay.out" && WSEEN=$((WSEEN+1))
 done < "$WORK/acked.txt"
-# the watch stream reconnects on leader change; events committed while it was
-# down are replayed from its last revision — so every acked write must appear.
-check "watch delivered every acked write" "$ACKED" "$WSEEN"
+check "replay contains every acked write" "$ACKED" "$WSEEN"
 
 echo "== assert 3: hashkv convergence across all 3 =="
 for _ in $(seq 1 20); do

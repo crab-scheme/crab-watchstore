@@ -300,12 +300,27 @@
 ; exclusive query; live dispatch tests it per-event), so here we just reconstruct +
 ; emit and bump the marker.  An empty batch produces NO response (etcd never sends an
 ; empty events frame from replay).
+; Replay batches are CHUNKED to at most WATCH-DELIVER-CHUNK events per
+; WatchResponse (cw-lkq.13): a single giant response makes the interpreted
+; protobuf encode quadratic (a 4000-event replay never finished encoding) and
+; risks oversized frames; etcd itself fragments large watch responses. Each
+; chunk advances delivered_rev, so a teardown mid-replay never re-delivers.
+(define WATCH-DELIVER-CHUNK 500)
 (define (watch-deliver-events! ctx w evs header-rev)
-  (if (pair? evs)
-      (let ((wevs (map (lambda (ev) (event->watch-event ctx ev (w-prev-kv? w))) evs)))
-        ((w-deliver-fn w) (events-response (w-watch-id w) header-rev wevs))
-        ; advance the high-water mark to the highest delivered revision
-        (set-w-delivered-rev! w (ev-mod-rev (list-ref evs (- (length evs) 1)))))))
+  (let chunk ((evs evs))
+    (if (pair? evs)
+        (let* ((batch (let take ((es evs) (n 0) (acc '()))
+                        (if (or (null? es) (= n WATCH-DELIVER-CHUNK))
+                            (reverse acc)
+                            (take (cdr es) (+ n 1) (cons (car es) acc)))))
+               (rest  (let drop ((es evs) (n 0))
+                        (if (or (null? es) (= n WATCH-DELIVER-CHUNK)) es
+                            (drop (cdr es) (+ n 1)))))
+               (wevs (map (lambda (ev) (event->watch-event ctx ev (w-prev-kv? w))) batch)))
+          ((w-deliver-fn w) (events-response (w-watch-id w) header-rev wevs))
+          ; advance the high-water mark to the highest delivered revision
+          (set-w-delivered-rev! w (ev-mod-rev (list-ref batch (- (length batch) 1))))
+          (chunk rest)))))
 
 ; ===========================================================================
 ; watch-on-apply! — the LIVE dispatch off mvcc-apply (ADR 0002 §3 LIVE, §4)

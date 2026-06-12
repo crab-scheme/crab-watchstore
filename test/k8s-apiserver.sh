@@ -26,7 +26,7 @@ for _ in $(seq 1 40); do
 done
 check "store healthy x3" 3 "$($COMPOSE ps --format '{{.Health}}' | grep -c healthy)"
 
-echo "== discover the leader (apiserver gets the leader endpoint; follower read-forwarding is cw-lkq follow-up) =="
+echo "== leader discovery (informational; apiserver gets ALL endpoints — cw-lkq.13 forwarding) =="
 LNAME=""
 for m in a b c; do
   J=$(docker exec "$(docker ps -qf name=cws-$m)" curl -s "http://cws-$m:12379/metrics" 2>/dev/null | grep "etcd_server_is_leader 1")
@@ -41,7 +41,7 @@ echo 'cwstoken,admin,admin,"system:masters"' > "$WORK/tokens.csv"
 docker run -d --name cws-apiserver --network crab-watchstore_cws \
   -p 6443:6443 -v "$WORK":/keys \
   registry.k8s.io/kube-apiserver:"$KVER" kube-apiserver \
-  --etcd-servers=http://cws-$LNAME:2379 \
+  --etcd-servers=http://cws-a:2379,http://cws-b:2379,http://cws-c:2379 \
   --service-cluster-ip-range=10.96.0.0/16 \
   --service-account-issuer=https://kubernetes.default.svc \
   --service-account-key-file=/keys/sa.pub \

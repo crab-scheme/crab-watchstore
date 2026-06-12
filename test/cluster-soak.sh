@@ -108,8 +108,8 @@ start_member "$VICTIM" --join yes
 sleep 4
 LEP=$(leader_ep)
 RPORT=$(case $VICTIM in a) echo 21790;; b) echo 21791;; c) echo 21792;; esac)
-"$ETCDCTL" --endpoints="$LEP" member add "$VICTIM" --peer-urls="http://127.0.0.1:$RPORT" >/dev/null 2>&1 \
-  && ok "member add $VICTIM accepted" || bad "member add failed"
+"$ETCDCTL" --endpoints="$LEP" member add "$VICTIM" --peer-urls="http://127.0.0.1:$RPORT" >"$WORK/add.out" 2>&1 \
+  && ok "member add $VICTIM accepted" || { bad "member add failed"; sed 's/^/  add-err: /' "$WORK/add.out" | tail -2; }
 
 wait "$LOADPID" 2>/dev/null
 sleep 8   # let replication + a final watch replay settle

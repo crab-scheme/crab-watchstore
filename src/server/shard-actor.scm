@@ -257,13 +257,23 @@
     ; acc slot consumed) — otherwise the next client write's reply lands on the conf index
     ; and every following reply shifts by one (a cross-wire). With an empty conf-skip (the
     ; fixed-config path) this is the original positional loop, unchanged (cw-u4a.29).
+    ; Deliver an ack to a pending waiter. A LOCAL waiter is a conn pid; a
+    ; FORWARDED write's waiter (cw-lkq.13) is the stand-in (fwd ORIGIN . ID) —
+    ; its ack rides 'ws-fwd-reply back to the origin member, whose shard relays
+    ; to the real conn from ITS fwd-pending table.
+    (define (ack-waiter! conn payload)
+      (if (and (pair? conn) (eq? (car conn) 'fwd))
+          (guard (e (#t #f))
+            (node-send (symbol->string node-name) (symbol->string (cadr conn))
+                       (list 'ws-fwd-reply shard-key node-name (cddr conn) payload)))
+          (send conn payload)))
     (define (drain! old-applied)
       (let loop ((idx (+ old-applied 1)) (rs (reverse acc)))
         (if (pair? rs)
             (if (hashtable-contains? conf-skip idx)
                 (loop (+ idx 1) rs)                       ; conf entry: no acc slot — skip index
                 (let ((conn (hashtable-ref pending idx #f)))
-                  (if conn (begin (send conn (car rs)) (hashtable-delete! pending idx)))
+                  (if conn (begin (ack-waiter! conn (car rs)) (hashtable-delete! pending idx)))
                   (loop (+ idx 1) (cdr rs))))))
       (set! acc '()))
 
@@ -284,7 +294,7 @@
       ; non-idempotent write double-applies (cc-cri). 'indeterminate is the
       ; truthful outcome.
       (vector-for-each
-       (lambda (conn) (send conn 'indeterminate))
+       (lambda (conn) (ack-waiter! conn 'indeterminate))
        (hashtable-values pending))
       (hashtable-clear! pending)
       ; Reads are idempotent — 'tryagain so the client safely retries against the
@@ -348,6 +358,47 @@
     (define PROPOSE-BATCH-CAP 64)
     ; the non-write message the drain stopped on, replayed before the mailbox.
     (define backlog '())
+    ; ---- follower-forwarded linearizable reads (cw-lkq.13) ----
+    ; etcd serves LINEARIZABLE reads on ANY member by forwarding to the leader
+    ; internally; clientv3 (kube-apiserver) round-robins endpoints and does NOT
+    ; retry our 'not leader' redirect on the storage-cacher path. So a follower
+    ; forwards the Range over the node mesh ('ws-fwd) to the leader, which
+    ; serves it and ships the reply back ('ws-fwd-reply); the follower relays
+    ; to the waiting local conn. fwd-pending maps request-id -> conn; entries
+    ; for lost replies (leader died mid-forward) are dropped when the client
+    ; retries (conn actors time out client-side).
+    ; entries are (conn . expiry-tick); swept every tick so a forward to a
+    ; dying/dead leader cannot wedge the asker forever (the member's gRPC actor
+    ; serializes unary calls — one lost reply would hang the whole KV API).
+    (define fwd-pending (make-eqv-hashtable))
+    (define fwd-seq 0)
+    (define fwd-ticks 0)
+    (define FWD-EXPIRE-TICKS 25)              ; ~3s at the default 120ms tick
+    (define (fwd-sweep!)
+      (set! fwd-ticks (+ fwd-ticks 1))
+      (if (> (hashtable-size fwd-pending) 0)
+          (vector-for-each
+           (lambda (id)
+             (let ((e (hashtable-ref fwd-pending id #f)))
+               (if (and e (>= fwd-ticks (cdr e)))
+                   (begin (hashtable-delete! fwd-pending id)
+                          (guard (g (#t #f)) (send (car e) 'tryagain))))))
+           (hashtable-keys fwd-pending))))
+    ; the kv-range reply payload (sendable) served from THIS replica's ctx.
+    (define (range-reply st opts)
+      (let* ((key (range-opt opts 'key (make-bytevector 0 0)))
+             (rend (range-opt opts 'range-end #f))
+             (res (mvcc-range ctx key rend opts)))
+        (if (and (pair? res) (eq? (car res) 'err-compacted))
+            (list 'kv-range-ok (mvcc-current-rev ctx) (raft-term st) 'compacted 0 '())
+            (list 'kv-range-ok (mvcc-current-rev ctx) (raft-term st) #f
+                  (car res)
+                  (map (lambda (item)
+                         (let ((uk (car item)) (rec (cdr item)))
+                           (list uk (kv-rec-value rec)
+                                 (kv-rec-create-rev rec) (kv-rec-mod-rev rec)
+                                 (kv-rec-version rec) (kv-rec-lease rec))))
+                       (cdr res))))))
     ; ---- leader-region pinning (cw-lkq.2) ----
     ; A leader OUTSIDE leader-region tries, at most once per XFER-EVERY ticks,
     ; to hand leadership (TimeoutNow) to a CAUGHT-UP voter in the preferred
@@ -649,6 +700,7 @@
             ;; and ack any pending batch before doing Raft tick work.
             ;; flush-and-drain! is a no-op when nothing is dirty / deferred.
             ((eq? (car m) 'tick)
+             (fwd-sweep!)                      ; expire wedged forwards (cw-lkq.13)
              (flush-and-drain! flush-base)
              (cond
                ((raft-leader? st)
@@ -734,23 +786,59 @@
                             ; leader's commit redirects instead of serving stale.
                             (and (> ser-max-lag 0)
                                  (> (- (raft-commit st) (raft-applied st)) ser-max-lag))))
-                   (send conn 'tryagain)
-                   (let* ((key (range-opt opts 'key (make-bytevector 0 0)))
-                          (rend (range-opt opts 'range-end #f))
-                          (res (mvcc-range ctx key rend opts)))
-                     (if (and (pair? res) (eq? (car res) 'err-compacted))
-                         (send conn (list 'kv-range-ok (mvcc-current-rev ctx)
-                                          (raft-term st) 'compacted 0 '()))
-                         (send conn
-                               (list 'kv-range-ok (mvcc-current-rev ctx) (raft-term st) #f
-                                     (car res)
-                                     (map (lambda (item)
-                                            (let ((uk (car item)) (rec (cdr item)))
-                                              (list uk (kv-rec-value rec)
-                                                    (kv-rec-create-rev rec) (kv-rec-mod-rev rec)
-                                                    (kv-rec-version rec) (kv-rec-lease rec))))
-                                          (cdr res))))))) )
+                   ; cw-lkq.13: forward a linearizable read to the KNOWN leader
+                   ; instead of erroring (etcd parity); no known leader -> the
+                   ; original 'tryagain redirect.
+                   (if (and leader (not (eqv? leader node-name)))
+                       (begin
+                         (set! fwd-seq (+ fwd-seq 1))
+                         (hashtable-set! fwd-pending fwd-seq
+                                         (cons conn (+ fwd-ticks FWD-EXPIRE-TICKS)))
+                         (guard (e (#t (hashtable-delete! fwd-pending fwd-seq)
+                                       (send conn 'tryagain)))
+                           (node-send (symbol->string node-name) (symbol->string leader)
+                                      (list 'ws-fwd shard-key node-name fwd-seq opts))))
+                       (send conn 'tryagain))
+                   (send conn (range-reply st opts))))
              (loop st leader elapsed flush-base))
+
+            ;; ---- forwarded WRITE, leader side (cw-lkq.13) ----
+            ;; Re-enter the client-command path with a (fwd ORIGIN . ID) stand-in
+            ;; as the waiter: propose/batch/ack machinery is identical; the ack
+            ;; (or 'indeterminate on stepdown) rides ws-fwd-reply home. A
+            ;; non-leader bounces 'tryagain straight back.
+            ((eq? (car m) 'fwd-write)
+             (let ((origin (cadr m)) (id (caddr m)) (cmd (cadddr m)))
+               (if (not (raft-leader? st))
+                   (begin
+                     (guard (e (#t #f))
+                       (node-send (symbol->string node-name) (symbol->string origin)
+                                  (list 'ws-fwd-reply shard-key node-name id 'tryagain)))
+                     (loop st leader elapsed flush-base))
+                   ; replay through the normal client-write path via backlog so
+                   ; the group-commit drain handles it uniformly.
+                   (begin
+                     (set! backlog (append backlog
+                                           (list (cons (cons 'fwd (cons origin id)) cmd))))
+                     (loop st leader elapsed flush-base)))))
+
+            ;; ---- forwarded linearizable read, leader side (cw-lkq.13) ----
+            ;; (fwd-range ORIGIN-NODE ID OPTS): serve from OUR ctx iff we lead,
+            ;; else bounce 'tryagain back; the reply rides 'ws-fwd-reply home.
+            ((eq? (car m) 'fwd-range)
+             (let ((origin (cadr m)) (id (caddr m)) (opts (cadddr m)))
+               (let ((payload (if (raft-leader? st) (range-reply st opts) 'tryagain)))
+                 (guard (e (#t #f))
+                   (node-send (symbol->string node-name) (symbol->string origin)
+                              (list 'ws-fwd-reply shard-key node-name id payload))))
+               (loop st leader elapsed flush-base)))
+            ;; ---- forwarded read reply, origin side (cw-lkq.13) ----
+            ((eq? (car m) 'fwd-reply)
+             (let* ((id (caddr m)) (payload (cadddr m))
+                    (e (hashtable-ref fwd-pending id #f)))
+               (if e (begin (hashtable-delete! fwd-pending id)
+                            (guard (g (#t #f)) (send (car e) payload))))
+               (loop st leader elapsed flush-base)))
 
             ;; ---- KV prev-kv seam: (kv-prev CONN KEY) -> the key's CURRENT live record
             ;; (cw-u4a.22).  etcd Put/DeleteRange prev_kv returns the value BEFORE the op;
@@ -1185,7 +1273,23 @@
              (let ((conn (cadr m)))
                (cond
                  ((not (raft-leader? st))
-                  (send conn 'tryagain) (loop st leader elapsed flush-base))
+                  ; cw-lkq.13: forward the WRITE to the known leader (etcd
+                  ; serves writes via any member); unknown leader -> redirect.
+                  ; A FWD STAND-IN landing here (leadership flipped between
+                  ; backlog push and processing) bounces 'tryagain to origin.
+                  (cond
+                    ((and (pair? conn) (eq? (car conn) 'fwd))
+                     (ack-waiter! conn 'tryagain))
+                    ((and leader (not (eqv? leader node-name)))
+                     (set! fwd-seq (+ fwd-seq 1))
+                     (hashtable-set! fwd-pending fwd-seq
+                                     (cons conn (+ fwd-ticks FWD-EXPIRE-TICKS)))
+                     (guard (e (#t (hashtable-delete! fwd-pending fwd-seq)
+                                   (send conn 'tryagain)))
+                       (node-send (symbol->string node-name) (symbol->string leader)
+                                  (list 'ws-fwd-write shard-key node-name fwd-seq cmd))))
+                    (else (send conn 'tryagain)))
+                  (loop st leader elapsed flush-base))
                  (solo
                   (send conn (cons 'read-ok (raft-applied st)))
                   (loop st leader elapsed flush-base))
@@ -1212,7 +1316,23 @@
              (let* ((conn (car m)) (cmd (cdr m)))
                (cond
                  ((not (raft-leader? st))
-                  (send conn 'tryagain) (loop st leader elapsed flush-base))
+                  ; cw-lkq.13: forward the WRITE to the known leader (etcd
+                  ; serves writes via any member); unknown leader -> redirect.
+                  ; A FWD STAND-IN landing here (leadership flipped between
+                  ; backlog push and processing) bounces 'tryagain to origin.
+                  (cond
+                    ((and (pair? conn) (eq? (car conn) 'fwd))
+                     (ack-waiter! conn 'tryagain))
+                    ((and leader (not (eqv? leader node-name)))
+                     (set! fwd-seq (+ fwd-seq 1))
+                     (hashtable-set! fwd-pending fwd-seq
+                                     (cons conn (+ fwd-ticks FWD-EXPIRE-TICKS)))
+                     (guard (e (#t (hashtable-delete! fwd-pending fwd-seq)
+                                   (send conn 'tryagain)))
+                       (node-send (symbol->string node-name) (symbol->string leader)
+                                  (list 'ws-fwd-write shard-key node-name fwd-seq cmd))))
+                    (else (send conn 'tryagain)))
+                  (loop st leader elapsed flush-base))
                  (else
                   (let ((old (raft-applied st)))
                     (let drain ((stx st) (conn conn) (cmd cmd) (n 1))

@@ -197,9 +197,16 @@
   (let ((n (string->number (arg-after "--tick-ms" "120")))) (if (and n (> n 0)) n 120)))
 (define election-ticks
   (let ((n (string->number (arg-after "--election-ticks" "4")))) (if (and n (> n 0)) n 4)))
+; ---- leader-region pinning (cw-lkq.2) ----
+; --leader-region REGION: a leader OUTSIDE this region transfers leadership
+; (TimeoutNow, cw-u4a.42) to a caught-up voter IN it — rate-limited, no-op when
+; no preferred voter is caught up (e.g. the region is down). Region per member
+; comes from the cluster spec's 5th field / --locality (cw-lkq.7).
+(define leader-region (arg-after "--leader-region" #f))
+(define region-map (map (lambda (n) (cons (car n) (list-ref n 4))) nodes))
 (spawn-source-dedicated "(include \"src/server/shard-actor.scm\")" 'shard-main
               "0" shard-voters me (string-append dbbase "-shard0") durable apply-shards
-              election-ticks)
+              election-ticks leader-region region-map)
 
 (define dial-addrs (map raft-addr dial-peers))
 ; Dedicated thread — the poller is the Raft tick-clock AND sole network drainer;

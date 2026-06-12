@@ -62,12 +62,19 @@
 ;     = the poller's tick-ms, so election-timeout-ms = tick-ms * (base+stagger)
 ;     — etcd's --election-timeout analogue. CheckQuorum + the PreVote grant
 ;     gate use the same value, so WAN profiles scale all three together.
+;   3 (cw-lkq.2)  leader-region: preferred leader region string, or #f.
+;   4 (cw-lkq.2)  region-map: ((node-name . region-or-#f) ...) for all members.
 (define (shard-main shard-key voters node-name db-path sync? . rest)
   (let* ((n-apply-workers (if (and (pair? rest) (number? (car rest)) (> (car rest) 0))
                               (car rest) 1))
          (election-base (if (and (pair? rest) (pair? (cdr rest))
                                  (number? (cadr rest)) (> (cadr rest) 0))
                             (cadr rest) 4))
+         (leader-region (if (and (pair? rest) (pair? (cdr rest)) (pair? (cddr rest))
+                                 (string? (list-ref rest 2)))
+                            (list-ref rest 2) #f))
+         (region-map (if (and (pair? rest) (>= (length rest) 4) (list? (list-ref rest 3)))
+                         (list-ref rest 3) '()))
          (handle  (store-open db-path #t))      ; create-if-missing
          (ctx     (make-ctx handle "default" sync?))
          (apply-workers
@@ -337,6 +344,35 @@
     (define PROPOSE-BATCH-CAP 64)
     ; the non-write message the drain stopped on, replayed before the mailbox.
     (define backlog '())
+    ; ---- leader-region pinning (cw-lkq.2) ----
+    ; A leader OUTSIDE leader-region tries, at most once per XFER-EVERY ticks,
+    ; to hand leadership (TimeoutNow) to a CAUGHT-UP voter in the preferred
+    ; region. raft-transfer-leadership refuses self/non-voter/not-caught-up, so
+    ; a down or lagging preferred region is a harmless no-op (leadership stays
+    ; where it is — availability over placement). No ping-pong: only an
+    ; out-of-region leader initiates, and a preferred-region leader never does.
+    (define XFER-EVERY 25)                  ; ticks between attempts (~3s at 120ms)
+    (define xfer-ticks 0)
+    (define (region-of n) (let ((hit (assv n region-map))) (and hit (cdr hit))))
+    (define (maybe-transfer-home! st)
+      (if (and leader-region
+               (raft-leader? st)
+               (not (equal? (region-of node-name) leader-region)))
+          (begin
+            (set! xfer-ticks (+ xfer-ticks 1))
+            (if (>= xfer-ticks XFER-EVERY)
+                (begin
+                  (set! xfer-ticks 0)
+                  (let try ((vs (aget st 'voters)))
+                    (cond
+                      ((null? vs) #f)        ; no caught-up preferred voter — stay
+                      ((and (not (eqv? (car vs) node-name))
+                            (equal? (region-of (car vs)) leader-region))
+                       (let ((r (raft-transfer-leadership st (car vs))))
+                         (if (eq? (car r) 'ok)
+                             (emit! (cadr r))
+                             (try (cdr vs)))))
+                      (else (try (cdr vs))))))))))
     ; fsync the batch, then ack every buffered waiter from `base`.
     (define (flush-and-drain! base)
       (ctx-flush! ctx)
@@ -619,6 +655,7 @@
                   (if (raft-leader? cq)
                       (let ((r (raft-tick cq)))
                         (emit! (cdr r))
+                        (maybe-transfer-home! (car r))
                         ; Lease expiry (cw-u4a.17, ADR 0003 §2): RIDES this same tick.
                         ; Seed/re-derive deadlines + propose ("LEASE-REVOKE" id) for any
                         ; expired lease.  propose-internal! threads the state + emits the

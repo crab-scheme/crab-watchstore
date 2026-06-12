@@ -51,7 +51,11 @@
          (if pid (send pid (list 'fwd-range (caddr frame) (cadddr frame) (car (cddddr frame)))))))
       ((eq? (car frame) 'ws-fwd-reply)
        (let ((pid (local-pid (cadr frame))))
-         (if pid (send pid (list 'fwd-reply (caddr frame) (cadddr frame) (car (cddddr frame)))))))))
+         (if pid (send pid (list 'fwd-reply (caddr frame) (cadddr frame) (car (cddddr frame)))))))
+      ; store-snapshot catch-up (cw-lkq.15): leader -> below-floor follower
+      ((eq? (car frame) 'ws-snap)
+       (let ((pid (local-pid (cadr frame))))
+         (if pid (send pid (list 'snap-install (caddr frame) (cadddr frame))))))))
   (define (tick-all!)
     (for-each (lambda (sk) (let ((p (local-pid sk))) (if p (send p (list 'tick)))))
               shard-keys))

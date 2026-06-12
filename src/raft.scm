@@ -91,7 +91,12 @@
         ; ReadIndex: `rseq` = monotone read-sequence stamped on every AE and echoed
         ; in the AER, so the leader counts only confirmation acks that reply to a
         ; heartbeat sent AFTER a read was issued (Raft §6.4 freshness).
-        (cons 'heard '()) (cons 'q-ticks 0) (cons 'pre-votes '()) (cons 'rseq 0)))
+        (cons 'heard '()) (cons 'q-ticks 0) (cons 'pre-votes '()) (cons 'rseq 0)
+        ; snap-req: peers a leader must catch up with a STORE snapshot — they
+        ; rejected AppendEntries at the compaction floor (base+1), so no log
+        ; replay can reach them (cw-lkq.15). The hosting actor ships ws-snap
+        ; and clears this via raft-clear-snap-req.
+        (cons 'snap-req '())))
 
 (define (raft-id st)      (aget st 'id))
 (define (raft-role st)    (aget st 'role))
@@ -110,6 +115,32 @@
 (define (last-log-term st) (entry-term st (log-len st)))
 (define (entries-from st i)                               ; i in base+1..len+1
   (list-tail (aget st 'log) (- i (aget st 'base) 1)))
+
+(define (drop-at-most lst n)                              ; list-tail, short-list safe
+  (if (or (<= n 0) (null? lst)) lst (drop-at-most (cdr lst) (- n 1))))
+
+; ---- multi-voter log compaction + snapshot install (cw-lkq.15) ----
+;
+; raft-compact-to: drop in-memory entries <= floor (their effects are applied in
+; the store, which IS the snapshot). Pure; no-op unless base < floor <= applied.
+; Absolute indexing is preserved (base advances with the same offset helpers
+; above), so pending/conf bookkeeping keyed by absolute index is unaffected.
+(define (raft-compact-to st floor)
+  (let ((b (aget st 'base)))
+    (if (or (<= floor b) (> floor (aget st 'applied))) st
+        (aset* st (list 'base floor
+                        'base-term (entry-term st floor)
+                        'log (list-tail (aget st 'log) (- floor b)))))))
+
+; raft-install-snapshot: a follower adopts a leader's store snapshot at `base`
+; (its log can no longer be reconciled below the leader's compaction floor).
+; The caller must have already replaced the persistent store contents.
+(define (raft-install-snapshot st base term)
+  (aset* st (list 'base base 'base-term term 'log '()
+                  'commit base 'applied base 'sm base 'role 'follower)))
+
+(define (raft-snap-requests st) (aget st 'snap-req))
+(define (raft-clear-snap-req st) (aset st 'snap-req '()))
 
 ; Legacy fixed-config majority (count threshold), still used by the actor
 ; (shard-actor) and PreVote/ReadIndex tallies, which only ever run a SIMPLE config
@@ -246,8 +277,23 @@
           (take-at-most (entries-from st nx) AE-MAX-ENTRIES)
           (aget st 'commit) (aget st 'rseq))))  ; +rseq (ReadIndex)
 
+; Broadcast AppendEntries to every peer whose next is still serveable from the
+; in-memory log. A peer with next <= base (compaction advanced past it while it
+; lagged — cw-lkq.15) CANNOT be served entries (entries-from would take a
+; negative list-tail): route it to snap-req for a store-snapshot catch-up
+; instead of an AE. After installing, the follower acks (aer #t base), which
+; advances its next past base and ordinary AEs resume.
 (define (broadcast-append st)
-  (cons st (map (lambda (p) (cons p (append-for st p))) (aget st 'peers))))
+  (let* ((b (aget st 'base))
+         (nxt (aget st 'next)))
+    (let part ((ps (aget st 'peers)) (fresh '()) (sr (aget st 'snap-req)))
+      (if (pair? ps)
+          (let ((p (car ps)))
+            (if (> (cdr (assq p nxt)) b)
+                (part (cdr ps) (cons p fresh) sr)
+                (part (cdr ps) fresh (add-mem p sr))))
+          (cons (aset st 'snap-req sr)
+                (map (lambda (p) (cons p (append-for st p))) fresh))))))
 
 (define (become-leader st)
   ; §5.4.2 / §6.4 no-op barrier: a fresh leader appends an empty entry in its OWN
@@ -506,6 +552,13 @@
           (if (not ok)
               (cons st (list (cons leader (list 'aer (aget st 'term) #f 0 rseq))))
               (let* ((b (aget st 'base))
+                     ; A stale/in-flight AE may start BELOW our base (we compacted
+                     ; past it, or just installed a snapshot): entries <= base are
+                     ; already applied — skip them and splice from base, so `log`
+                     ; keeps holding exactly base+1.. (cw-lkq.15).
+                     (skip (if (< pidx b) (- b pidx) 0))
+                     (entries (drop-at-most entries skip))
+                     (pidx (+ pidx skip))
                      (kept (take-n (aget st 'log) (- pidx b)))   ; keep base+1..pidx
                      (newlog (append kept entries))
                      (midx (+ pidx (length entries)))
@@ -543,11 +596,23 @@
        ; are compacted into the snapshot, so entries-from/append-for cannot serve
        ; them (a negative list-tail index -> crash; bug cw-u4a.39). Clamp to base+1;
        ; the follower re-syncs from base+1 (all voters compact to the same base).
-       (let* ((nx (cdr (assq from (aget st 'next))))
-              (st (aset* st (list 'next (aset (aget st 'next) from
-                                              (max (+ (aget st 'base) 1) (- nx 1)))
-                                  'heard (add-mem from (aget st 'heard))))))
-         (cons st (list (cons from (append-for st from)))))))))
+       (let ((nx (cdr (assq from (aget st 'next))))
+             (b  (aget st 'base)))
+         (if (and (> b 0) (= nx (+ b 1)))
+             ; next was ALREADY at the floor, so the peer rejected an AE with
+             ; prev = base — it lacks (or disagrees below) our compaction floor,
+             ; and the log holds nothing earlier to walk back to: only a STORE
+             ; snapshot can catch it up (cw-lkq.15). Mark it for the hosting
+             ; actor (ws-snap); resending the same AE would reject forever.
+             ; (A reject with next still BELOW the floor — a stale walk-back —
+             ; clamps to base+1 and tries the floor AE first, as before.)
+             (cons (aset* st (list 'snap-req (add-mem from (aget st 'snap-req))
+                                   'heard (add-mem from (aget st 'heard))))
+                   '())
+             (let ((st (aset* st (list 'next (aset (aget st 'next) from
+                                                   (max (+ b 1) (- nx 1)))
+                                       'heard (add-mem from (aget st 'heard))))))
+               (cons st (list (cons from (append-for st from)))))))))))
 
 ; ============================================================
 ; deterministic in-Scheme cluster simulator (Article III: prove it)

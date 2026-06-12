@@ -370,10 +370,50 @@
     ; entries are (conn . expiry-tick); swept every tick so a forward to a
     ; dying/dead leader cannot wedge the asker forever (the member's gRPC actor
     ; serializes unary calls — one lost reply would hang the whole KV API).
+    (define snap-accum #f)        ; in-flight inbound snapshot (BASE TERM ROWS) | #f
     (define fwd-pending (make-eqv-hashtable))
     (define fwd-seq 0)
     (define fwd-ticks 0)
     (define FWD-EXPIRE-TICKS 25)              ; ~3s at the default 120ms tick
+    ; ---- snapshot shipping, leader side (cw-lkq.15) ----
+    ; The engine marks (snap-req) any peer that rejected AppendEntries at the
+    ; compaction floor — log replay can no longer reach it. Ship the FULL store
+    ; (raw rows, byte-level replica) + applied index/term over the mesh; the
+    ; follower installs it and the next heartbeat's AE lands at its new base.
+    ; Rate-limited per peer so a down/slow peer doesn't draw a snapshot per AER.
+    (define snap-last (make-eqv-hashtable))
+    (define SNAP-MIN-TICKS 50)
+    ; Rows go in BOUNDED chunks (one giant frame both risks the transport and
+    ; recurses message (de)serialization thousands of conses deep — a wiped
+    ; rejoiner's install aborted on a literal stack overflow before chunking).
+    ; The mesh is ordered per sender, so begin/rows.../end arrive in sequence.
+    (define SNAP-CHUNK-ROWS 200)
+    (define (snap-send! p payload)
+      (guard (e (#t #f))
+        (node-send (symbol->string node-name) (symbol->string p)
+                   (list 'ws-snap shard-key node-name payload))))
+    (define (ship-snaps! st)
+      (let ((reqs (raft-snap-requests st)))
+        (if (null? reqs) st
+            (begin
+              (for-each
+               (lambda (p)
+                 (let ((last (hashtable-ref snap-last p (- 0 SNAP-MIN-TICKS))))
+                   (if (>= (- fwd-ticks last) SNAP-MIN-TICKS)
+                       (begin
+                         (hashtable-set! snap-last p fwd-ticks)
+                         (snap-send! p (list 'begin (raft-applied st)
+                                             (entry-term st (raft-applied st))))
+                         (let chunk ((rows (kv-scan ctx (make-bytevector 0))))
+                           (if (pair? rows)
+                               (let split ((n SNAP-CHUNK-ROWS) (r rows) (acc '()))
+                                 (if (or (= n 0) (null? r))
+                                     (begin (snap-send! p (list 'rows (reverse acc)))
+                                            (chunk r))
+                                     (split (- n 1) (cdr r) (cons (car r) acc))))))
+                         (snap-send! p (list 'end))))))
+               reqs)
+              (raft-clear-snap-req st)))))
     (define (fwd-sweep!)
       (set! fwd-ticks (+ fwd-ticks 1))
       (if (> (hashtable-size fwd-pending) 0)
@@ -457,17 +497,26 @@
         (else
          (if flush-base (flush-and-drain! flush-base) (drain! old))
          #f)))
-    ; solo log compaction (RocksDB is the snapshot); no-op for multi-voter.
-    ; NEVER compact while acks are deferred: `pending` is keyed by absolute log
-    ; index and compaction resets the log to 0, which would collide the next
-    ; proposal's index with an undrained one. flush-base = #f means every applied
-    ; entry's ack has been drained, so compaction is safe then.
+    ; Log compaction (RocksDB is the snapshot). NEVER compact while acks are
+    ; deferred: `pending` is keyed by absolute log index — flush-base = #f means
+    ; every applied entry's ack has been drained, so compaction is safe then.
+    ;   solo:        compact fully once applied == log-len (original behavior).
+    ;   multi-voter: keep the last COMPACT-KEEP applied entries for ordinary
+    ;     catch-up and drop everything older (cw-lkq.15). Without this the log
+    ;     grows O(total writes) and every propose's full-log copy makes the
+    ;     cluster melt O(N²) under sustained load (the WAN kube-apiserver
+    ;     collapse: GiBs of RSS, 200% CPU, tick starvation, election churn).
+    ;     A peer that falls below the floor is caught up with a STORE snapshot
+    ;     (ws-snap) instead of log replay — see ship-snaps! below.
+    (define COMPACT-KEEP 1024)
     (define (compact st)
-      (if (and solo (= (raft-applied st) (log-len st)))
-          (aset* st (list 'base (raft-applied st)
-                          'base-term (last-log-term st)
-                          'log '()))
-          st))
+      (if solo
+          (if (= (raft-applied st) (log-len st))
+              (aset* st (list 'base (raft-applied st)
+                              'base-term (last-log-term st)
+                              'log '()))
+              st)
+          (raft-compact-to st (- (raft-applied st) COMPACT-KEEP))))
     (define (maybe-compact st flush-base)
       (if flush-base st (compact st)))
     ; node-qualified table keys ("node:shard") so the in-process sim (all replicas
@@ -651,7 +700,7 @@
                                  flush-base))
                          (old (raft-applied st))
                          (old-loglen (log-len st))          ; cw-u4a.29: detect an auto-appended Cnew
-                         (r (raft-step st from rpc)) (st2 (car r)))
+                         (r (raft-step st from rpc)) (st2 (ship-snaps! (car r))))
                     ; leader -> follower: 'indeterminate the remaining (now
                     ; uncommitted) in-flight proposals + clear pending, before any
                     ; drain! can cross-wire them (H1).
@@ -701,6 +750,10 @@
             ;; flush-and-drain! is a no-op when nothing is dirty / deferred.
             ((eq? (car m) 'tick)
              (fwd-sweep!)                      ; expire wedged forwards (cw-lkq.13)
+             ; cw-lkq.15: long-lived server actors accumulate cyclic garbage the
+             ; Rc heap can't free — sweep the (thread-local) cycle registry
+             ; periodically. No-op on builds without tracing-cycle-collector.
+             (if (= 0 (modulo fwd-ticks 16)) (collect-garbage))
              (flush-and-drain! flush-base)
              (cond
                ((raft-leader? st)
@@ -832,6 +885,58 @@
                    (node-send (symbol->string node-name) (symbol->string origin)
                               (list 'ws-fwd-reply shard-key node-name id payload))))
                (loop st leader elapsed flush-base)))
+            ;; ---- snapshot install, follower side (cw-lkq.15) ----
+            ;; ('snap-install FROM ('begin BASE TERM) | ('rows CHUNK) | ('end)):
+            ;; the leader compacted past our log position; adopt a byte-level
+            ;; replica of its store at BASE (raw rows span every namespace incl.
+            ;; MVCC history + REV-CF, so local watchers replay the jumped window
+            ;; from the installed history). Chunks accumulate in snap-accum and
+            ;; install on 'end. Stale/duplicate offers (base <= our applied) and
+            ;; offers while WE lead are ignored; a fresh 'begin discards any
+            ;; partial transfer (the leader re-ships whole).
+            ((eq? (car m) 'snap-install)
+             (let ((payload (caddr m)))
+               (cond
+                 ((eq? (car payload) 'begin)
+                  (let ((sbase (cadr payload)) (sterm (caddr payload)))
+                    (set! snap-accum
+                          (if (or (raft-leader? st) (<= sbase (raft-applied st)))
+                              #f                       ; stale offer — swallow its chunks
+                              (list sbase sterm '())))
+                    (loop st leader elapsed flush-base)))
+                 ((eq? (car payload) 'rows)
+                  (if snap-accum
+                      (set-car! (cddr snap-accum)
+                                (append (caddr snap-accum) (cadr payload))))
+                  (loop st leader elapsed flush-base))
+                 ((and (eq? (car payload) 'end) snap-accum)
+                  (let ((sbase (car snap-accum)) (sterm (cadr snap-accum))
+                        (rows (caddr snap-accum))
+                        (pre (mvcc-current-rev ctx)))
+                    (set! snap-accum #f)
+                    (if flush-base (flush-and-drain! flush-base))
+                    (flush-materializations!)
+                    (for-each (lambda (kv) (kv-del! ctx (car kv)))
+                              (kv-scan ctx (make-bytevector 0)))
+                    (for-each (lambda (kv) (kv-put! ctx (car kv) (cdr kv))) rows)
+                    (ctx-save-applied! ctx sbase sterm)
+                    (ctx-flush! ctx)
+                    (if (> (reg-count watch-reg) 0)
+                        (begin
+                          (watch-on-apply! watch-reg ctx pre (mvcc-current-rev ctx))
+                          (watch-check-compaction! watch-reg ctx)))
+                    (let ((st2 (raft-install-snapshot st sbase sterm)))
+                      ; ack the installed position to the sender (an ordinary
+                      ; AER success at base): its next advances past its
+                      ; compaction floor and ordinary AEs resume — without this
+                      ; the leader would keep filtering us out of broadcasts
+                      ; (next <= base) and re-shipping snapshots forever.
+                      (emit! (list (cons (cadr m)
+                                         (list 'aer (raft-term st2) #t sbase 0))))
+                      (publish! st2 (cadr m))
+                      (loop st2 (cadr m) 0 #f))))
+                 (else (loop st leader elapsed flush-base)))))
+
             ;; ---- forwarded read reply, origin side (cw-lkq.13) ----
             ((eq? (car m) 'fwd-reply)
              (let* ((id (caddr m)) (payload (cadddr m))

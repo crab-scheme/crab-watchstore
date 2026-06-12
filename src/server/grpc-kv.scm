@@ -1535,7 +1535,13 @@
   ; ===========================================================================
   ; main loop: pure mailbox dispatch (unary inline + stream routing)
   ; ===========================================================================
+  (define gc-msg-count 0)
   (let loop ()
+    ; cw-lkq.15: this dispatcher allocates heavily per request (pb decode/encode);
+    ; cyclic garbage is only reclaimed by an explicit cycle-registry sweep on THIS
+    ; thread. No-op on builds without tracing-cycle-collector.
+    (set! gc-msg-count (+ gc-msg-count 1))
+    (if (= 0 (modulo gc-msg-count 512)) (collect-garbage))
     (let ((m (next-message)))
       (cond
         ((not (pair? m)) (loop))

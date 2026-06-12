@@ -44,10 +44,20 @@
   (define (tick-all!)
     (for-each (lambda (sk) (let ((p (local-pid sk))) (if p (send p (list 'tick)))))
               shard-keys))
-  (let loop ((i 0))
-    (let ((msgs (node-poll (symbol->string node-name))))
-      (for-each route! msgs)
-      (cond
-        ((>= i tick-every) (tick-all!) (heal!) (loop 0))
-        ((null? msgs) (yield) (loop (+ i 1)))
-        (else (loop (+ i 1)))))))
+  ; TICK PACING (cw-b5w.7): WALL-CLOCK, not iteration-count. The original
+  ; "tick after TICK-EVERY idle iterations" implicitly assumed (yield) costs
+  ; ~1ms; on current crabscheme yield is essentially free, so the tick clock
+  ; ran ~100x fast (measured ~700-1000 ticks/s), the 4-tick election timeout
+  ; became ~5ms, and idle clusters churned elections continuously (terms
+  ; +2-4/s). TICK-EVERY is now the tick interval in MILLISECONDS (callers
+  ; already pass 120). The drain/yield structure is unchanged — the loop still
+  ; spins draining frames; only tick emission is time-gated.
+  (let ((tick-secs (/ tick-every 1000.0)))
+    (let loop ((last (current-second)))
+      (let ((msgs (node-poll (symbol->string node-name))))
+        (for-each route! msgs)
+        (let ((now (current-second)))
+          (cond
+            ((>= (- now last) tick-secs) (tick-all!) (heal!) (loop now))
+            ((null? msgs) (yield) (loop last))
+            (else (loop last))))))))

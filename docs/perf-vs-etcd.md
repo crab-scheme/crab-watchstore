@@ -70,14 +70,15 @@ sustained it at acceptable tail latency. So a PASS means *"sustained the target 
 |---|---|---|
 | `s` (~150 w/s, 50 clients)  | **PASS** · 150 w/s  | **PASS** · 151 w/s |
 | `m` (~1000 w/s, 200 clients) | **PASS** · 1000 w/s · slowest 0.063 s | **PASS** · 1000 w/s |
-| `l` (~8000 w/s, 500 clients) | **PASS** · 7935 w/s · slowest 0.075 s | **FAIL** — sustains **~2,700 w/s** (slowest 0.245 s) |
+| `l` (~8000 w/s, 500 clients) | **PASS** · 7935 w/s · slowest 0.075 s | **FAIL** — sustains **~1,200 w/s** (see correction) |
 
 **2026-06-11, after the cw-b5w perf epic** (the original cw-u4a.36 run did not sustain
 `load=m`; see history below). crab-watchstore now **PASSes `load=m`** — measured solo it
 holds 1000 w/s with a **37 ms** worst case (etcd's same-day solo tail: ~40–63 ms) — and at
 `load=l` pressure it sustains **~2,700 w/s** against the 8,000 target (`bench/ladder-cws.sh`,
-three runs 1.9k–2.7k). The sustained-write gap to etcd is now **~3×**, down from ~8×+
-pre-epic. Tail-latency numbers in the combined back-to-back run above are noisier than the
+three runs 1.9k–2.7k). The sustained-write gap to etcd is **~6–7×**, down from ~8×+ pre-epic
+(see the cw-b5w.7 correction below — the interim ~2.7k/~3× figure was inflated by a
+broken Raft tick clock). Tail-latency numbers in the combined back-to-back run above are noisier than the
 solo measurements (both servers + population phases share the box); the solo ladder + the
 profiling doc (`docs/perf-profile-load-m.md`) carry the clean per-level tails.
 
@@ -89,8 +90,17 @@ What moved it (the cw-b5w epic):
 3. **cw-b5w.3** — group commit (one AE/commit/settle round per mailbox batch of up to 64
    proposals): 2.7k w/s and the `load=m` tail collapsed 124 ms → 37 ms.
 4. **cw-b5w.4** — parallel apply workers (ADR 0005 B) shipped + proven correct, but
-   **regressed** `load=l` on darwin-arm64 (2.7k → 1.6k: barrier round-trips + the
-   SingleThreaded-RocksDB mutex), so the default stays `--shards 1`; retune issue open.
+   regressed `load=l` on darwin-arm64 (barrier round-trips + the SingleThreaded-RocksDB
+   mutex), so the default stays `--shards 1`; retune issue open.
+
+**Correction (cw-b5w.7):** every number measured between cw-b5w.3 and the tick fix ran
+on a broken Raft tick clock (idle-iteration-paced; ~700–1000 ticks/s instead of 8/s),
+which churned multi-node elections AND acted as an accidental commit pump on the ladder.
+With wall-clock ticks (the fix): `load=m` still PASSES (989 w/s, slowest 0.42 s) and
+`load=l` sustains **~1,180 w/s** — the honest post-epic single-node ceiling. Batch-cap
+sweep: 64 ≫ 8 (454 w/s), so group commit itself is real and kept; the extra ~1.5k w/s
+under the flood was the artifact. Idle 3-node clusters now hold term 1 indefinitely
+(previously +2–4 terms/s).
 
 Historical (cw-u4a.36, pre-epic): `s` PASS (slowest 13 ms vs etcd 24 ms), `m` did not
 sustain, `l` skipped — i.e. a single-node ceiling between 150 and 1000 w/s.

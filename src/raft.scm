@@ -201,7 +201,15 @@
 (define (sync-progress st)
   (if (not (raft-leader? st)) st
       (let ((nx (aget st 'next)) (mt (aget st 'match)) (peers (aget st 'peers))
-            (dflt (+ 1 (log-len st))))
+            ; A NEWLY-added peer starts at next = base+1 (the snapshot floor),
+            ; NOT log-len+1: a wiped rejoiner's first AppendEntries then ships
+            ; the full tail in ONE round. Seeding at the log head made it walk
+            ; next back ONE PER REJECT round-trip — under concurrent writes the
+            ; log grows while next decrements, so catch-up could stall forever
+            ; (cw-lkq.14; user-approved consensus-core change, 2026-06-12).
+            ; A non-wiped joiner receives a redundant-but-correct prefix (the
+            ; consistency check truncates/overlays identically — idempotent).
+            (dflt (+ 1 (aget st 'base))))
         (aset* st (list
           'next  (map (lambda (p) (cons p (assq-def p nx dflt))) peers)
           'match (map (lambda (p) (cons p (assq-def p mt 0)))   peers))))))
@@ -221,11 +229,22 @@
 ; leader replication helpers
 ; ============================================================
 
+; Cap entries per AppendEntries (etcd's max-size-per-msg analogue): a freshly
+; added member is seeded at next = base+1 (cw-lkq.14), so its first AE would
+; otherwise carry the ENTIRE log — thousands of entries in one transport frame,
+; which can fail outright and stall catch-up forever. Bounded batches pipeline:
+; each AER advances next by the batch, the next heartbeat ships the next slice.
+(define AE-MAX-ENTRIES 256)
+(define (take-at-most lst n)
+  (let loop ((l lst) (n n) (acc '()))
+    (if (or (null? l) (= n 0)) (reverse acc)
+        (loop (cdr l) (- n 1) (cons (car l) acc)))))
 (define (append-for st peer)
   (let* ((nx (cdr (assq peer (aget st 'next))))
          (prev (- nx 1)))
     (list 'ae (aget st 'term) (aget st 'id) prev (entry-term st prev)
-          (entries-from st nx) (aget st 'commit) (aget st 'rseq))))  ; +rseq (ReadIndex)
+          (take-at-most (entries-from st nx) AE-MAX-ENTRIES)
+          (aget st 'commit) (aget st 'rseq))))  ; +rseq (ReadIndex)
 
 (define (broadcast-append st)
   (cons st (map (lambda (p) (cons p (append-for st p))) (aget st 'peers))))

@@ -1,0 +1,196 @@
+# deploy/k8s/cws-members.yaml — 3-region crab-watchstore on Kubernetes (gtr).
+#
+# Mirrors deploy/docker/docker-compose.yml + wan.override.yml as native k8s, but
+# registry-free: members run stock debian:bookworm-slim and the artifact bundle
+# (amd64 crabscheme + src + bin) is delivered into each pod via `kubectl cp`
+# (see deploy/k8s/deploy.sh). Bootstrap waits for /opt/cws/.ready, injects tc
+# netem (75ms egress => ~150ms RTT, needs NET_ADMIN), then execs the launcher.
+#
+#   - 3 member Deployments cws-a/b/c = regions us-east/eu-west/ap-south
+#   - 3 HEADLESS Services (clusterIP: None, publishNotReadyAddresses) so each
+#     name `cws-X` resolves to that member's POD IP (the member binds the
+#     address from its --cluster row, so it must be the pod IP, not a VIP).
+#   - leader pinned us-east; Raft timing widened (tick 250ms, 8 election ticks).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cws-conf
+  namespace: cws-geo
+data:
+  a.conf: |
+    node     a
+    db       /data/a
+    durable  yes
+    cluster  a:cws-a:7001:2379:us-east,b:cws-b:7001:2379:eu-west,c:cws-c:7001:2379:ap-south
+  b.conf: |
+    node     b
+    db       /data/b
+    durable  yes
+    cluster  a:cws-a:7001:2379:us-east,b:cws-b:7001:2379:eu-west,c:cws-c:7001:2379:ap-south
+  c.conf: |
+    node     c
+    db       /data/c
+    durable  yes
+    cluster  a:cws-a:7001:2379:us-east,b:cws-b:7001:2379:eu-west,c:cws-c:7001:2379:ap-south
+  bootstrap.sh: |
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y --no-install-recommends libstdc++6 ca-certificates curl bash iproute2 procps >/dev/null
+    echo ">> bootstrap: deps ready, waiting for artifact bundle (/opt/cws/.ready)"
+    while [ ! -f /opt/cws/.ready ]; do sleep 1; done
+    chmod +x /opt/cws/crabscheme /opt/cws/bin/crab-watchstore
+    export CRABSCHEME=/opt/cws/crabscheme
+    if [ -n "${WAN_DELAY_MS:-}" ] && [ "${WAN_DELAY_MS}" != "0" ]; then
+      tc qdisc replace dev eth0 root netem delay "${WAN_DELAY_MS}ms" \
+        || { echo "FATAL: tc netem failed (NET_ADMIN? eth0?)"; exit 1; }
+      echo ">> wan: ${WAN_DELAY_MS}ms egress (inter-member RTT ~$((WAN_DELAY_MS*2))ms)"
+    fi
+    cd /opt/cws
+    echo ">> exec crab-watchstore $*"
+    exec /opt/cws/bin/crab-watchstore "$@"
+---
+# --- member a (us-east, pinned leader region) ---
+apiVersion: v1
+kind: Service
+metadata: { name: cws-a, namespace: cws-geo }
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: { app: cws, member: a }
+  ports:
+  - { name: grpc, port: 2379 }
+  - { name: raft, port: 7001 }
+  - { name: health, port: 12379 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: cws-a, namespace: cws-geo }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: cws, member: a } }
+  template:
+    metadata: { labels: { app: cws, member: a } }
+    spec:
+      hostname: cws-a
+      containers:
+      - name: cws
+        image: debian:bookworm-slim
+        command: ["bash","/cfg/bootstrap.sh"]
+        args: ["--config","/etc/crab-watchstore.conf","--tick-ms","250","--election-ticks","8","--locality","us-east","--leader-region","us-east"]
+        env: [{ name: WAN_DELAY_MS, value: "75" }]
+        securityContext: { capabilities: { add: ["NET_ADMIN"] } }
+        ports: [{ containerPort: 2379 },{ containerPort: 7001 },{ containerPort: 12379 }]
+        volumeMounts:
+        - { name: cfg, mountPath: /cfg }
+        - { name: conf, mountPath: /etc/crab-watchstore.conf, subPath: a.conf }
+        - { name: cws, mountPath: /opt/cws }
+        - { name: data, mountPath: /data }
+        readinessProbe:
+          exec: { command: ["bash","-c","curl -fsS http://$(hostname):12379/health | grep -q '\"health\":\"true\"'"] }
+          initialDelaySeconds: 15
+          periodSeconds: 5
+          failureThreshold: 12
+      volumes:
+      - { name: cfg, configMap: { name: cws-conf } }
+      - { name: conf, configMap: { name: cws-conf } }
+      - { name: cws, emptyDir: {} }
+      - { name: data, emptyDir: {} }
+---
+# --- member b (eu-west) ---
+apiVersion: v1
+kind: Service
+metadata: { name: cws-b, namespace: cws-geo }
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: { app: cws, member: b }
+  ports:
+  - { name: grpc, port: 2379 }
+  - { name: raft, port: 7001 }
+  - { name: health, port: 12379 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: cws-b, namespace: cws-geo }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: cws, member: b } }
+  template:
+    metadata: { labels: { app: cws, member: b } }
+    spec:
+      hostname: cws-b
+      containers:
+      - name: cws
+        image: debian:bookworm-slim
+        command: ["bash","/cfg/bootstrap.sh"]
+        args: ["--config","/etc/crab-watchstore.conf","--tick-ms","250","--election-ticks","8","--locality","eu-west","--leader-region","us-east"]
+        env: [{ name: WAN_DELAY_MS, value: "75" }]
+        securityContext: { capabilities: { add: ["NET_ADMIN"] } }
+        ports: [{ containerPort: 2379 },{ containerPort: 7001 },{ containerPort: 12379 }]
+        volumeMounts:
+        - { name: cfg, mountPath: /cfg }
+        - { name: conf, mountPath: /etc/crab-watchstore.conf, subPath: b.conf }
+        - { name: cws, mountPath: /opt/cws }
+        - { name: data, mountPath: /data }
+        readinessProbe:
+          exec: { command: ["bash","-c","curl -fsS http://$(hostname):12379/health | grep -q '\"health\":\"true\"'"] }
+          initialDelaySeconds: 15
+          periodSeconds: 5
+          failureThreshold: 12
+      volumes:
+      - { name: cfg, configMap: { name: cws-conf } }
+      - { name: conf, configMap: { name: cws-conf } }
+      - { name: cws, emptyDir: {} }
+      - { name: data, emptyDir: {} }
+---
+# --- member c (ap-south) ---
+apiVersion: v1
+kind: Service
+metadata: { name: cws-c, namespace: cws-geo }
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector: { app: cws, member: c }
+  ports:
+  - { name: grpc, port: 2379 }
+  - { name: raft, port: 7001 }
+  - { name: health, port: 12379 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: cws-c, namespace: cws-geo }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: cws, member: c } }
+  template:
+    metadata: { labels: { app: cws, member: c } }
+    spec:
+      hostname: cws-c
+      containers:
+      - name: cws
+        image: debian:bookworm-slim
+        command: ["bash","/cfg/bootstrap.sh"]
+        args: ["--config","/etc/crab-watchstore.conf","--tick-ms","250","--election-ticks","8","--locality","ap-south","--leader-region","us-east"]
+        env: [{ name: WAN_DELAY_MS, value: "75" }]
+        securityContext: { capabilities: { add: ["NET_ADMIN"] } }
+        ports: [{ containerPort: 2379 },{ containerPort: 7001 },{ containerPort: 12379 }]
+        volumeMounts:
+        - { name: cfg, mountPath: /cfg }
+        - { name: conf, mountPath: /etc/crab-watchstore.conf, subPath: c.conf }
+        - { name: cws, mountPath: /opt/cws }
+        - { name: data, mountPath: /data }
+        readinessProbe:
+          exec: { command: ["bash","-c","curl -fsS http://$(hostname):12379/health | grep -q '\"health\":\"true\"'"] }
+          initialDelaySeconds: 15
+          periodSeconds: 5
+          failureThreshold: 12
+      volumes:
+      - { name: cfg, configMap: { name: cws-conf } }
+      - { name: conf, configMap: { name: cws-conf } }
+      - { name: cws, emptyDir: {} }
+      - { name: data, emptyDir: {} }

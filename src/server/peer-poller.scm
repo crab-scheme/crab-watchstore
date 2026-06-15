@@ -67,6 +67,17 @@
   ; +2-4/s). TICK-EVERY is now the tick interval in MILLISECONDS (callers
   ; already pass 120). The drain/yield structure is unchanged — the loop still
   ; spins draining frames; only tick emission is time-gated.
+  ; IDLE PARK (cw-lkq scale): the idle branch used to (yield) and immediately
+  ; re-poll. On current crabscheme yield is ~free, so an idle node spun this
+  ; dedicated thread at ~100% CPU (~2.5 cores/member measured). With a real
+  ; k8s control plane (many small lease/watch ops) and a 9-member region×AZ
+  ; topology that oversubscribed the host and stalled op handling. Tick pacing
+  ; is already WALL-CLOCK (cw-b5w.7), so a short idle sleep does NOT change tick
+  ; timing — it only adds <=1ms to inbound-frame drain latency, negligible vs
+  ; the 20-150ms inter-region RTT. The sleep is taken ONLY when there is nothing
+  ; to drain (null? msgs); under active Raft replication msgs is non-empty and
+  ; the loop stays hot, so throughput is unaffected. (Dedicated-thread actor =>
+  ; sleep-ms is a real thread sleep that releases the core.)
   (let ((tick-secs (/ tick-every 1000.0)))
     (let loop ((last (current-second)))
       (let ((msgs (node-poll (symbol->string node-name))))
@@ -74,5 +85,5 @@
         (let ((now (current-second)))
           (cond
             ((>= (- now last) tick-secs) (tick-all!) (heal!) (loop now))
-            ((null? msgs) (yield) (loop last))
+            ((null? msgs) (sleep-ms 5) (loop last))
             (else (loop last))))))))

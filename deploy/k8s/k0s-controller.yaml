@@ -1,0 +1,99 @@
+# deploy/k8s/k0s-controller.yaml — an embedded k0s control plane on gtr that uses
+# the crab-watchstore 3-region store as its EXTERNAL etcd (the "localized etcd").
+#
+# Controller-only (no worker) => no privileged container needed (read-only rootfs
+# + tmpfs, per k0s-in-docker docs). Drive it with the bundled `k0s kubectl`.
+# Network/CNI/proxy/dns/konnectivity are disabled: this control plane exists only
+# to host KWOK-simulated nodes+pods, so no real pod networking is required.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k0s-config
+  namespace: cws-geo
+data:
+  k0s.yaml: |
+    apiVersion: k0s.k0sproject.io/v1beta1
+    kind: ClusterConfig
+    metadata:
+      name: k0s
+    spec:
+      storage:
+        type: etcd
+        etcd:
+          externalCluster:
+            # Point ONLY at the pinned-leader region (us-east). The etcd client
+            # balances writes across all endpoints; a write landing on a FOLLOWER
+            # returns "etcdserver: not leader", so listing followers stalls the
+            # control plane. Leader-region pinning keeps m1a the stable leader, so
+            # targeting it directly sends every op to the leader (no forwarding).
+            endpoints:
+              - http://cws-m1a:2379
+            etcdPrefix: /k0s-sim
+      api:
+        sans:
+          - k0s-api
+          - k0s-api.cws-geo.svc
+      # Relax leaderelection for a deliberately high-latency (WAN/AZ) + noisy-host
+      # store: a transient multi-second op stall must not drop KCM/scheduler
+      # leadership (standard practice for WAN-stretched etcd).
+      controllerManager:
+        extraArgs:
+          leader-elect-lease-duration: 300s
+          leader-elect-renew-deadline: 270s
+          leader-elect-retry-period: 30s
+          node-monitor-grace-period: 300s
+          kube-api-qps: "200"
+          kube-api-burst: "400"
+      scheduler:
+        extraArgs:
+          leader-elect-lease-duration: 300s
+          leader-elect-renew-deadline: 270s
+          leader-elect-retry-period: 30s
+          kube-api-qps: "200"
+          kube-api-burst: "400"
+      network:
+        provider: custom
+        podCIDR: 10.244.0.0/16
+        serviceCIDR: 10.96.0.0/12
+---
+apiVersion: v1
+kind: Service
+metadata: { name: k0s-api, namespace: cws-geo }
+spec:
+  selector: { app: k0s-controller }
+  ports: [{ name: https, port: 6443, targetPort: 6443 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: k0s-controller, namespace: cws-geo }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: k0s-controller } }
+  strategy: { type: Recreate }
+  template:
+    metadata: { labels: { app: k0s-controller } }
+    spec:
+      hostname: k0s-controller
+      containers:
+      - name: k0s
+        image: docker.io/k0sproject/k0s:v1.32.13-k0s.0
+        command: ["k0s","controller","--config","/etc/k0s/k0s.yaml",
+                  "--disable-components","konnectivity-server,kube-proxy,coredns,network-provider,helm,metrics-server,worker-config"]
+        ports: [{ containerPort: 6443 }]
+        securityContext:
+          readOnlyRootFilesystem: true
+        volumeMounts:
+        - { name: cfg, mountPath: /etc/k0s }
+        - { name: data, mountPath: /var/lib/k0s }
+        - { name: run, mountPath: /run }
+        - { name: tmp, mountPath: /tmp }
+        readinessProbe:
+          exec: { command: ["k0s","kubectl","get","--raw","/readyz"] }
+          initialDelaySeconds: 20
+          periodSeconds: 10
+          failureThreshold: 30
+      volumes:
+      - { name: cfg, configMap: { name: k0s-config } }
+      - { name: data, emptyDir: {} }
+      - { name: run, emptyDir: { medium: Memory } }
+      - { name: tmp, emptyDir: {} }

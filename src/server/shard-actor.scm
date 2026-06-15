@@ -665,7 +665,18 @@
                   (let* ((cidx (list-ref rpc 3)) (clt (list-ref rpc 4))
                          (up (or (> clt (last-log-term st))
                                  (and (= clt (last-log-term st)) (>= cidx (log-len st)))))
-                         (grant (and (not (raft-leader? st)) (>= elapsed timeout) up)))
+                         ; cw-lkq: grant a pre-vote when we have not heard from a
+                         ; live leader for the BASE election timeout — NOT our own
+                         ; per-node STAGGERED `timeout`. The stagger exists only to
+                         ; pick who CAMPAIGNS first; using it as the grant threshold
+                         ; deadlocks at >3 voters: a node resets `elapsed` to 0 the
+                         ; instant it starts a pre-vote (tick branch), so no set of
+                         ; majority voters is ever simultaneously past its staggered
+                         ; timeout, and pre-vote never reaches a majority. The base
+                         ; threshold is also correct Raft PreVote: a live, heart-
+                         ; beating leader keeps elapsed < base on every voter (AE
+                         ; resets it), so no disruptive pre-vote is ever granted.
+                         (grant (and (not (raft-leader? st)) (>= elapsed election-base) up)))
                     (emit! (list (cons from (list 'prvr (raft-term st) grant))))
                     (loop st leader elapsed flush-base)))
                  ;; ---- PreVote reply -> tally; on a majority start the REAL

@@ -233,12 +233,18 @@
       ; long enough that a joiner raced past it with shard-pid = #f, making
       ; EVERY gRPC call raise ("handler error") for the life of the process.
       (let spin ()
-        (if (table-lookup 'ws-shard-pid (qk)) #t (spin)))
+        (if (table-lookup 'ws-shard-pid (qk)) #t (begin (sleep-ms 20) (spin))))
       (display "node ") (display me)
       (display ": joined mesh as a non-voter — awaiting MemberAdd (catch-up + promote)") (newline))
     (begin
+      ; sleep-poll, do NOT busy-spin: this main-thread wait runs WHILE the shard
+      ; actor + peer-poller are trying to elect a leader. A tight (spin) here pins
+      ; the main thread at 100% and, on a CPU-starved host, starves the very
+      ; threads running the election — so the election never completes and the
+      ; wait spins forever (seen with a 9-member cluster on a loaded node). A
+      ; 20ms poll frees the core; startup latency cost is at most one poll.
       (let spin ()
-        (if (table-lookup 'ws-shard-leader (qk)) #t (spin)))
+        (if (table-lookup 'ws-shard-leader (qk)) #t (begin (sleep-ms 20) (spin))))
       (display "node ") (display me) (display ": shard 0 ready (leader=")
       (display (table-lookup 'ws-shard-leader (qk))) (display ", role=")
       (display (table-lookup 'ws-shard-role (qk))) (display ")") (newline)))
@@ -340,5 +346,10 @@
                         shard-pid (symbol->string me) bind-host metrics-port locality)
 
 ; The consensus substrate + etcd KV API + metrics endpoint are up. Park so the node process
-; stays alive serving Raft RPCs to peers and gRPC calls to clients.
-(let park () (yield) (park))
+; stays alive serving Raft RPCs to peers and gRPC calls to clients. The main thread does NO
+; work (shard/poller/grpc/metrics are all their own actor threads), so it must SLEEP, not
+; (yield)-spin: on current crabscheme yield is ~free, so the old (yield) loop pinned this
+; thread at ~100% CPU (~1 core/member at idle, on top of the peer-poller spin). A 1s sleep
+; keeps the process alive with negligible CPU and starves nothing (the green pool runs on its
+; own worker threads).
+(let park () (sleep-ms 1000) (park))

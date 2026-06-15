@@ -1,0 +1,57 @@
+# deploy/k8s/cws-apiserver.yaml — a real kube-apiserver backed by the stretched
+# 3-region crab-watchstore store (the geo k8s e2e, cw-lkq.10, as a k8s workload).
+# Secret cws-apiserver-keys (sa.key/sa.pub/tokens.csv) is created at apply time.
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: cws-apiserver, namespace: cws-geo }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: cws-apiserver } }
+  template:
+    metadata: { labels: { app: cws-apiserver } }
+    spec:
+      containers:
+      - name: apiserver
+        image: registry.k8s.io/kube-apiserver:v1.30.0
+        command: ["kube-apiserver"]
+        args:
+        - --etcd-servers=http://cws-a:2379,http://cws-b:2379,http://cws-c:2379
+        - --service-cluster-ip-range=10.96.0.0/16
+        - --service-account-issuer=https://kubernetes.default.svc
+        - --service-account-key-file=/keys/sa.pub
+        - --service-account-signing-key-file=/keys/sa.key
+        - --authorization-mode=AlwaysAllow
+        - --token-auth-file=/keys/tokens.csv
+        - --cert-dir=/tmp
+        - --secure-port=6443
+        ports: [{ containerPort: 6443 }]
+        volumeMounts: [{ name: keys, mountPath: /keys, readOnly: true }]
+        readinessProbe:
+          httpGet:
+            path: /livez
+            port: 6443
+            scheme: HTTPS
+            httpHeaders: [{ name: Authorization, value: "Bearer cwstoken" }]
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          failureThreshold: 30
+      volumes:
+      - { name: keys, secret: { secretName: cws-apiserver-keys } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: cws-apiserver, namespace: cws-geo }
+spec:
+  selector: { app: cws-apiserver }
+  ports: [{ name: https, port: 6443, targetPort: 6443 }]
+---
+# drill box: in-cluster curl client for the region-loss e2e (geo-k8s-e2e.sh logic)
+apiVersion: v1
+kind: Pod
+metadata: { name: cws-drill, namespace: cws-geo, labels: { app: cws-drill } }
+spec:
+  restartPolicy: Never
+  containers:
+  - name: drill
+    image: curlimages/curl:8.11.0
+    command: ["sleep","infinity"]

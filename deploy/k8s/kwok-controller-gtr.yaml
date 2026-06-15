@@ -1,0 +1,26 @@
+# deploy/k8s/kwok-controller-gtr.yaml — KWOK controller running on the REAL gtr
+# node, managing the embedded k0s cluster externally (the k0s cluster has no real
+# workers, so its kwok-controller must live here). It drives fake nodes/pods whose
+# entire object state lives in crab-watchstore (via k0s -> external etcd).
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: kwok-controller-gtr, namespace: cws-geo }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: kwok-controller-gtr } }
+  template:
+    metadata: { labels: { app: kwok-controller-gtr } }
+    spec:
+      containers:
+      - name: kwok
+        image: registry.k8s.io/kwok/kwok:v0.7.0
+        args:
+        - --kubeconfig=/kc/config
+        - --manage-all-nodes=false
+        - --manage-nodes-with-annotation-selector=kwok.x-k8s.io/node=fake
+        - --cidr=10.200.0.0/16
+        - --node-ip=10.200.0.1
+        - --node-lease-duration-seconds=40
+        volumeMounts: [{ name: kc, mountPath: /kc, readOnly: true }]
+      volumes:
+      - { name: kc, secret: { secretName: k0s-kubeconfig } }

@@ -177,7 +177,25 @@
 ; is added later via MemberAdd, then promoted), so it never campaigns before being admitted.
 ; A fresh node is a voter in the full set.  Either way the live config arrives by replication
 ; (adopted on append), overriding this bootstrap set.
-(define shard-voters (if join? existing-members all-names))
+; ---- genesis learners (cw-85j) — local-majority WAN config ----
+; --learners name,name : these members boot as NON-VOTING (receive AppendEntries,
+; never count for quorum/elections). Passed IDENTICALLY to every member (the spec
+; + flag are shared), so all nodes derive the SAME genesis voters/learners split.
+; Use to seat a local-majority voter set, e.g. 9 members with ap-south as learners
+; => 5 voters (us-east 3 + eu-west 2), majority 3 = the leader's 3 local us-east
+; voters, so a write commits on the LAN instead of crossing the 80ms WAN.
+(define learner-names
+  (let ((s (arg-after "--learners" "")))
+    (if (string=? s "") '() (map string->symbol (split-on s #\,)))))
+(define (drop-learners ns)
+  (let loop ((ns ns) (acc '()))
+    (cond ((null? ns) (reverse acc))
+          ((memv (car ns) learner-names) (loop (cdr ns) acc))
+          (else (loop (cdr ns) (cons (car ns) acc))))))
+; A joiner is admitted via MemberAdd (no genesis learners); a fresh node seats the
+; voter-only set + the learner subset.
+(define shard-voters   (if join? existing-members (drop-learners all-names)))
+(define shard-learners (if join? '() learner-names))
 ; --shards N (cw-b5w.4, ADR 0005 B): apply-worker count for parallel PUT
 ; materialization. DEFAULT 1 (serial): on darwin-arm64 the measured ladder
 ; REGRESSED with 4 workers (load=l 2707 -> 1603 w/s) — the per-batch barrier
@@ -212,7 +230,7 @@
   (let ((n (string->number (arg-after "--serializable-max-lag" "0")))) (if (and n (>= n 0)) n 0)))
 (spawn-source-dedicated "(include \"src/server/shard-actor.scm\")" 'shard-main
               "0" shard-voters me (string-append dbbase "-shard0") durable apply-shards
-              election-ticks leader-region region-map serializable-max-lag)
+              election-ticks leader-region region-map serializable-max-lag shard-learners)
 
 (define dial-addrs (map raft-addr dial-peers))
 ; Dedicated thread — the poller is the Raft tick-clock AND sole network drainer;

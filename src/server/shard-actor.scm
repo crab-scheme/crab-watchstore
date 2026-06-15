@@ -79,6 +79,11 @@
                          (list-ref rest 3) '()))
          (ser-max-lag (if (and (>= (length rest) 5) (number? (list-ref rest 4)))
                           (list-ref rest 4) 0))
+         ; 6 (cw-85j) genesis LEARNERS: non-voting members seated at bootstrap
+         ; (a WAN local-majority config). Default '() = every existing caller /
+         ; the original all-voters genesis.
+         (genesis-learners (if (and (>= (length rest) 6) (list? (list-ref rest 5)))
+                               (list-ref rest 5) '()))
          (handle  (store-open db-path #t))      ; create-if-missing
          (ctx     (make-ctx handle "default" sync?))
          (apply-workers
@@ -623,7 +628,7 @@
 
     (let* ((loaded (ctx-load-applied ctx))                 ; (idx . term) from RocksDB
            (p (car loaded)) (pt (cdr loaded))
-           (st0 (make-raft node-name voters apply-fn 0))
+           (st0 (make-raft node-name voters apply-fn 0 genesis-learners))
            ; restart: RocksDB already reflects entries up to p, so start with the
            ; log compacted to base=p (applied=commit=p). The log replays only
            ; entries above p, so committed entries are never re-applied.

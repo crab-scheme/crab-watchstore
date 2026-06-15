@@ -22,6 +22,20 @@ for ri, region in enumerate(REGIONS, start=1):
 
 cluster = ",".join(f'{m["id"]}:{m["host"]}:7001:2379:{m["region"]}' for m in members)
 
+# cw-85j local-majority WAN config: the LEADER REGION must hold a STRICT MAJORITY
+# of voters so a write commits on the LAN without crossing the WAN. With 3 AZs in
+# the leader region, cap voters at 5 = us-east(3) + 2 from other regions; majority
+# 3 = the leader's 3 local us-east voters. Everyone else (the 3rd eu-west AZ + all
+# ap-south) boots as a non-voting LEARNER: fully replicated for read-locality +
+# failover, never on the commit critical path. Passed IDENTICALLY to every member
+# so all nodes derive the same genesis voters/learners split.
+LEADER_REGION = "us-east"
+_leader_voters = [m["id"] for m in members if m["region"] == LEADER_REGION]
+_other_ids = [m["id"] for m in members if m["region"] != LEADER_REGION]
+# add just enough non-leader voters to reach 5 total (keeps leader region a majority)
+voter_ids = set(_leader_voters + _other_ids[: max(0, 5 - len(_leader_voters))])
+learners = ",".join(m["id"] for m in members if m["id"] not in voter_ids)
+
 BOOTSTRAP = r"""#!/usr/bin/env bash
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
@@ -85,7 +99,7 @@ spec:
       - name: cws
         image: debian:bookworm-slim
         command: ["bash","/cfg/bootstrap.sh"]
-        args: ["--config","/etc/crab-watchstore.conf","--tick-ms","250","--election-ticks","10","--locality","{m['region']}","--leader-region","{leader_region}"]
+        args: ["--config","/etc/crab-watchstore.conf","--tick-ms","250","--election-ticks","10","--locality","{m['region']}","--leader-region","{leader_region}","--learners","{learners}"]
         securityContext: {{ capabilities: {{ add: ["NET_ADMIN"] }} }}
         resources:
           requests: {{ cpu: "1", memory: 256Mi }}

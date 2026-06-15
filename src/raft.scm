@@ -71,10 +71,18 @@
 ; appended or truncated. `base-voters`/`base-voters-old`/`base-learners` snapshot
 ; the config covered by `base` (the compacted prefix), so a truncation that drops
 ; every in-memory ConfChange reverts to the snapshot's config.
-(define (make-raft id ids apply-fn sm0)
-  (list (cons 'id id) (cons 'peers (others id ids)) (cons 'all ids)
-        (cons 'voters ids) (cons 'voters-old #f) (cons 'learners '())
-        (cons 'base-voters ids) (cons 'base-voters-old #f) (cons 'base-learners '())
+; `ids` = the genesis VOTER set. Optional trailing `learners` (cw-85j) = the
+; genesis NON-VOTING members: they receive AppendEntries (so they are in `peers`)
+; but never count for quorum/elections (NOT in `voters`/`all`). Omitting it is the
+; original behaviour byte-for-byte (learners '(), peers = others id ids). A
+; genesis learner lets a WAN deployment seat a local-majority voter set (e.g. 5
+; voters with 3 in the leader region) while far-region members ride along as
+; learners off the commit critical path.
+(define (make-raft id ids apply-fn sm0 . rest)
+  (let ((learners (if (pair? rest) (car rest) '())))
+  (list (cons 'id id) (cons 'peers (others id (append ids learners))) (cons 'all ids)
+        (cons 'voters ids) (cons 'voters-old #f) (cons 'learners learners)
+        (cons 'base-voters ids) (cons 'base-voters-old #f) (cons 'base-learners learners)
         (cons 'role 'follower) (cons 'term 0) (cons 'voted-for #f)
         (cons 'log '()) (cons 'commit 0) (cons 'applied 0) (cons 'votes '())
         (cons 'next '()) (cons 'match '()) (cons 'apply apply-fn) (cons 'sm sm0)
@@ -96,7 +104,7 @@
         ; rejected AppendEntries at the compaction floor (base+1), so no log
         ; replay can reach them (cw-lkq.15). The hosting actor ships ws-snap
         ; and clears this via raft-clear-snap-req.
-        (cons 'snap-req '())))
+        (cons 'snap-req '()))))
 
 (define (raft-id st)      (aget st 'id))
 (define (raft-role st)    (aget st 'role))

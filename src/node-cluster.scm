@@ -313,10 +313,16 @@
                (string-append "http://" (cadr e) ":" (number->string (caddr e)))))
        nodes))
 
+; cw-6i0: a POOL of grpc-kv-main workers behind a thin round-robin router, so
+; concurrent requests issue concurrent shard proposals (the shard's group-commit
+; then coalesces them) instead of serializing one Raft commit per write through a
+; lone handler.  --grpc-workers tunes the pool size (default 32).
+(define grpc-workers
+  (string->number (arg-after "--grpc-workers" "32")))
 (define grpc-handler
-  (spawn-source-dedicated "(include \"src/server/grpc-kv.scm\")" 'grpc-kv-main
+  (spawn-source-dedicated "(include \"src/server/grpc-router.scm\")" 'grpc-router-main
                           shard-pid cluster-id member-id cluster-members
-                          (symbol->string me)))
+                          (symbol->string me) grpc-workers))
 ; TLS path (cw-u4a.21) iff --tls-cert was given; otherwise the original h2c
 ; server.  grpc-serve-tls reuses the SAME handler actor — TLS only wraps the IO.
 (define grpc-sid

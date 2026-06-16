@@ -546,7 +546,7 @@
     ;     collapse: GiBs of RSS, 200% CPU, tick starvation, election churn).
     ;     A peer that falls below the floor is caught up with a STORE snapshot
     ;     (ws-snap) instead of log replay — see ship-snaps! below.
-    (define COMPACT-KEEP 1024)
+    (define COMPACT-KEEP 256)
     (define (compact st)
       (if solo
           (if (= (raft-applied st) (log-len st))

@@ -597,6 +597,32 @@
     ; ErrCompacted: if a non-zero explicit revision is below compact-rev
     (if (and (not (= req-rev 0)) (< req-rev compact-rev))
         (cons 'err-compacted compact-rev)
+        ; EXP8 (cw-709): SINGLE-KEY fast path. etcd's most common read is a point
+        ; GET (range-end unset). The general path below kv-scans the WHOLE NS-KEY
+        ; namespace and is O(total keys) per read — catastrophic at scale and the
+        ; cause of the read-hang (cw-b7f), since kv-scan over a sparse prefix also
+        ; trips the cs-store iterator bug (cs-s9i). A point read uses mvcc-get-latest
+        ; (one O(log n) seek), identical visibility semantics (newest version
+        ; <= at-rev, tombstone => absent). Only taken when NO create/mod-rev filters
+        ; apply (those need the group scan); otherwise fall through.
+        (if (and (range-end-unset? range-end)
+                 (= min-cr 0) (= max-cr 0) (= min-mr 0) (= max-mr 0))
+            (let ((rec (if (= req-rev 0)
+                           (mvcc-get-latest ctx key)
+                           (mvcc-get-latest ctx key at-rev))))
+              (if (not rec)
+                  (cons 0 '())
+                  (cons 1 (if count-only
+                              '()
+                              (list (cons key
+                                          (if keys-only
+                                              (vector (vector-ref rec 0)   ; tag
+                                                      (vector-ref rec 1)   ; create-rev
+                                                      (vector-ref rec 2)   ; mod-rev
+                                                      (vector-ref rec 3)   ; version
+                                                      (vector-ref rec 4)   ; lease
+                                                      (make-bytevector 0 0)) ; blank value
+                                              rec)))))))
         ; -- scan NS-KEY namespace forward, group by user-key, pick visible version --
         (let ((rows (kv-scan ctx (mvcc-byte NS-KEY))))
           ; Iterate all KEY-CF rows in on-disk order.  Rows are ordered by
@@ -673,7 +699,7 @@
                     ; new key — flush previous group first, start new group
                     (else
                      (let ((new-results (if cur-uk (flush-group cur-uk (reverse cur-group)) results)))
-                       (collect (cdr rs) uk (list row) new-results)))))))))))
+                       (collect (cdr rs) uk (list row) new-results))))))))))))
 
 ; ---------------------------------------------------------------------------
 ; mvcc-digest-at / mvcc-snapshot-kvs  (cw-u4a.32 — Maintenance Status/Hash/HashKV/Snapshot)

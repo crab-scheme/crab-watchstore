@@ -34,7 +34,10 @@
 
 (define GRPC-UNAVAILABLE-ROUTER 14)   ; gRPC UNAVAILABLE (client retries)
 
-(define (grpc-router-main shard-pid cluster-id member-id cluster-members my-node-name pool-size)
+(define (grpc-router-main shard-pid cluster-id member-id cluster-members my-node-name pool-size . rest)
+  ; cw-ivt: shard-groups (number of Raft groups) threaded to each worker so it can
+  ; resolve the per-key shard pid. Default 1 (single group).
+  (define shard-groups (if (and (pair? rest) (number? (car rest))) (car rest) 1))
   ; ---- spawn the worker pool: each worker is the FULL grpc-kv-main body ----
   ; Identical args to the pre-pool single-handler spawn (node-cluster.scm), so a
   ; worker behaves exactly as the old lone handler did.
@@ -77,7 +80,7 @@
                    (spawn-source-dedicated "(include \"src/server/grpc-kv.scm\")"
                                            'grpc-kv-main
                                            shard-pid cluster-id member-id
-                                           cluster-members my-node-name))
+                                           cluster-members my-node-name shard-groups))
       (build (+ i 1))))
 
   (display "node ") (display my-node-name)

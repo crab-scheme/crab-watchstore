@@ -442,6 +442,30 @@
   ; optional 5th arg (cw-lkq.6): THIS node's name string, for node-peers-based
   ; MemberAdd name resolution (#f on old callers/tests -> mesh lookup disabled).
   (define my-node-name (if (and (pair? rest) (string? (car rest))) (car rest) #f))
+  ; cw-ivt: multi-Raft-group sharding. shard-groups = N (default 1). Data-path ops
+  ; (PUT/GET/DEL) route by FNV-1a(key) mod N to the LOCAL replica of the owning group
+  ; (ws-shard-pid "node:idx"); SYSTEM ops (auth/lease/membership/cur-rev) stay on the
+  ; shard-pid arg (group 0). N=1 → every key resolves to group 0 = the old behavior.
+  (define shard-groups
+    (let ((r2 (and (pair? rest) (cdr rest))))
+      (if (and (pair? r2) (number? (car r2)) (> (car r2) 0)) (car r2) 1)))
+  (define shard-pid-cache (make-vector shard-groups #f))
+  (define (shard-pid-idx i)
+    (or (vector-ref shard-pid-cache i)
+        (let ((p (and my-node-name
+                      (table-lookup 'ws-shard-pid
+                                    (string-append my-node-name ":" (number->string i))))))
+          (if p (vector-set! shard-pid-cache i p))
+          (or p shard-pid))))          ; fall back to group 0 until the replica publishes
+  (define (key-shard key)              ; FNV-1a over the key bytes, mod N
+    (if (<= shard-groups 1) 0
+        (let ((len (bytevector-length key)))
+          (let loop ((i 0) (h 2166136261))
+            (if (= i len) (modulo h shard-groups)
+                (loop (+ i 1)
+                      (modulo (* (bitwise-xor h (bytevector-u8-ref key i)) 16777619)
+                              4294967296)))))))
+  (define (shard-pid-for key) (shard-pid-idx (key-shard key)))
   ; cluster-members (cw-u4a.30): the static --cluster spec as a list of
   ; (name-string peerurl-string), e.g. (("a" "http://127.0.0.1:7001") ...).  Used by
   ; the Cluster service to report peerURLs in MemberList and as an extra id->name
@@ -461,14 +485,16 @@
   ; raw-receive here must yield the shard's reply; any dispatcher traffic that
   ; races in (*grpc-request* / *grpc-stream-msg* / *grpc-stream-end*) is buffered
   ; for the main loop so we never mis-parse it as a shard ack.
-  (define (ask-shard msg)
-    (send shard-pid msg)
+  (define (ask-shard-on pid msg)
+    (send pid msg)
     (let wait ()
       (let ((r (raw-receive)))
         (if (and (pair? r)
                  (memq (car r) '(*grpc-request* *grpc-stream-msg* *grpc-stream-end* put-done)))
             (begin (set! grpc-pending (append grpc-pending (list r))) (wait))
             r))))
+  (define (ask-shard msg) (ask-shard-on shard-pid msg))            ; SYSTEM group (0)
+  (define (ask-shard-key key msg) (ask-shard-on (shard-pid-for key) msg))  ; cw-ivt: data-path
 
   ; next mailbox message for the main loop: buffered dispatcher traffic first
   ; (FIFO), else a fresh receive.
@@ -491,17 +517,25 @@
       (make-header cluster-id member-id rev
                    (if (and (pair? r) (eq? (car r) 'cur-rev-ok)) (caddr r) 1))))
 
-  ; snapshot a key's current live record BEFORE a write (for prev_kv).
+  ; snapshot a key's current live record BEFORE a write (for prev_kv). cw-ivt: route
+  ; to the key's group.
   (define (shard-prev key)
-    (let ((r (ask-shard (list 'kv-prev (self) key))))
+    (let ((r (ask-shard-key key (list 'kv-prev (self) key))))
       (if (and (pair? r) (eq? (car r) 'kv-prev-ok)) (cadr r) #f)))   ; tuple | #f
 
   ; run a Range against the shard's ctx (leader-gated).  Returns the raw seam reply:
   ;   (kv-range-ok cur-rev term err total tuples) | 'tryagain | 'indeterminate
-  (define (shard-range opts) (ask-shard (list 'kv-range (self) opts)))
+  ; cw-ivt P1: route by the range's start key — correct for single-key reads (the
+  ; common case + check perf). A multi-key range spanning groups is INCOMPLETE under
+  ; N>1 (only the start key's group is scanned) — cross-shard scatter-gather is P2.
+  (define (shard-range opts)
+    (ask-shard-key (range-opt opts 'key (make-bytevector 0 0)) (list 'kv-range (self) opts)))
 
-  ; propose an internal write command; returns the shard ack.
-  (define (shard-write cmd) (ask-shard (cons (self) cmd)))
+  ; propose an internal write command; returns the shard ack. cw-ivt: route by the
+  ; command's key (element 1: ("PUT"|"DEL" key ...)).
+  (define (shard-write cmd)
+    (ask-shard-key (if (and (pair? cmd) (pair? (cdr cmd))) (cadr cmd) (make-bytevector 0 0))
+                   (cons (self) cmd)))
 
   ; ===========================================================================
   ; EXP5 (cw-juw): ASYNC write submission — break the per-PUT blocking closed
@@ -815,7 +849,8 @@
             ; put-done acks (each decrements inflight + responds) until there's room.
             (drain-until-room!)
             (set! inflight (+ inflight 1))
-            (send shard-pid (cons (list 'async (self) h)
+            ; cw-ivt: route the async PUT to the key's group.
+            (send (shard-pid-for key) (cons (list 'async (self) h)
                                   (list (string->utf8 "PUT") key value (int->bytes lease))))
             'async)
           (handle-put-sync h key value lease want-prev))))

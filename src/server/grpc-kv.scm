@@ -537,6 +537,42 @@
     (ask-shard-key (if (and (pair? cmd) (pair? (cdr cmd))) (cadr cmd) (make-bytevector 0 0))
                    (cons (self) cmd)))
 
+  ; cw-ivt P2: a multi-key range [key,range-end) can cover keys in ANY group (keys are
+  ; hash-partitioned), so SCATTER the Range to every group, GATHER, and merge: union
+  ; the tuples, sort by user-key (bv<?), sum the per-group totals, max the cur-rev,
+  ; apply the limit post-merge. Each group only holds its own keys, so the union is the
+  ; full range with no dups. NOTE: not a consistent cross-group snapshot (per-group
+  ; linearizable reads at possibly-different revs) — a documented divergence.
+  (define (take-n lst n)
+    (let loop ((l lst) (k n) (acc '()))
+      (if (or (null? l) (= k 0)) (reverse acc) (loop (cdr l) (- k 1) (cons (car l) acc)))))
+  (define (shard-range-all opts)
+    (let loop ((i 0) (crev 0) (term 1) (total 0) (tuples '()) (compacted #f))
+      (if (>= i shard-groups)
+          (if compacted (list 'kv-range-ok (if (< crev 1) 1 crev) term 'compacted 0 '())
+              (let* ((sorted (list-sort (lambda (a b) (bv<? (car a) (car b))) tuples))
+                     (lim (range-opt opts 'limit 0))
+                     (final (if (and (> lim 0) (> (length sorted) lim)) (take-n sorted lim) sorted)))
+                (list 'kv-range-ok (if (< crev 1) 1 crev) term #f total final)))
+          (let ((r (ask-shard-on (shard-pid-idx i) (list 'kv-range (self) opts))))
+            (if (and (pair? r) (eq? (car r) 'kv-range-ok))
+                (loop (+ i 1) (max crev (list-ref r 1)) (list-ref r 2)
+                      (+ total (list-ref r 4)) (append (list-ref r 5) tuples)
+                      (or compacted (eq? (list-ref r 3) 'compacted)))
+                (loop (+ i 1) crev term total tuples compacted))))))   ; skip a failed group (best-effort)
+
+  ; cw-ivt P2: a multi-key DeleteRange likewise spans groups — SCATTER the DEL to every
+  ; group (each deletes its matching keys) and SUM the counts. Best-effort, NOT atomic
+  ; across groups (independent Raft) — a documented divergence; a group that bounces
+  ; tryagain just contributes 0 (its keys aren't deleted this call). Returns ("DEL" rev . n).
+  (define (shard-delete-all cmd)
+    (let loop ((i 0) (maxrev 0) (total 0))
+      (if (>= i shard-groups) (cons "DEL" (cons maxrev total))
+          (let ((r (ask-shard-on (shard-pid-idx i) (cons (self) cmd))))
+            (if (and (pair? r) (string? (car r)) (string=? (car r) "DEL"))
+                (loop (+ i 1) (max maxrev (cadr r)) (+ total (cddr r)))
+                (loop (+ i 1) maxrev total))))))
+
   ; ===========================================================================
   ; EXP5 (cw-juw): ASYNC write submission — break the per-PUT blocking closed
   ; loop so the shard's group-commit actually batches. handle-put submits the
@@ -808,7 +844,9 @@
                          (cons 'max-create-rev (list-ref rl 12))
                          (cons 'min-mod-rev    (list-ref rl 9))
                          (cons 'max-mod-rev    (list-ref rl 10))))
-             (res (shard-range opts)))
+             ; cw-ivt P2: a spanning range (range-end set) scatter-gathers across groups;
+             ; a single-key range routes to its one group.
+             (res (if (and rend (> shard-groups 1)) (shard-range-all opts) (shard-range opts))))
       (cond
         ((not (pair? res)) (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: not leader")))
         ((eq? (car res) 'kv-range-ok)
@@ -899,9 +937,11 @@
       (if deny (cons 'err deny)
       (let* ((want-prev (galist 'prev_kv dr #f))
            ; snapshot the to-be-deleted live KVs via a Range over the same span.
+           ; cw-ivt P2: a spanning span scatter-gathers; single-key routes to one group.
+           (span? (and rend (> shard-groups 1)))
            (prev-kvs (if want-prev
-                         (let ((rres (shard-range (list (cons 'key key)
-                                                        (cons 'range-end rend)))))
+                         (let* ((ropts (list (cons 'key key) (cons 'range-end rend)))
+                                (rres (if span? (shard-range-all ropts) (shard-range ropts))))
                            (if (and (pair? rres) (eq? (car rres) 'kv-range-ok))
                                (map tuple->keyvalue (list-ref rres 5))
                                '()))
@@ -909,7 +949,7 @@
            (cmd   (if rend
                       (list (string->utf8 "DEL") key rend)
                       (list (string->utf8 "DEL") key)))
-           (ack   (shard-write cmd)))
+           (ack   (if span? (shard-delete-all cmd) (shard-write cmd))))
       (cond
         ((and (pair? ack) (string? (car ack)) (string=? (car ack) "DEL"))
          (let* ((rev (cadr ack)) (deleted (cddr ack))

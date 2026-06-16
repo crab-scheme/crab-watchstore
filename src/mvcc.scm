@@ -285,11 +285,23 @@
 ; ---------------------------------------------------------------------------
 
 ; current main revision; 0 if never written.
+; EXP7 (cw-u90): cache current-rev in the ctx. The shard is the SOLE writer of
+; current-rev and (with serial apply, the committed default) reads + writes are
+; serialized through one actor mailbox, so the in-memory value can never go stale
+; vs RocksDB. This removes one RocksDB point-read per applied PUT (mvcc-current-rev
+; is read per stamp), the hottest apply-path read after EXP6 batched the commits.
+; Lazy-init from RocksDB (-1 sentinel) so a restarted shard picks up the persisted
+; value on its first read.
 (define (mvcc-current-rev ctx)
-  (let ((b (kv-get ctx META-CURRENT-REV)))
-    (if (and b (>= (bytevector-length b) 8)) (bytes->u64 b 0) 0)))
+  (let ((c (shard-ctx-crev ctx)))
+    (if (>= c 0) c
+        (let* ((b (kv-get ctx META-CURRENT-REV))
+               (v (if (and b (>= (bytevector-length b) 8)) (bytes->u64 b 0) 0)))
+          (set-shard-ctx-crev! ctx v)
+          v))))
 
 (define (mvcc-set-current-rev! ctx main)
+  (set-shard-ctx-crev! ctx main)
   (kv-put! ctx META-CURRENT-REV (u64->bytes main)))
 
 ; compact revision (read floor); 0 if never compacted.  (Written by .8.)

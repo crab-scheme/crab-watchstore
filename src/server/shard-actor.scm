@@ -970,6 +970,10 @@
                     (for-each (lambda (kv) (kv-del! ctx (car kv)))
                               (kv-scan ctx (make-bytevector 0)))
                     (for-each (lambda (kv) (kv-put! ctx (car kv) (cdr kv))) rows)
+                    ; EXP7: snapshot rows wrote META-CURRENT-REV directly (bypassing
+                    ; mvcc-set-current-rev!), so the cached crev is stale — invalidate
+                    ; so the next mvcc-current-rev re-reads the installed value.
+                    (set-shard-ctx-crev! ctx -1)
                     (ctx-save-applied! ctx sbase sterm)
                     (ctx-flush! ctx)
                     (if (> (reg-count watch-reg) 0)

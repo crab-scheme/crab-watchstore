@@ -386,23 +386,41 @@
 ; per user-key whose key falls in range.  (mvcc-get-latest does the per-key
 ; newest/tombstone resolution.)  A thin O(range) scan that .7 will refine.
 (define (live-keys-in-range ctx K rangeEnd)
+  ; EXP9 (cw-aka): SINGLE-KEY fast path, symmetric to EXP8's read path. A single-key
+  ; DELETE (rangeEnd unset) targets exactly K — resolve it with one mvcc-get-latest
+  ; point seek (O(log n)) instead of kv-scanning the WHOLE NS-KEY namespace
+  ; (O(total keys)). A live K => (list K); a tombstoned/absent K => '(). This is
+  ; etcd's common single-key Delete; true ranges still scan (the KEY-CF sorts by
+  ; (lenK,K) so different-length keys in a range aren't contiguous — a bounded
+  ; range scan needs a key-ordered secondary index, tracked separately).
+  (if (range-end-unset? rangeEnd)
+      (if (mvcc-get-latest ctx K) (list K) '())
   ; collect distinct user-keys present in NS-KEY (any version), then filter to range
   ; + liveness.  We decode the user-key out of each NS-KEY composite key:
   ;   0x01 || u64be(lenK) || K || INV(rev16)
+  ; EXP9 (cw-aka): O(n) consecutive-grouping instead of the old O(n^2) `(member uk
+  ; seen)` list dedup. KEY-CF sorts by (lenK, K, INV-rev), so ALL versions of a
+  ; user-key are CONSECUTIVE — track the previous uk to skip its older versions
+  ; without a membership scan. The old quadratic dedup over ~150k keys (a range
+  ; DeleteRange, e.g. check perf cleanup) was ~n^2 ops and timed out; this is linear.
   (let ((rows (kv-scan ctx (mvcc-byte NS-KEY))))
-    (let loop ((rs rows) (seen '()) (out '()))
+    (let loop ((rs rows) (prev-uk #f) (out '()))
       (if (null? rs)
           (reverse out)
           (let* ((fk   (caar rs))
                  (lenK (bytes->u64 fk 1))
                  (uk   (subbv fk 9 (+ 9 lenK))))
             (cond
-              ((member uk seen) (loop (cdr rs) seen out))   ; already handled this key
-              ((not (in-range? uk K rangeEnd)) (loop (cdr rs) (cons uk seen) out))
-              ((mvcc-get-latest ctx uk)
-               (loop (cdr rs) (cons uk seen) (cons uk out))) ; live -> include
-              (else (loop (cdr rs) (cons uk seen) out))))))) ; tombstoned -> skip
-  )
+              ((and prev-uk (equal? uk prev-uk)) (loop (cdr rs) prev-uk out)) ; older version of same key
+              ((not (in-range? uk K rangeEnd)) (loop (cdr rs) uk out))
+              ; EXP9: the FIRST row of a key group is its NEWEST version (KEY-CF sorts
+              ; versions newest-first via INV-rev), so decode it inline instead of a
+              ; redundant mvcc-get-latest point seek per key (~n extra seeks on a bulk
+              ; range delete). Live => include; tombstone => key already absent, skip.
+              ((not (kv-rec-tombstone? (kv-record-decode (cdar rs))))
+               (loop (cdr rs) uk (cons uk out)))                              ; live -> include
+              (else (loop (cdr rs) uk out)))))))                              ; tombstoned -> skip
+  ))
 
 ; uk in [K, rangeEnd) ?  Single-key (unset rangeEnd) => uk == K exactly.
 (define (in-range? uk K rangeEnd)

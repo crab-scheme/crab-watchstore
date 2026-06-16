@@ -250,10 +250,18 @@
 (define dial-addrs (map raft-addr dial-peers))
 ; Dedicated thread — the poller is the Raft tick-clock AND sole network drainer;
 ; cooperative parking on a shared worker would slow the protocol (green-threads
-; INV-3). cw-ivt: the poller already routes inbound frames by shard-key to the right
-; local replica, so it drives ALL groups — pass the full shard-key list.
-(spawn-source-dedicated "(include \"src/server/peer-poller.scm\")" 'peer-poller
-              me shard-key-list tick-ms dial-addrs (- (length nodes) 1))
+; INV-3). cw-gx4: spawn ONE poller PER GROUP, each draining only its group's
+; cs-net channel (node-poll-ch) on its own dedicated thread, so independent
+; groups replicate in parallel instead of serializing one node-poll. Channel
+; mapping MUST match shard-actor's my-channel: SHARD-CHANNELS = #(1 3 4 5),
+; channel = (vector-ref ... (modulo group 4)). N=1 → one poller on channel 1.
+(for-each
+ (lambda (sk)
+   (let* ((g (let ((n (string->number sk))) (if n n 0)))
+          (ch (vector-ref '#(1 3 4 5) (modulo g 4))))
+     (spawn-source-dedicated "(include \"src/server/peer-poller.scm\")" 'peer-poller
+                   me (list sk) tick-ms dial-addrs (- (length nodes) 1) ch)))
+ shard-key-list)
 
 ; wait until this node has elected/learned a leader for shard 0, so the substrate is ready
 ; before we report up.  A JOINER is not in consensus yet (no leader until MemberAdd lands +

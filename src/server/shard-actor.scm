@@ -84,6 +84,12 @@
          ; the original all-voters genesis.
          (genesis-learners (if (and (>= (length rest) 6) (list? (list-ref rest 5)))
                                (list-ref rest 5) '()))
+         ; cw-gx4: this group's cs-net channel — one Raft group → one channel so
+         ; groups don't serialize on Messages. SHARD-CHANNELS = {1,3,4,5}
+         ; (Consensus/Workflow/Bulk/Observability); Control=0 + Messages=2 are
+         ; reserved. Groups beyond 4 share a channel (still N-way parallel up to 4).
+         (my-group (let ((n (string->number shard-key))) (if n n 0)))
+         (my-channel (vector-ref '#(1 3 4 5) (modulo my-group 4)))
          (handle  (store-open db-path #t))      ; create-if-missing
          (ctx     (make-ctx handle "default" sync?))
          (apply-workers
@@ -249,12 +255,15 @@
     ; ship engine outputs (target-node . rpc) to peers over the node transport.
     ; A send to a DOWN peer must not crash us — Raft is lossy-tolerant and
     ; recovers the entry on the next heartbeat/AE, so swallow transport errors.
+    ; cw-gx4: all of this group's inter-node frames route on MY-CHANNEL so
+    ; independent groups drain in parallel (TO is already a node-name string).
+    (define (gsend to msg) (node-send-ch (symbol->string node-name) to my-channel msg))
     (define (emit! outs)
       (for-each
        (lambda (o)
          (guard (e (#t #f))
-           (node-send (symbol->string node-name) (symbol->string (car o))
-                      (list 'ws-engine shard-key node-name (cdr o)))))
+           (gsend (symbol->string (car o))
+                  (list 'ws-engine shard-key node-name (cdr o)))))
        outs))
     ; match in-order applied replies to the indices that produced them. `acc` holds one
     ; slot per applied NON-conf entry (apply-fn pushes it; the no-op barrier pushes #f); a
@@ -275,7 +284,7 @@
          (guard (e (#t #f)) (send (cadr conn) (list 'put-done (caddr conn) payload))))
         ((and (pair? conn) (eq? (car conn) 'fwd))
          (guard (e (#t #f))
-           (node-send (symbol->string node-name) (symbol->string (cadr conn))
+           (gsend (symbol->string (cadr conn))
                       (list 'ws-fwd-reply shard-key node-name (cddr conn) payload))))
         (else (send conn payload))))
     (define (drain! old-applied)
@@ -428,7 +437,7 @@
     (define SNAP-CHUNK-ROWS 200)
     (define (snap-send! p payload)
       (guard (e (#t #f))
-        (node-send (symbol->string node-name) (symbol->string p)
+        (gsend (symbol->string p)
                    (list 'ws-snap shard-key node-name payload))))
     (define (ship-snaps! st)
       (let ((reqs (raft-snap-requests st)))
@@ -900,7 +909,7 @@
                                          (cons conn (+ fwd-ticks FWD-EXPIRE-TICKS)))
                          (guard (e (#t (hashtable-delete! fwd-pending fwd-seq)
                                        (send conn 'tryagain)))
-                           (node-send (symbol->string node-name) (symbol->string leader)
+                           (gsend (symbol->string leader)
                                       (list 'ws-fwd shard-key node-name fwd-seq opts))))
                        (send conn 'tryagain))
                    (send conn (range-reply st opts))))
@@ -916,7 +925,7 @@
                (if (not (raft-leader? st))
                    (begin
                      (guard (e (#t #f))
-                       (node-send (symbol->string node-name) (symbol->string origin)
+                       (gsend (symbol->string origin)
                                   (list 'ws-fwd-reply shard-key node-name id 'tryagain)))
                      (loop st leader elapsed flush-base))
                    ; replay through the normal client-write path via backlog so
@@ -933,7 +942,7 @@
              (let ((origin (cadr m)) (id (caddr m)) (opts (cadddr m)))
                (let ((payload (if (raft-leader? st) (range-reply st opts) 'tryagain)))
                  (guard (e (#t #f))
-                   (node-send (symbol->string node-name) (symbol->string origin)
+                   (gsend (symbol->string origin)
                               (list 'ws-fwd-reply shard-key node-name id payload))))
                (loop st leader elapsed flush-base)))
             ;; ---- snapshot install, follower side (cw-lkq.15) ----
@@ -1450,7 +1459,7 @@
                                      (cons conn (+ fwd-ticks FWD-EXPIRE-TICKS)))
                      (guard (e (#t (hashtable-delete! fwd-pending fwd-seq)
                                    (send conn 'tryagain)))
-                       (node-send (symbol->string node-name) (symbol->string leader)
+                       (gsend (symbol->string leader)
                                   (list 'ws-fwd-write shard-key node-name fwd-seq cmd))))
                     (else (send conn 'tryagain)))
                   (loop st leader elapsed flush-base))
@@ -1499,7 +1508,7 @@
                                      (cons conn (+ fwd-ticks FWD-EXPIRE-TICKS)))
                      (guard (e (#t (hashtable-delete! fwd-pending fwd-seq)
                                    (ack-waiter! conn 'tryagain)))
-                       (node-send (symbol->string node-name) (symbol->string leader)
+                       (gsend (symbol->string leader)
                                   (list 'ws-fwd-write shard-key node-name fwd-seq cmd))))
                     (else (ack-waiter! conn 'tryagain)))    ; no known leader → bounce (async-safe)
                   (loop st leader elapsed flush-base))

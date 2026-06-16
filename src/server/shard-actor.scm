@@ -267,11 +267,17 @@
     ; its ack rides 'ws-fwd-reply back to the origin member, whose shard relays
     ; to the real conn from ITS fwd-pending table.
     (define (ack-waiter! conn payload)
-      (if (and (pair? conn) (eq? (car conn) 'fwd))
-          (guard (e (#t #f))
-            (node-send (symbol->string node-name) (symbol->string (cadr conn))
-                       (list 'ws-fwd-reply shard-key node-name (cddr conn) payload)))
-          (send conn payload)))
+      (cond
+        ; EXP5 (cw-juw) async write: conn = (async WORKER-PID HANDLE). The worker
+        ; submitted without blocking; reply (put-done HANDLE payload) and it
+        ; encodes + grpc-respond!s. Same pending/drain machinery, new sink.
+        ((and (pair? conn) (eq? (car conn) 'async))
+         (guard (e (#t #f)) (send (cadr conn) (list 'put-done (caddr conn) payload))))
+        ((and (pair? conn) (eq? (car conn) 'fwd))
+         (guard (e (#t #f))
+           (node-send (symbol->string node-name) (symbol->string (cadr conn))
+                      (list 'ws-fwd-reply shard-key node-name (cddr conn) payload))))
+        (else (send conn payload))))
     (define (drain! old-applied)
       (let loop ((idx (+ old-applied 1)) (rs (reverse acc)))
         (if (pair? rs)
@@ -361,6 +367,33 @@
     ; round (the mailbox drain in the client-command branch), bounding the extra
     ; latency the last write in a batch can pick up under a flooded mailbox.
     (define PROPOSE-BATCH-CAP 64)
+    ; --- TEMP write-path profiling (cw-jkz): batch size + round cadence ---
+    (define prof-writes 0) (define prof-rounds 0) (define prof-t0 (current-second))
+    ; EXP3 (cw-cex): leader emit(write)->commit round-trip. last-emit set when a
+    ; write batch is emitted; on the AER that advances applied, accumulate the delta.
+    (define last-emit #f) (define rtt-sum 0.0) (define rtt-n 0)
+    (define (rtt-mark-emit!) (set! last-emit (current-second)))
+    (define (rtt-on-commit!)
+      (if last-emit
+          (begin
+            (set! rtt-sum (+ rtt-sum (- (current-second) last-emit)))
+            (set! rtt-n (+ rtt-n 1)) (set! last-emit #f)
+            (if (>= rtt-n 500)
+                (begin
+                  (display "RTT emit->commit avg-ms=") (display (* 1000.0 (/ rtt-sum rtt-n)))
+                  (display " n=") (display rtt-n) (newline)
+                  (set! rtt-sum 0.0) (set! rtt-n 0))))))
+    (define (prof-tick! n)
+      (set! prof-writes (+ prof-writes n)) (set! prof-rounds (+ prof-rounds 1))
+      (if (>= prof-writes 500)
+          (let ((dt (- (current-second) prof-t0)))
+            (display "PROF w=") (display prof-writes)
+            (display " rounds=") (display prof-rounds)
+            (display " avgbatch=") (display (exact->inexact (/ prof-writes prof-rounds)))
+            (display " w/s=") (display (/ prof-writes (if (> dt 0) dt 1)))
+            (display " ms/round=") (display (* 1000.0 (/ dt prof-rounds)))
+            (newline)
+            (set! prof-writes 0) (set! prof-rounds 0) (set! prof-t0 (current-second)))))
     ; the non-write message the drain stopped on, replayed before the mailbox.
     (define backlog '())
     ; ---- follower-forwarded linearizable reads (cw-lkq.13) ----
@@ -737,6 +770,8 @@
                       (else (settle-member! st2)))
                     ; record the new applied-index in the batch BEFORE the fsync
                     (if (> (raft-applied st2) old) (persist-applied! st2))
+                    (if (and (raft-leader? st2) (eq? (car rpc) 'aer) (> (raft-applied st2) old))
+                        (rtt-on-commit!))
                     ; HOLE 1 fix: a FOLLOWER fsyncs its applied writes (one flush)
                     ; BEFORE emitting the AppendEntries reply. The AER success means
                     ; "durably stored", so the leader may commit+ack a client only
@@ -1399,6 +1434,10 @@
                   ; A FWD STAND-IN landing here (leadership flipped between
                   ; backlog push and processing) bounces 'tryagain to origin.
                   (cond
+                    ; EXP5 async write on a non-leader: bounce tryagain via the
+                    ; async sink (client retries to the leader); no fwd relay.
+                    ((and (pair? conn) (eq? (car conn) 'async))
+                     (ack-waiter! conn 'tryagain))
                     ((and (pair? conn) (eq? (car conn) 'fwd))
                      (ack-waiter! conn 'tryagain))
                     ((and leader (not (eqv? leader node-name)))
@@ -1442,6 +1481,10 @@
                   ; A FWD STAND-IN landing here (leadership flipped between
                   ; backlog push and processing) bounces 'tryagain to origin.
                   (cond
+                    ; EXP5 async write on a non-leader: bounce tryagain via the
+                    ; async sink (client retries to the leader); no fwd relay.
+                    ((and (pair? conn) (eq? (car conn) 'async))
+                     (ack-waiter! conn 'tryagain))
                     ((and (pair? conn) (eq? (car conn) 'fwd))
                      (ack-waiter! conn 'tryagain))
                     ((and leader (not (eqv? leader node-name)))
@@ -1468,7 +1511,9 @@
                           (else
                            (if (not (eq? nxt '*timeout*))
                                (set! backlog (append backlog (list nxt))))
+                           (prof-tick! n)
                            (emit! outs1)              ; ONE AE round for the whole batch
+                           (rtt-mark-emit!)
                            (let ((st2 (maybe-commit st1))) ; solo commits now; cluster waits for AERs
                              (if (> (raft-applied st2) old) (persist-applied! st2))
                              ; this branch only runs on the leader -> #t

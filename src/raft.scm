@@ -452,6 +452,21 @@
       (broadcast-append
        (aset st 'log (append (aget st 'log) (list (cons (aget st 'term) command)))))))
 
+; EXP19 (cw-t0n): batch propose. Append a whole list of commands to the log in ONE
+; (append log entries) and broadcast ONCE — vs the drain calling raft-propose per
+; entry, which was O(log-len) PER entry (O(batch*loglen) total) AND ran
+; broadcast-append per entry while the caller discarded all but the last. The
+; resulting log + AE are byte-identical to proposing the commands one-by-one and
+; broadcasting after the last. Returns (st . broadcast-outputs) like raft-propose.
+; Empty list => no-op (st, no outputs).
+(define (raft-propose-batch st commands)
+  (if (or (not (raft-leader? st)) (null? commands))
+      (cons st '())
+      (let ((term (aget st 'term)))
+        (broadcast-append
+         (aset st 'log (append (aget st 'log)
+                               (map (lambda (c) (cons term c)) commands)))))))
+
 ; Leader-side membership change (cw-u4a.28). TARGET-VOTERS / TARGET-LEARNERS describe
 ; the desired final config. Refused (no-op) if we don't lead or a change is already
 ; in flight (one at a time). If the VOTER set is unchanged (a learner-only add/remove)

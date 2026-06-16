@@ -546,7 +546,7 @@
     ;     collapse: GiBs of RSS, 200% CPU, tick starvation, election churn).
     ;     A peer that falls below the floor is caught up with a STORE snapshot
     ;     (ws-snap) instead of log replay — see ship-snaps! below.
-    (define COMPACT-KEEP 256)
+    (define COMPACT-KEEP 1024)
     (define (compact st)
       (if solo
           (if (= (raft-applied st) (log-len st))
@@ -1502,24 +1502,35 @@
                     (else (send conn 'tryagain)))
                   (loop st leader elapsed flush-base))
                  (else
+                  ; EXP19 (cw-t0n): COLLECT the queued client writes first (no per-entry
+                  ; propose), then append the whole batch in ONE raft-propose-batch +
+                  ; ONE broadcast. The old drain proposed per entry — O(loglen) append
+                  ; AND a discarded broadcast-append EACH — i.e. O(batch*loglen). Each
+                  ; item is (conn . cmd); entry i (1-based) lands at index base-idx+i.
                   (let ((old (raft-applied st)))
-                    (let drain ((stx st) (conn conn) (cmd cmd) (n 1))
-                      (hashtable-set! pending (+ 1 (log-len stx)) conn)
-                      (let* ((r (raft-propose stx cmd)) (st1 (car r)) (outs1 (cdr r))
-                             (nxt (if (< n PROPOSE-BATCH-CAP) (raw-receive 0) '*timeout*)))
+                    (let collect ((acc (list (cons conn cmd))) (n 1))
+                      (let ((nxt (if (< n PROPOSE-BATCH-CAP) (raw-receive 0) '*timeout*)))
                         (cond
-                          ;; another queued client write -> append it to the batch
+                          ;; another queued client write -> add to the batch
                           ((and (pair? nxt) (not (symbol? (car nxt))))
-                           (drain st1 (car nxt) (cdr nxt) (+ n 1)))
-                          ;; mailbox empty / cap hit / non-write -> close the batch
+                           (collect (cons nxt acc) (+ n 1)))
+                          ;; mailbox empty / cap hit / non-write -> close + propose the batch
                           (else
                            (if (not (eq? nxt '*timeout*))
                                (set! backlog (append backlog (list nxt))))
-                           (prof-tick! n)
-                           (emit! outs1)              ; ONE AE round for the whole batch
-                           (rtt-mark-emit!)
-                           (let ((st2 (maybe-commit st1))) ; solo commits now; cluster waits for AERs
-                             (if (> (raft-applied st2) old) (persist-applied! st2))
-                             ; this branch only runs on the leader -> #t
-                             (let ((nb (settle! #t old flush-base)))  ; defer ack (durable) or ack now
-                               (loop (maybe-compact st2 nb) node-name elapsed nb))))))))))))))))))
+                           (let ((batch (reverse acc)) (base-idx (log-len st)))
+                             ; register each waiter at its prospective log index
+                             (let reg ((bs batch) (i 1))
+                               (when (pair? bs)
+                                 (hashtable-set! pending (+ base-idx i) (caar bs))
+                                 (reg (cdr bs) (+ i 1))))
+                             (prof-tick! n)
+                             (let* ((r (raft-propose-batch st (map cdr batch)))
+                                    (st1 (car r)) (outs1 (cdr r)))
+                               (emit! outs1)              ; ONE AE round for the whole batch
+                               (rtt-mark-emit!)
+                               (let ((st2 (maybe-commit st1))) ; solo commits now; cluster waits for AERs
+                                 (if (> (raft-applied st2) old) (persist-applied! st2))
+                                 ; this branch only runs on the leader -> #t
+                                 (let ((nb (settle! #t old flush-base)))  ; defer ack (durable) or ack now
+                                   (loop (maybe-compact st2 nb) node-name elapsed nb))))))))))))))))))))

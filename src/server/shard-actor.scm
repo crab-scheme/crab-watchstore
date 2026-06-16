@@ -1485,21 +1485,23 @@
                   ; A FWD STAND-IN landing here (leadership flipped between
                   ; backlog push and processing) bounces 'tryagain to origin.
                   (cond
-                    ; EXP5 async write on a non-leader: bounce tryagain via the
-                    ; async sink (client retries to the leader); no fwd relay.
-                    ((and (pair? conn) (eq? (car conn) 'async))
-                     (ack-waiter! conn 'tryagain))
+                    ; A FWD STAND-IN on a non-leader (leadership flipped) → bounce,
+                    ; never re-forward (no relay loops).
                     ((and (pair? conn) (eq? (car conn) 'fwd))
                      (ack-waiter! conn 'tryagain))
+                    ; cw-ivt: FORWARD to the shard's known leader — for ASYNC conns too
+                    ; (was: async bounced tryagain, so a write whose group is led on
+                    ; another node never progressed). The fwd-reply acks the original
+                    ; conn via ack-waiter! (async → put-done).
                     ((and leader (not (eqv? leader node-name)))
                      (set! fwd-seq (+ fwd-seq 1))
                      (hashtable-set! fwd-pending fwd-seq
                                      (cons conn (+ fwd-ticks FWD-EXPIRE-TICKS)))
                      (guard (e (#t (hashtable-delete! fwd-pending fwd-seq)
-                                   (send conn 'tryagain)))
+                                   (ack-waiter! conn 'tryagain)))
                        (node-send (symbol->string node-name) (symbol->string leader)
                                   (list 'ws-fwd-write shard-key node-name fwd-seq cmd))))
-                    (else (send conn 'tryagain)))
+                    (else (ack-waiter! conn 'tryagain)))    ; no known leader → bounce (async-safe)
                   (loop st leader elapsed flush-base))
                  (else
                   ; EXP19 (cw-t0n): COLLECT the queued client writes first (no per-entry

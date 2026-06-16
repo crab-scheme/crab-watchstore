@@ -277,11 +277,15 @@
       ; threads running the election — so the election never completes and the
       ; wait spins forever (seen with a 9-member cluster on a loaded node). A
       ; 20ms poll frees the core; startup latency cost is at most one poll.
-      (let spin ()
-        (if (table-lookup 'ws-shard-leader (qk)) #t (begin (sleep-ms 20) (spin))))
-      (display "node ") (display me) (display ": shard 0 ready (leader=")
-      (display (table-lookup 'ws-shard-leader (qk))) (display ", role=")
-      (display (table-lookup 'ws-shard-role (qk))) (display ")") (newline)))
+      ; cw-ivt: wait for + report EVERY shard group's leader (was hardcoded shard 0).
+      (for-each
+       (lambda (sk)
+         (let ((qks (string-append (symbol->string me) ":" sk)))
+           (let spin () (if (table-lookup 'ws-shard-leader qks) #t (begin (sleep-ms 20) (spin))))
+           (display "node ") (display me) (display ": shard ") (display sk)
+           (display " ready (leader=") (display (table-lookup 'ws-shard-leader qks))
+           (display ", role=") (display (table-lookup 'ws-shard-role qks)) (display ")") (newline)))
+       shard-key-list)))
 
 ; ---- etcd v3 KV gRPC service (cw-u4a.22) ----
 ; The clientport in the --cluster spec (long parsed-but-unused) is THIS node's etcd

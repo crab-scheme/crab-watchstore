@@ -64,7 +64,34 @@ transport path) → re-run Jepsen after. Validate per-channel ordering/delivery 
 preserved per group (Raft needs in-order per-peer-per-group; per-channel queues are
 already in-order, so mapping one group → one channel preserves it).
 
-## Status
+## Status — IMPLEMENTED + VALIDATED (cw-gx4 / cw-mul)
 
-Design only (this doc). The load harness (`bench/loadgen`) makes it reliably
-measurable. Implementation is a dedicated crabscheme transport effort.
+All layers shipped: cs-distrib `Router` per-channel inboxes (`send_ch` /
+`recv_local_channel` / `poll_channel`), cs-runtime `node-send-ch` / `node-poll-ch`
+builtins (direct `Value`↔bytes codec), and the watchstore rewire (shard-actor
+`my-channel = #(1 3 4 5)[group mod 4]`, one peer-poller per group). Wire format
+unchanged; clean election + replication, 0% fail; Jepsen not yet re-run.
+
+**The result reversed the original "no scale-out" finding — it was a measurement
+artifact.** All earlier numbers were taken at `loadgen -conc 64`, which is
+**latency-bound**: node CPU plateaus at ~6 cores while throughput keeps climbing
+with concurrency. Re-measured at the correct operating point (`conc >= 256`):
+
+| config | conc=64 | conc=256 | conc=512 |
+|---|---|---|---|
+| N=1 (single group) | 3546 | 4748 | 4684 |
+| N=3 (sharded)      | 3546 | 7519 | **9343** |
+| scale-out          | ~1×  | 1.58× | **1.99×** |
+
+At conc=512, **N=3 = ~9.3k w/s = 2.0× scale-out over N=1, exceeding etcd's 7562
+on the same host.** Per-channel pollers + multi-Raft sharding deliver near-linear
+scale-out once enough requests are in flight to fill the parallel groups.
+
+**Over-sharding limit (conc=512):** N=3 = 8402 → N=6 = 3333 → N=9 = 2837, with CPU
+*rising* to ~800%. Each group spawns its own dedicated poller + shard-actor thread,
+so N>node-count oversubscribes the cores (N=6 = 36 threads, N=9 = 54, on 10 cores)
+and collapses. **Optimum = N = node count** (one leader group per node). Going
+past ~9k needs more *machines* (cores + NICs), not more groups per host.
+
+Reproduce: `bench/cluster-3node.sh` + `bench/sweep-cws.sh` (conc sweep) and
+`MODE=shards bench/sweep-cws.sh` (shard sweep). **Always drive `conc >= 256`.**

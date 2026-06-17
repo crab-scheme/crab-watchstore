@@ -79,8 +79,13 @@ spawn N shards, and route client ops to the owning shard.
 - Throughput: 3-node, `--shard-groups {1,3,6}`, `check perf --load=l` — expect
   near-linear up to min(groups, cores, nodes). This is the headline measurement.
 
-## Status
+## Status — IMPLEMENTED + scale-out VALIDATED (cw-ivt / cw-gx4 / cw-mul)
 
-Iteration 1 (this doc): design only, on `feat/multi-shard`. P1 implementation next.
-Baseline = fix/cw-geo-perf (EXP6-19, 4297 w/s). The WAL (feat/raft-wal) is orthogonal
-(perf-neutral) and not required for the scale-out work.
+Multi-Raft-group sharding shipped, plus per-shard pollers (see
+`per-shard-pollers.md`). **Scale-out confirmed at the correct operating point**
+(`loadgen -conc >= 256` — `conc=64` is latency-bound and understates throughput
+~60-70%): at conc=512, N=3 = ~9.3k w/s = **2.0× over N=1 (~4.7k), beating etcd's
+7562 on the same host.** Optimum shard count = node count; N>nodes over-shards
+and collapses (dedicated thread per group oversubscribes the cores). The earlier
+"no scale-out (N=3==N=1)" reading was a conc=64 artifact. Reproduce with
+`bench/sweep-cws.sh`. WAL (feat/raft-wal) is orthogonal (perf-neutral).

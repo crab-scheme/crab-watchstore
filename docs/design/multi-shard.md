@@ -89,3 +89,8 @@ Multi-Raft-group sharding shipped, plus per-shard pollers (see
 and collapses (dedicated thread per group oversubscribes the cores). The earlier
 "no scale-out (N=3==N=1)" reading was a conc=64 artifact. Reproduce with
 `bench/sweep-cws.sh`. WAL (feat/raft-wal) is orthogonal (perf-neutral).
+
+**Multi-region (WAN) validated** — see `wan-multi-region.md`. Under emulated
+cross-region RTT (`CW_NET_DELAY_MS`), the deployment is stable at every delay;
+writes fall off smoothly/linearly with quorum RTT (~39% of LAN at 100ms RTT) while
+reads are RTT-immune on both consistency levels.

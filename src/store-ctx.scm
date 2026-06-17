@@ -29,14 +29,16 @@
   (fields (immutable handle)
           (immutable cf)
           (immutable sync)
-          (mutable   dirty)))      ; # of writes buffered since last fsync
+          (mutable   dirty)         ; # of writes buffered since last fsync
+          (mutable   crev)))        ; EXP7: cached current-rev (-1 = not yet read)
 
 ; (make-ctx handle [cf-name] [sync?])
 (define (make-ctx handle . opts)
   (make-shard-ctx handle
                   (if (and (pair? opts) (car opts)) (car opts) "default")
                   (and (pair? opts) (pair? (cdr opts)) (cadr opts))
-                  0))
+                  0
+                  -1))
 
 ; ---- raw KV ops ----
 ;

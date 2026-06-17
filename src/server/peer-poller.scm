@@ -26,7 +26,19 @@
 ;              gone (or a restarted peer is coming back) so we re-dial, healing
 ;              the mesh. node-connect is keyed by peer name, so re-dialing a live
 ;              peer is a harmless replace.
-(define (peer-poller node-name shard-keys tick-every dial-addrs target)
+; cw-gx4: CHANNEL (optional, in `rest`) — when given, this is a PER-GROUP poller
+; that drains only its group's cs-net channel via node-poll-ch, so independent
+; groups drain on separate dedicated threads in parallel instead of serializing
+; one node-poll over Messages. When absent, it's the legacy single-node poller
+; (node-poll over Messages, routes ALL groups). heal! runs on the "0"-owning
+; poller only, to avoid N threads racing node-connect.
+(define (peer-poller node-name shard-keys tick-every dial-addrs target . rest)
+  (define channel (if (and (pair? rest) (number? (car rest))) (car rest) #f))
+  (define heal-owner? (if channel (member "0" shard-keys) #t))
+  (define (poll-msgs)
+    (if channel
+        (node-poll-ch (symbol->string node-name) channel)
+        (node-poll (symbol->string node-name))))
   (define (local-pid sk)
     (table-lookup 'ws-shard-pid (string-append (symbol->string node-name) ":" sk)))
   (define (heal!)
@@ -80,10 +92,10 @@
   ; sleep-ms is a real thread sleep that releases the core.)
   (let ((tick-secs (/ tick-every 1000.0)))
     (let loop ((last (current-second)))
-      (let ((msgs (node-poll (symbol->string node-name))))
+      (let ((msgs (poll-msgs)))
         (for-each route! msgs)
         (let ((now (current-second)))
           (cond
-            ((>= (- now last) tick-secs) (tick-all!) (heal!) (loop now))
+            ((>= (- now last) tick-secs) (tick-all!) (if heal-owner? (heal!)) (loop now))
             ((null? msgs) (sleep-ms 5) (loop last))
             (else (loop last))))))))

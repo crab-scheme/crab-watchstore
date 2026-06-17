@@ -177,7 +177,25 @@
 ; is added later via MemberAdd, then promoted), so it never campaigns before being admitted.
 ; A fresh node is a voter in the full set.  Either way the live config arrives by replication
 ; (adopted on append), overriding this bootstrap set.
-(define shard-voters (if join? existing-members all-names))
+; ---- genesis learners (cw-85j) — local-majority WAN config ----
+; --learners name,name : these members boot as NON-VOTING (receive AppendEntries,
+; never count for quorum/elections). Passed IDENTICALLY to every member (the spec
+; + flag are shared), so all nodes derive the SAME genesis voters/learners split.
+; Use to seat a local-majority voter set, e.g. 9 members with ap-south as learners
+; => 5 voters (us-east 3 + eu-west 2), majority 3 = the leader's 3 local us-east
+; voters, so a write commits on the LAN instead of crossing the 80ms WAN.
+(define learner-names
+  (let ((s (arg-after "--learners" "")))
+    (if (string=? s "") '() (map string->symbol (split-on s #\,)))))
+(define (drop-learners ns)
+  (let loop ((ns ns) (acc '()))
+    (cond ((null? ns) (reverse acc))
+          ((memv (car ns) learner-names) (loop (cdr ns) acc))
+          (else (loop (cdr ns) (cons (car ns) acc))))))
+; A joiner is admitted via MemberAdd (no genesis learners); a fresh node seats the
+; voter-only set + the learner subset.
+(define shard-voters   (if join? existing-members (drop-learners all-names)))
+(define shard-learners (if join? '() learner-names))
 ; --shards N (cw-b5w.4, ADR 0005 B): apply-worker count for parallel PUT
 ; materialization. DEFAULT 1 (serial): on darwin-arm64 the measured ladder
 ; REGRESSED with 4 workers (load=l 2707 -> 1603 w/s) — the per-batch barrier
@@ -186,6 +204,16 @@
 ; for retuning (bigger batches / Linux / multi-DB); see docs/adr/0005 + cw-b5w.5.
 (define apply-shards
   (let ((n (string->number (arg-after "--shards" "1")))) (if (and n (> n 0)) n 1)))
+; cw-ivt: --shard-groups N = number of INDEPENDENT Raft groups (keys 0..N-1), each a
+; full replica group on every node. Writes to different keys land on different groups
+; → different leaders (election stagger rotates by shard idx) → parallel consensus =
+; scale-out. DEFAULT 1 (today's single-group behavior, byte-identical). Distinct from
+; --shards (apply-worker count WITHIN a group).
+(define shard-groups
+  (let ((n (string->number (arg-after "--shard-groups" "1")))) (if (and n (> n 0)) n 1)))
+(define shard-key-list
+  (let loop ((i 0) (acc '())) (if (= i shard-groups) (reverse acc)
+                                  (loop (+ i 1) (cons (number->string i) acc)))))
 ; ---- Raft timing knobs (cw-lkq.1, etcd analogues for WAN deployments) ----
 ; --tick-ms        heartbeat interval / Raft clock (etcd --heartbeat-interval);
 ;                  the poller paces ticks by wall clock (cw-b5w.7). Default 120.
@@ -210,16 +238,30 @@
 ; (serve whatever is applied; etcd's default serializable behavior).
 (define serializable-max-lag
   (let ((n (string->number (arg-after "--serializable-max-lag" "0")))) (if (and n (>= n 0)) n 0)))
-(spawn-source-dedicated "(include \"src/server/shard-actor.scm\")" 'shard-main
-              "0" shard-voters me (string-append dbbase "-shard0") durable apply-shards
-              election-ticks leader-region region-map serializable-max-lag)
+; cw-ivt: spawn one shard-main per group (key "0".."N-1"), each its own DB path.
+; N=1 is byte-identical to the old single "0" spawn (dbbase-shard0).
+(for-each
+ (lambda (sk)
+   (spawn-source-dedicated "(include \"src/server/shard-actor.scm\")" 'shard-main
+                 sk shard-voters me (string-append dbbase "-shard" sk) durable apply-shards
+                 election-ticks leader-region region-map serializable-max-lag shard-learners))
+ shard-key-list)
 
 (define dial-addrs (map raft-addr dial-peers))
 ; Dedicated thread — the poller is the Raft tick-clock AND sole network drainer;
 ; cooperative parking on a shared worker would slow the protocol (green-threads
-; INV-3).
-(spawn-source-dedicated "(include \"src/server/peer-poller.scm\")" 'peer-poller
-              me '("0") tick-ms dial-addrs (- (length nodes) 1))
+; INV-3). cw-gx4: spawn ONE poller PER GROUP, each draining only its group's
+; cs-net channel (node-poll-ch) on its own dedicated thread, so independent
+; groups replicate in parallel instead of serializing one node-poll. Channel
+; mapping MUST match shard-actor's my-channel: SHARD-CHANNELS = #(1 3 4 5),
+; channel = (vector-ref ... (modulo group 4)). N=1 → one poller on channel 1.
+(for-each
+ (lambda (sk)
+   (let* ((g (let ((n (string->number sk))) (if n n 0)))
+          (ch (vector-ref '#(1 3 4 5) (modulo g 4))))
+     (spawn-source-dedicated "(include \"src/server/peer-poller.scm\")" 'peer-poller
+                   me (list sk) tick-ms dial-addrs (- (length nodes) 1) ch)))
+ shard-key-list)
 
 ; wait until this node has elected/learned a leader for shard 0, so the substrate is ready
 ; before we report up.  A JOINER is not in consensus yet (no leader until MemberAdd lands +
@@ -243,11 +285,15 @@
       ; threads running the election — so the election never completes and the
       ; wait spins forever (seen with a 9-member cluster on a loaded node). A
       ; 20ms poll frees the core; startup latency cost is at most one poll.
-      (let spin ()
-        (if (table-lookup 'ws-shard-leader (qk)) #t (begin (sleep-ms 20) (spin))))
-      (display "node ") (display me) (display ": shard 0 ready (leader=")
-      (display (table-lookup 'ws-shard-leader (qk))) (display ", role=")
-      (display (table-lookup 'ws-shard-role (qk))) (display ")") (newline)))
+      ; cw-ivt: wait for + report EVERY shard group's leader (was hardcoded shard 0).
+      (for-each
+       (lambda (sk)
+         (let ((qks (string-append (symbol->string me) ":" sk)))
+           (let spin () (if (table-lookup 'ws-shard-leader qks) #t (begin (sleep-ms 20) (spin))))
+           (display "node ") (display me) (display ": shard ") (display sk)
+           (display " ready (leader=") (display (table-lookup 'ws-shard-leader qks))
+           (display ", role=") (display (table-lookup 'ws-shard-role qks)) (display ")") (newline)))
+       shard-key-list)))
 
 ; ---- etcd v3 KV gRPC service (cw-u4a.22) ----
 ; The clientport in the --cluster spec (long parsed-but-unused) is THIS node's etcd
@@ -313,10 +359,16 @@
                (string-append "http://" (cadr e) ":" (number->string (caddr e)))))
        nodes))
 
+; cw-6i0: a POOL of grpc-kv-main workers behind a thin round-robin router, so
+; concurrent requests issue concurrent shard proposals (the shard's group-commit
+; then coalesces them) instead of serializing one Raft commit per write through a
+; lone handler.  --grpc-workers tunes the pool size (default 32).
+(define grpc-workers
+  (string->number (arg-after "--grpc-workers" "32")))
 (define grpc-handler
-  (spawn-source-dedicated "(include \"src/server/grpc-kv.scm\")" 'grpc-kv-main
+  (spawn-source-dedicated "(include \"src/server/grpc-router.scm\")" 'grpc-router-main
                           shard-pid cluster-id member-id cluster-members
-                          (symbol->string me)))
+                          (symbol->string me) grpc-workers shard-groups))
 ; TLS path (cw-u4a.21) iff --tls-cert was given; otherwise the original h2c
 ; server.  grpc-serve-tls reuses the SAME handler actor — TLS only wraps the IO.
 (define grpc-sid

@@ -79,6 +79,17 @@
                          (list-ref rest 3) '()))
          (ser-max-lag (if (and (>= (length rest) 5) (number? (list-ref rest 4)))
                           (list-ref rest 4) 0))
+         ; 6 (cw-85j) genesis LEARNERS: non-voting members seated at bootstrap
+         ; (a WAN local-majority config). Default '() = every existing caller /
+         ; the original all-voters genesis.
+         (genesis-learners (if (and (>= (length rest) 6) (list? (list-ref rest 5)))
+                               (list-ref rest 5) '()))
+         ; cw-gx4: this group's cs-net channel — one Raft group → one channel so
+         ; groups don't serialize on Messages. SHARD-CHANNELS = {1,3,4,5}
+         ; (Consensus/Workflow/Bulk/Observability); Control=0 + Messages=2 are
+         ; reserved. Groups beyond 4 share a channel (still N-way parallel up to 4).
+         (my-group (let ((n (string->number shard-key))) (if n n 0)))
+         (my-channel (vector-ref '#(1 3 4 5) (modulo my-group 4)))
          (handle  (store-open db-path #t))      ; create-if-missing
          (ctx     (make-ctx handle "default" sync?))
          (apply-workers
@@ -244,12 +255,15 @@
     ; ship engine outputs (target-node . rpc) to peers over the node transport.
     ; A send to a DOWN peer must not crash us — Raft is lossy-tolerant and
     ; recovers the entry on the next heartbeat/AE, so swallow transport errors.
+    ; cw-gx4: all of this group's inter-node frames route on MY-CHANNEL so
+    ; independent groups drain in parallel (TO is already a node-name string).
+    (define (gsend to msg) (node-send-ch (symbol->string node-name) to my-channel msg))
     (define (emit! outs)
       (for-each
        (lambda (o)
          (guard (e (#t #f))
-           (node-send (symbol->string node-name) (symbol->string (car o))
-                      (list 'ws-engine shard-key node-name (cdr o)))))
+           (gsend (symbol->string (car o))
+                  (list 'ws-engine shard-key node-name (cdr o)))))
        outs))
     ; match in-order applied replies to the indices that produced them. `acc` holds one
     ; slot per applied NON-conf entry (apply-fn pushes it; the no-op barrier pushes #f); a
@@ -262,11 +276,17 @@
     ; its ack rides 'ws-fwd-reply back to the origin member, whose shard relays
     ; to the real conn from ITS fwd-pending table.
     (define (ack-waiter! conn payload)
-      (if (and (pair? conn) (eq? (car conn) 'fwd))
-          (guard (e (#t #f))
-            (node-send (symbol->string node-name) (symbol->string (cadr conn))
-                       (list 'ws-fwd-reply shard-key node-name (cddr conn) payload)))
-          (send conn payload)))
+      (cond
+        ; EXP5 (cw-juw) async write: conn = (async WORKER-PID HANDLE). The worker
+        ; submitted without blocking; reply (put-done HANDLE payload) and it
+        ; encodes + grpc-respond!s. Same pending/drain machinery, new sink.
+        ((and (pair? conn) (eq? (car conn) 'async))
+         (guard (e (#t #f)) (send (cadr conn) (list 'put-done (caddr conn) payload))))
+        ((and (pair? conn) (eq? (car conn) 'fwd))
+         (guard (e (#t #f))
+           (gsend (symbol->string (cadr conn))
+                      (list 'ws-fwd-reply shard-key node-name (cddr conn) payload))))
+        (else (send conn payload))))
     (define (drain! old-applied)
       (let loop ((idx (+ old-applied 1)) (rs (reverse acc)))
         (if (pair? rs)
@@ -356,6 +376,33 @@
     ; round (the mailbox drain in the client-command branch), bounding the extra
     ; latency the last write in a batch can pick up under a flooded mailbox.
     (define PROPOSE-BATCH-CAP 64)
+    ; --- TEMP write-path profiling (cw-jkz): batch size + round cadence ---
+    (define prof-writes 0) (define prof-rounds 0) (define prof-t0 (current-second))
+    ; EXP3 (cw-cex): leader emit(write)->commit round-trip. last-emit set when a
+    ; write batch is emitted; on the AER that advances applied, accumulate the delta.
+    (define last-emit #f) (define rtt-sum 0.0) (define rtt-n 0)
+    (define (rtt-mark-emit!) (set! last-emit (current-second)))
+    (define (rtt-on-commit!)
+      (if last-emit
+          (begin
+            (set! rtt-sum (+ rtt-sum (- (current-second) last-emit)))
+            (set! rtt-n (+ rtt-n 1)) (set! last-emit #f)
+            (if (>= rtt-n 500)
+                (begin
+                  (display "RTT emit->commit avg-ms=") (display (* 1000.0 (/ rtt-sum rtt-n)))
+                  (display " n=") (display rtt-n) (newline)
+                  (set! rtt-sum 0.0) (set! rtt-n 0))))))
+    (define (prof-tick! n)
+      (set! prof-writes (+ prof-writes n)) (set! prof-rounds (+ prof-rounds 1))
+      (if (>= prof-writes 500)
+          (let ((dt (- (current-second) prof-t0)))
+            (display "PROF w=") (display prof-writes)
+            (display " rounds=") (display prof-rounds)
+            (display " avgbatch=") (display (exact->inexact (/ prof-writes prof-rounds)))
+            (display " w/s=") (display (/ prof-writes (if (> dt 0) dt 1)))
+            (display " ms/round=") (display (* 1000.0 (/ dt prof-rounds)))
+            (newline)
+            (set! prof-writes 0) (set! prof-rounds 0) (set! prof-t0 (current-second)))))
     ; the non-write message the drain stopped on, replayed before the mailbox.
     (define backlog '())
     ; ---- follower-forwarded linearizable reads (cw-lkq.13) ----
@@ -390,7 +437,7 @@
     (define SNAP-CHUNK-ROWS 200)
     (define (snap-send! p payload)
       (guard (e (#t #f))
-        (node-send (symbol->string node-name) (symbol->string p)
+        (gsend (symbol->string p)
                    (list 'ws-snap shard-key node-name payload))))
     (define (ship-snaps! st)
       (let ((reqs (raft-snap-requests st)))
@@ -623,7 +670,7 @@
 
     (let* ((loaded (ctx-load-applied ctx))                 ; (idx . term) from RocksDB
            (p (car loaded)) (pt (cdr loaded))
-           (st0 (make-raft node-name voters apply-fn 0))
+           (st0 (make-raft node-name voters apply-fn 0 genesis-learners))
            ; restart: RocksDB already reflects entries up to p, so start with the
            ; log compacted to base=p (applied=commit=p). The log replays only
            ; entries above p, so committed entries are never re-applied.
@@ -732,6 +779,8 @@
                       (else (settle-member! st2)))
                     ; record the new applied-index in the batch BEFORE the fsync
                     (if (> (raft-applied st2) old) (persist-applied! st2))
+                    (if (and (raft-leader? st2) (eq? (car rpc) 'aer) (> (raft-applied st2) old))
+                        (rtt-on-commit!))
                     ; HOLE 1 fix: a FOLLOWER fsyncs its applied writes (one flush)
                     ; BEFORE emitting the AppendEntries reply. The AER success means
                     ; "durably stored", so the leader may commit+ack a client only
@@ -860,7 +909,7 @@
                                          (cons conn (+ fwd-ticks FWD-EXPIRE-TICKS)))
                          (guard (e (#t (hashtable-delete! fwd-pending fwd-seq)
                                        (send conn 'tryagain)))
-                           (node-send (symbol->string node-name) (symbol->string leader)
+                           (gsend (symbol->string leader)
                                       (list 'ws-fwd shard-key node-name fwd-seq opts))))
                        (send conn 'tryagain))
                    (send conn (range-reply st opts))))
@@ -876,7 +925,7 @@
                (if (not (raft-leader? st))
                    (begin
                      (guard (e (#t #f))
-                       (node-send (symbol->string node-name) (symbol->string origin)
+                       (gsend (symbol->string origin)
                                   (list 'ws-fwd-reply shard-key node-name id 'tryagain)))
                      (loop st leader elapsed flush-base))
                    ; replay through the normal client-write path via backlog so
@@ -893,7 +942,7 @@
              (let ((origin (cadr m)) (id (caddr m)) (opts (cadddr m)))
                (let ((payload (if (raft-leader? st) (range-reply st opts) 'tryagain)))
                  (guard (e (#t #f))
-                   (node-send (symbol->string node-name) (symbol->string origin)
+                   (gsend (symbol->string origin)
                               (list 'ws-fwd-reply shard-key node-name id payload))))
                (loop st leader elapsed flush-base)))
             ;; ---- snapshot install, follower side (cw-lkq.15) ----
@@ -930,6 +979,10 @@
                     (for-each (lambda (kv) (kv-del! ctx (car kv)))
                               (kv-scan ctx (make-bytevector 0)))
                     (for-each (lambda (kv) (kv-put! ctx (car kv) (cdr kv))) rows)
+                    ; EXP7: snapshot rows wrote META-CURRENT-REV directly (bypassing
+                    ; mvcc-set-current-rev!), so the cached crev is stale — invalidate
+                    ; so the next mvcc-current-rev re-reads the installed value.
+                    (set-shard-ctx-crev! ctx -1)
                     (ctx-save-applied! ctx sbase sterm)
                     (ctx-flush! ctx)
                     (if (> (reg-count watch-reg) 0)
@@ -1394,6 +1447,10 @@
                   ; A FWD STAND-IN landing here (leadership flipped between
                   ; backlog push and processing) bounces 'tryagain to origin.
                   (cond
+                    ; EXP5 async write on a non-leader: bounce tryagain via the
+                    ; async sink (client retries to the leader); no fwd relay.
+                    ((and (pair? conn) (eq? (car conn) 'async))
+                     (ack-waiter! conn 'tryagain))
                     ((and (pair? conn) (eq? (car conn) 'fwd))
                      (ack-waiter! conn 'tryagain))
                     ((and leader (not (eqv? leader node-name)))
@@ -1402,7 +1459,7 @@
                                      (cons conn (+ fwd-ticks FWD-EXPIRE-TICKS)))
                      (guard (e (#t (hashtable-delete! fwd-pending fwd-seq)
                                    (send conn 'tryagain)))
-                       (node-send (symbol->string node-name) (symbol->string leader)
+                       (gsend (symbol->string leader)
                                   (list 'ws-fwd-write shard-key node-name fwd-seq cmd))))
                     (else (send conn 'tryagain)))
                   (loop st leader elapsed flush-base))
@@ -1437,35 +1494,54 @@
                   ; A FWD STAND-IN landing here (leadership flipped between
                   ; backlog push and processing) bounces 'tryagain to origin.
                   (cond
+                    ; A FWD STAND-IN on a non-leader (leadership flipped) → bounce,
+                    ; never re-forward (no relay loops).
                     ((and (pair? conn) (eq? (car conn) 'fwd))
                      (ack-waiter! conn 'tryagain))
+                    ; cw-ivt: FORWARD to the shard's known leader — for ASYNC conns too
+                    ; (was: async bounced tryagain, so a write whose group is led on
+                    ; another node never progressed). The fwd-reply acks the original
+                    ; conn via ack-waiter! (async → put-done).
                     ((and leader (not (eqv? leader node-name)))
                      (set! fwd-seq (+ fwd-seq 1))
                      (hashtable-set! fwd-pending fwd-seq
                                      (cons conn (+ fwd-ticks FWD-EXPIRE-TICKS)))
                      (guard (e (#t (hashtable-delete! fwd-pending fwd-seq)
-                                   (send conn 'tryagain)))
-                       (node-send (symbol->string node-name) (symbol->string leader)
+                                   (ack-waiter! conn 'tryagain)))
+                       (gsend (symbol->string leader)
                                   (list 'ws-fwd-write shard-key node-name fwd-seq cmd))))
-                    (else (send conn 'tryagain)))
+                    (else (ack-waiter! conn 'tryagain)))    ; no known leader → bounce (async-safe)
                   (loop st leader elapsed flush-base))
                  (else
+                  ; EXP19 (cw-t0n): COLLECT the queued client writes first (no per-entry
+                  ; propose), then append the whole batch in ONE raft-propose-batch +
+                  ; ONE broadcast. The old drain proposed per entry — O(loglen) append
+                  ; AND a discarded broadcast-append EACH — i.e. O(batch*loglen). Each
+                  ; item is (conn . cmd); entry i (1-based) lands at index base-idx+i.
                   (let ((old (raft-applied st)))
-                    (let drain ((stx st) (conn conn) (cmd cmd) (n 1))
-                      (hashtable-set! pending (+ 1 (log-len stx)) conn)
-                      (let* ((r (raft-propose stx cmd)) (st1 (car r)) (outs1 (cdr r))
-                             (nxt (if (< n PROPOSE-BATCH-CAP) (raw-receive 0) '*timeout*)))
+                    (let collect ((acc (list (cons conn cmd))) (n 1))
+                      (let ((nxt (if (< n PROPOSE-BATCH-CAP) (raw-receive 0) '*timeout*)))
                         (cond
-                          ;; another queued client write -> append it to the batch
+                          ;; another queued client write -> add to the batch
                           ((and (pair? nxt) (not (symbol? (car nxt))))
-                           (drain st1 (car nxt) (cdr nxt) (+ n 1)))
-                          ;; mailbox empty / cap hit / non-write -> close the batch
+                           (collect (cons nxt acc) (+ n 1)))
+                          ;; mailbox empty / cap hit / non-write -> close + propose the batch
                           (else
                            (if (not (eq? nxt '*timeout*))
                                (set! backlog (append backlog (list nxt))))
-                           (emit! outs1)              ; ONE AE round for the whole batch
-                           (let ((st2 (maybe-commit st1))) ; solo commits now; cluster waits for AERs
-                             (if (> (raft-applied st2) old) (persist-applied! st2))
-                             ; this branch only runs on the leader -> #t
-                             (let ((nb (settle! #t old flush-base)))  ; defer ack (durable) or ack now
-                               (loop (maybe-compact st2 nb) node-name elapsed nb))))))))))))))))))
+                           (let ((batch (reverse acc)) (base-idx (log-len st)))
+                             ; register each waiter at its prospective log index
+                             (let reg ((bs batch) (i 1))
+                               (when (pair? bs)
+                                 (hashtable-set! pending (+ base-idx i) (caar bs))
+                                 (reg (cdr bs) (+ i 1))))
+                             (prof-tick! n)
+                             (let* ((r (raft-propose-batch st (map cdr batch)))
+                                    (st1 (car r)) (outs1 (cdr r)))
+                               (emit! outs1)              ; ONE AE round for the whole batch
+                               (rtt-mark-emit!)
+                               (let ((st2 (maybe-commit st1))) ; solo commits now; cluster waits for AERs
+                                 (if (> (raft-applied st2) old) (persist-applied! st2))
+                                 ; this branch only runs on the leader -> #t
+                                 (let ((nb (settle! #t old flush-base)))  ; defer ack (durable) or ack now
+                                   (loop (maybe-compact st2 nb) node-name elapsed nb))))))))))))))))))))

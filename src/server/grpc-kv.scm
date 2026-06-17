@@ -442,6 +442,30 @@
   ; optional 5th arg (cw-lkq.6): THIS node's name string, for node-peers-based
   ; MemberAdd name resolution (#f on old callers/tests -> mesh lookup disabled).
   (define my-node-name (if (and (pair? rest) (string? (car rest))) (car rest) #f))
+  ; cw-ivt: multi-Raft-group sharding. shard-groups = N (default 1). Data-path ops
+  ; (PUT/GET/DEL) route by FNV-1a(key) mod N to the LOCAL replica of the owning group
+  ; (ws-shard-pid "node:idx"); SYSTEM ops (auth/lease/membership/cur-rev) stay on the
+  ; shard-pid arg (group 0). N=1 → every key resolves to group 0 = the old behavior.
+  (define shard-groups
+    (let ((r2 (and (pair? rest) (cdr rest))))
+      (if (and (pair? r2) (number? (car r2)) (> (car r2) 0)) (car r2) 1)))
+  (define shard-pid-cache (make-vector shard-groups #f))
+  (define (shard-pid-idx i)
+    (or (vector-ref shard-pid-cache i)
+        (let ((p (and my-node-name
+                      (table-lookup 'ws-shard-pid
+                                    (string-append my-node-name ":" (number->string i))))))
+          (if p (vector-set! shard-pid-cache i p))
+          (or p shard-pid))))          ; fall back to group 0 until the replica publishes
+  (define (key-shard key)              ; FNV-1a over the key bytes, mod N
+    (if (<= shard-groups 1) 0
+        (let ((len (bytevector-length key)))
+          (let loop ((i 0) (h 2166136261))
+            (if (= i len) (modulo h shard-groups)
+                (loop (+ i 1)
+                      (modulo (* (bitwise-xor h (bytevector-u8-ref key i)) 16777619)
+                              4294967296)))))))
+  (define (shard-pid-for key) (shard-pid-idx (key-shard key)))
   ; cluster-members (cw-u4a.30): the static --cluster spec as a list of
   ; (name-string peerurl-string), e.g. (("a" "http://127.0.0.1:7001") ...).  Used by
   ; the Cluster service to report peerURLs in MemberList and as an extra id->name
@@ -461,14 +485,16 @@
   ; raw-receive here must yield the shard's reply; any dispatcher traffic that
   ; races in (*grpc-request* / *grpc-stream-msg* / *grpc-stream-end*) is buffered
   ; for the main loop so we never mis-parse it as a shard ack.
-  (define (ask-shard msg)
-    (send shard-pid msg)
+  (define (ask-shard-on pid msg)
+    (send pid msg)
     (let wait ()
       (let ((r (raw-receive)))
         (if (and (pair? r)
-                 (memq (car r) '(*grpc-request* *grpc-stream-msg* *grpc-stream-end*)))
+                 (memq (car r) '(*grpc-request* *grpc-stream-msg* *grpc-stream-end* put-done)))
             (begin (set! grpc-pending (append grpc-pending (list r))) (wait))
             r))))
+  (define (ask-shard msg) (ask-shard-on shard-pid msg))            ; SYSTEM group (0)
+  (define (ask-shard-key key msg) (ask-shard-on (shard-pid-for key) msg))  ; cw-ivt: data-path
 
   ; next mailbox message for the main loop: buffered dispatcher traffic first
   ; (FIFO), else a fresh receive.
@@ -491,17 +517,111 @@
       (make-header cluster-id member-id rev
                    (if (and (pair? r) (eq? (car r) 'cur-rev-ok)) (caddr r) 1))))
 
-  ; snapshot a key's current live record BEFORE a write (for prev_kv).
+  ; snapshot a key's current live record BEFORE a write (for prev_kv). cw-ivt: route
+  ; to the key's group.
   (define (shard-prev key)
-    (let ((r (ask-shard (list 'kv-prev (self) key))))
+    (let ((r (ask-shard-key key (list 'kv-prev (self) key))))
       (if (and (pair? r) (eq? (car r) 'kv-prev-ok)) (cadr r) #f)))   ; tuple | #f
 
   ; run a Range against the shard's ctx (leader-gated).  Returns the raw seam reply:
   ;   (kv-range-ok cur-rev term err total tuples) | 'tryagain | 'indeterminate
-  (define (shard-range opts) (ask-shard (list 'kv-range (self) opts)))
+  ; cw-ivt P1: route by the range's start key — correct for single-key reads (the
+  ; common case + check perf). A multi-key range spanning groups is INCOMPLETE under
+  ; N>1 (only the start key's group is scanned) — cross-shard scatter-gather is P2.
+  (define (shard-range opts)
+    (ask-shard-key (range-opt opts 'key (make-bytevector 0 0)) (list 'kv-range (self) opts)))
 
-  ; propose an internal write command; returns the shard ack.
-  (define (shard-write cmd) (ask-shard (cons (self) cmd)))
+  ; propose an internal write command; returns the shard ack. cw-ivt: route by the
+  ; command's key (element 1: ("PUT"|"DEL" key ...)).
+  (define (shard-write cmd)
+    (ask-shard-key (if (and (pair? cmd) (pair? (cdr cmd))) (cadr cmd) (make-bytevector 0 0))
+                   (cons (self) cmd)))
+
+  ; cw-ivt P2: a multi-key range [key,range-end) can cover keys in ANY group (keys are
+  ; hash-partitioned), so SCATTER the Range to every group, GATHER, and merge: union
+  ; the tuples, sort by user-key (bv<?), sum the per-group totals, max the cur-rev,
+  ; apply the limit post-merge. Each group only holds its own keys, so the union is the
+  ; full range with no dups. NOTE: not a consistent cross-group snapshot (per-group
+  ; linearizable reads at possibly-different revs) — a documented divergence.
+  (define (take-n lst n)
+    (let loop ((l lst) (k n) (acc '()))
+      (if (or (null? l) (= k 0)) (reverse acc) (loop (cdr l) (- k 1) (cons (car l) acc)))))
+  (define (shard-range-all opts)
+    (let loop ((i 0) (crev 0) (term 1) (total 0) (tuples '()) (compacted #f))
+      (if (>= i shard-groups)
+          (if compacted (list 'kv-range-ok (if (< crev 1) 1 crev) term 'compacted 0 '())
+              (let* ((sorted (list-sort (lambda (a b) (bv<? (car a) (car b))) tuples))
+                     (lim (range-opt opts 'limit 0))
+                     (final (if (and (> lim 0) (> (length sorted) lim)) (take-n sorted lim) sorted)))
+                (list 'kv-range-ok (if (< crev 1) 1 crev) term #f total final)))
+          (let ((r (ask-shard-on (shard-pid-idx i) (list 'kv-range (self) opts))))
+            (if (and (pair? r) (eq? (car r) 'kv-range-ok))
+                (loop (+ i 1) (max crev (list-ref r 1)) (list-ref r 2)
+                      (+ total (list-ref r 4)) (append (list-ref r 5) tuples)
+                      (or compacted (eq? (list-ref r 3) 'compacted)))
+                (loop (+ i 1) crev term total tuples compacted))))))   ; skip a failed group (best-effort)
+
+  ; cw-ivt P2: a multi-key DeleteRange likewise spans groups — SCATTER the DEL to every
+  ; group (each deletes its matching keys) and SUM the counts. Best-effort, NOT atomic
+  ; across groups (independent Raft) — a documented divergence; a group that bounces
+  ; tryagain just contributes 0 (its keys aren't deleted this call). Returns ("DEL" rev . n).
+  (define (shard-delete-all cmd)
+    (let loop ((i 0) (maxrev 0) (total 0))
+      (if (>= i shard-groups) (cons "DEL" (cons maxrev total))
+          (let ((r (ask-shard-on (shard-pid-idx i) (cons (self) cmd))))
+            (if (and (pair? r) (string? (car r)) (string=? (car r) "DEL"))
+                (loop (+ i 1) (max maxrev (cadr r)) (+ total (cddr r)))
+                (loop (+ i 1) maxrev total))))))
+
+  ; ===========================================================================
+  ; EXP5 (cw-juw): ASYNC write submission — break the per-PUT blocking closed
+  ; loop so the shard's group-commit actually batches. handle-put submits the
+  ; write tagged with the call-handle and RETURNS (no block); the shard replies
+  ; (put-done HANDLE payload) on commit; respond-put-done! encodes + responds.
+  ; ===========================================================================
+  ; cached "is auth disabled?" — checked once (one blocking round-trip), then the
+  ; fast async PUT path skips the per-op auth-state round-trip. PROTOTYPE: a stale
+  ; cache would skip authz if auth is toggled on mid-run (acceptable for the perf
+  ; experiment; real fix would invalidate on the auth-rev the shard already tracks).
+  (define auth-known #f) (define auth-off #f)
+  (define (auth-disabled?)
+    (if auth-known auth-off
+        (let ((s (ask-shard (list 'auth-state (self)))))
+          (set! auth-known #t)
+          (set! auth-off (or (not (pair? s)) (not (eq? (car s) 'auth-state-ok)) (not (cadr s))))
+          auth-off)))
+  ; cached raft term for the async PutResponse header (refreshed lazily; term is
+  ; near-constant and clients don't gate on it for puts).
+  (define wterm 1) (define wterm-left 0)
+  (define (wterm!)
+    (when (<= wterm-left 0)
+      (let ((r (ask-shard (list 'cur-rev (self)))))
+        (if (and (pair? r) (eq? (car r) 'cur-rev-ok)) (set! wterm (caddr r))))
+      (set! wterm-left 1024))
+    (set! wterm-left (- wterm-left 1))
+    wterm)
+  ; EXP6 (cw-xwp): bounded in-flight window — backpressure. Async submission
+  ; (EXP5) removed the per-PUT block, but with NO bound the worker submits
+  ; unboundedly; under sustained load=l the shard mailbox/pending grow faster
+  ; than commit drains them → leader pegs 100% CPU, GC thrash, cluster wedges.
+  ; Cap the number of un-acked async PUTs per worker; when full, BLOCK draining
+  ; put-done acks (which decrement inflight) before submitting more. With N
+  ; workers the global window is bounded to N*INFLIGHT-CAP — enough to keep the
+  ; shard's group-commit batch full without unbounded queue growth.
+  (define INFLIGHT-CAP 8)
+  (define inflight 0)
+  ; respond to an async PUT once its commit lands.
+  (define (respond-put-done! m)
+    (set! inflight (- inflight 1))
+    (let ((h (cadr m)) (payload (caddr m)))
+      (cond
+        ((and (pair? payload) (string? (car payload)) (string=? (car payload) "PUT"))
+         (grpc-respond! h (etcd-pb-encode-put-resp cluster-id member-id (cdr payload) (wterm!) #f)))
+        ((and (pair? payload) (eq? (car payload) 'err-lease-not-found))
+         (grpc-respond-error! h 9 "etcdserver: requested lease not found"))
+        ((eq? payload 'tryagain)      (grpc-respond-error! h GRPC-UNAVAILABLE "etcdserver: not leader"))
+        ((eq? payload 'indeterminate) (grpc-respond-error! h GRPC-UNAVAILABLE "etcdserver: leader changed"))
+        (else (grpc-respond-error! h GRPC-INTERNAL "put: unexpected async ack")))))
 
   ; ===========================================================================
   ; Cluster service helpers (cw-u4a.30) — node-name <-> etcd Member, over the .29
@@ -724,7 +844,9 @@
                          (cons 'max-create-rev (list-ref rl 12))
                          (cons 'min-mod-rev    (list-ref rl 9))
                          (cons 'max-mod-rev    (list-ref rl 10))))
-             (res (shard-range opts)))
+             ; cw-ivt P2: a spanning range (range-end set) scatter-gathers across groups;
+             ; a single-key range routes to its one group.
+             (res (if (and rend (> shard-groups 1)) (shard-range-all opts) (shard-range opts))))
       (cond
         ((not (pair? res)) (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: not leader")))
         ((eq? (car res) 'kv-range-ok)
@@ -747,13 +869,47 @@
   ; back (cons 'err-lease-not-found id) -> a gRPC error (FailedPrecondition 9, etcd's).
   ; HOT PATH (cw-b5w.2): native decode/encode, same rationale as handle-range.
   ; Decoded list is positional: (key value lease prev_kv ignore_value ignore_lease).
+  ; EXP5 (cw-juw): fast ASYNC PUT path. When auth is disabled and no prev_kv is
+  ; requested (the common case incl. check perf / kube writes), decode + submit the
+  ; write tagged with the call-handle and RETURN 'async — the shard replies
+  ; (put-done h ...) on commit and the main loop encodes+responds. This removes the
+  ; blocking ask-shard so the worker keeps submitting → the shard's mailbox fills →
+  ; group-commit batches. Anything needing prev_kv or auth falls back to sync.
   (define (handle-put h bytes)
     (let* ((pr    (etcd-pb-decode-put bytes))
            (key   (list-ref pr 0))
            (value (list-ref pr 1))
            (lease (list-ref pr 2))
-           (want-prev (list-ref pr 3))
-           (deny  (authz-deny? h key #f 'write)))
+           (want-prev (list-ref pr 3)))
+      (if (and (not want-prev) (auth-disabled?))
+          (begin
+            ; EXP6: backpressure — if our in-flight window is full, block draining
+            ; put-done acks (each decrements inflight + responds) until there's room.
+            (drain-until-room!)
+            (set! inflight (+ inflight 1))
+            ; cw-ivt: route the async PUT to the key's group.
+            (send (shard-pid-for key) (cons (list 'async (self) h)
+                                  (list (string->utf8 "PUT") key value (int->bytes lease))))
+            'async)
+          (handle-put-sync h key value lease want-prev))))
+
+  ; EXP6: block until inflight < INFLIGHT-CAP, servicing put-done acks (which
+  ; decrement inflight). Any racing dispatcher traffic is buffered for the main
+  ; loop, exactly as ask-shard does — so we never mis-handle a *grpc-request*.
+  (define (drain-until-room!)
+    (let wait ()
+      (when (>= inflight INFLIGHT-CAP)
+        (let ((r (raw-receive)))
+          (cond
+            ((and (pair? r) (eq? (car r) 'put-done)) (respond-put-done! r))
+            ((and (pair? r)
+                  (memq (car r) '(*grpc-request* *grpc-stream-msg* *grpc-stream-end*)))
+             (set! grpc-pending (append grpc-pending (list r))))
+            (else #f))
+          (wait)))))
+
+  (define (handle-put-sync h key value lease want-prev)
+    (let* ((deny  (authz-deny? h key #f 'write)))
       (if deny (cons 'err deny)
       (let* ((prev  (and want-prev (shard-prev key)))
              (ack   (shard-write (list (string->utf8 "PUT") key value (int->bytes lease)))))
@@ -781,9 +937,11 @@
       (if deny (cons 'err deny)
       (let* ((want-prev (galist 'prev_kv dr #f))
            ; snapshot the to-be-deleted live KVs via a Range over the same span.
+           ; cw-ivt P2: a spanning span scatter-gathers; single-key routes to one group.
+           (span? (and rend (> shard-groups 1)))
            (prev-kvs (if want-prev
-                         (let ((rres (shard-range (list (cons 'key key)
-                                                        (cons 'range-end rend)))))
+                         (let* ((ropts (list (cons 'key key) (cons 'range-end rend)))
+                                (rres (if span? (shard-range-all ropts) (shard-range ropts))))
                            (if (and (pair? rres) (eq? (car rres) 'kv-range-ok))
                                (map tuple->keyvalue (list-ref rres 5))
                                '()))
@@ -791,7 +949,7 @@
            (cmd   (if rend
                       (list (string->utf8 "DEL") key rend)
                       (list (string->utf8 "DEL") key)))
-           (ack   (shard-write cmd)))
+           (ack   (if span? (shard-delete-all cmd) (shard-write cmd))))
       (cond
         ((and (pair? ack) (string? (car ack)) (string=? (car ack) "DEL"))
          (let* ((rev (cadr ack)) (deleted (cddr ack))
@@ -1259,6 +1417,9 @@
                       ((string=? path "/grpc.health.v1.Health/Check")         (handle-health-check h bytes))
                       (else (cons 'unimplemented path))))))
       (cond
+        ; EXP5: an async PUT already submitted; its response is sent later from
+        ; the main loop on the shard's put-done reply. Nothing to do here.
+        ((eq? res 'async) #f)
         ((and (pair? res) (eq? (car res) 'ok))
          (grpc-respond! h (cdr res)))
         ((and (pair? res) (eq? (car res) 'err))
@@ -1547,6 +1708,9 @@
         ((not (pair? m)) (loop))
         ((eq? (car m) '*grpc-request*)
          (dispatch! (cadr m)) (loop))
+        ; EXP5 (cw-juw): async PUT commit landed -> encode + respond now.
+        ((eq? (car m) 'put-done)
+         (respond-put-done! m) (loop))
         ; a subsequent client-streamed message -> forward to the stream worker.
         ; A dead worker (it crashed / already exited) must NOT take down the
         ; dispatcher: guard the send and drop the stale route.

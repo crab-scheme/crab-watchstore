@@ -285,11 +285,23 @@
 ; ---------------------------------------------------------------------------
 
 ; current main revision; 0 if never written.
+; EXP7 (cw-u90): cache current-rev in the ctx. The shard is the SOLE writer of
+; current-rev and (with serial apply, the committed default) reads + writes are
+; serialized through one actor mailbox, so the in-memory value can never go stale
+; vs RocksDB. This removes one RocksDB point-read per applied PUT (mvcc-current-rev
+; is read per stamp), the hottest apply-path read after EXP6 batched the commits.
+; Lazy-init from RocksDB (-1 sentinel) so a restarted shard picks up the persisted
+; value on its first read.
 (define (mvcc-current-rev ctx)
-  (let ((b (kv-get ctx META-CURRENT-REV)))
-    (if (and b (>= (bytevector-length b) 8)) (bytes->u64 b 0) 0)))
+  (let ((c (shard-ctx-crev ctx)))
+    (if (>= c 0) c
+        (let* ((b (kv-get ctx META-CURRENT-REV))
+               (v (if (and b (>= (bytevector-length b) 8)) (bytes->u64 b 0) 0)))
+          (set-shard-ctx-crev! ctx v)
+          v))))
 
 (define (mvcc-set-current-rev! ctx main)
+  (set-shard-ctx-crev! ctx main)
   (kv-put! ctx META-CURRENT-REV (u64->bytes main)))
 
 ; compact revision (read floor); 0 if never compacted.  (Written by .8.)
@@ -374,23 +386,41 @@
 ; per user-key whose key falls in range.  (mvcc-get-latest does the per-key
 ; newest/tombstone resolution.)  A thin O(range) scan that .7 will refine.
 (define (live-keys-in-range ctx K rangeEnd)
+  ; EXP9 (cw-aka): SINGLE-KEY fast path, symmetric to EXP8's read path. A single-key
+  ; DELETE (rangeEnd unset) targets exactly K — resolve it with one mvcc-get-latest
+  ; point seek (O(log n)) instead of kv-scanning the WHOLE NS-KEY namespace
+  ; (O(total keys)). A live K => (list K); a tombstoned/absent K => '(). This is
+  ; etcd's common single-key Delete; true ranges still scan (the KEY-CF sorts by
+  ; (lenK,K) so different-length keys in a range aren't contiguous — a bounded
+  ; range scan needs a key-ordered secondary index, tracked separately).
+  (if (range-end-unset? rangeEnd)
+      (if (mvcc-get-latest ctx K) (list K) '())
   ; collect distinct user-keys present in NS-KEY (any version), then filter to range
   ; + liveness.  We decode the user-key out of each NS-KEY composite key:
   ;   0x01 || u64be(lenK) || K || INV(rev16)
+  ; EXP9 (cw-aka): O(n) consecutive-grouping instead of the old O(n^2) `(member uk
+  ; seen)` list dedup. KEY-CF sorts by (lenK, K, INV-rev), so ALL versions of a
+  ; user-key are CONSECUTIVE — track the previous uk to skip its older versions
+  ; without a membership scan. The old quadratic dedup over ~150k keys (a range
+  ; DeleteRange, e.g. check perf cleanup) was ~n^2 ops and timed out; this is linear.
   (let ((rows (kv-scan ctx (mvcc-byte NS-KEY))))
-    (let loop ((rs rows) (seen '()) (out '()))
+    (let loop ((rs rows) (prev-uk #f) (out '()))
       (if (null? rs)
           (reverse out)
           (let* ((fk   (caar rs))
                  (lenK (bytes->u64 fk 1))
                  (uk   (subbv fk 9 (+ 9 lenK))))
             (cond
-              ((member uk seen) (loop (cdr rs) seen out))   ; already handled this key
-              ((not (in-range? uk K rangeEnd)) (loop (cdr rs) (cons uk seen) out))
-              ((mvcc-get-latest ctx uk)
-               (loop (cdr rs) (cons uk seen) (cons uk out))) ; live -> include
-              (else (loop (cdr rs) (cons uk seen) out))))))) ; tombstoned -> skip
-  )
+              ((and prev-uk (equal? uk prev-uk)) (loop (cdr rs) prev-uk out)) ; older version of same key
+              ((not (in-range? uk K rangeEnd)) (loop (cdr rs) uk out))
+              ; EXP9: the FIRST row of a key group is its NEWEST version (KEY-CF sorts
+              ; versions newest-first via INV-rev), so decode it inline instead of a
+              ; redundant mvcc-get-latest point seek per key (~n extra seeks on a bulk
+              ; range delete). Live => include; tombstone => key already absent, skip.
+              ((not (kv-rec-tombstone? (kv-record-decode (cdar rs))))
+               (loop (cdr rs) uk (cons uk out)))                              ; live -> include
+              (else (loop (cdr rs) uk out)))))))                              ; tombstoned -> skip
+  ))
 
 ; uk in [K, rangeEnd) ?  Single-key (unset rangeEnd) => uk == K exactly.
 (define (in-range? uk K rangeEnd)
@@ -585,6 +615,32 @@
     ; ErrCompacted: if a non-zero explicit revision is below compact-rev
     (if (and (not (= req-rev 0)) (< req-rev compact-rev))
         (cons 'err-compacted compact-rev)
+        ; EXP8 (cw-709): SINGLE-KEY fast path. etcd's most common read is a point
+        ; GET (range-end unset). The general path below kv-scans the WHOLE NS-KEY
+        ; namespace and is O(total keys) per read — catastrophic at scale and the
+        ; cause of the read-hang (cw-b7f), since kv-scan over a sparse prefix also
+        ; trips the cs-store iterator bug (cs-s9i). A point read uses mvcc-get-latest
+        ; (one O(log n) seek), identical visibility semantics (newest version
+        ; <= at-rev, tombstone => absent). Only taken when NO create/mod-rev filters
+        ; apply (those need the group scan); otherwise fall through.
+        (if (and (range-end-unset? range-end)
+                 (= min-cr 0) (= max-cr 0) (= min-mr 0) (= max-mr 0))
+            (let ((rec (if (= req-rev 0)
+                           (mvcc-get-latest ctx key)
+                           (mvcc-get-latest ctx key at-rev))))
+              (if (not rec)
+                  (cons 0 '())
+                  (cons 1 (if count-only
+                              '()
+                              (list (cons key
+                                          (if keys-only
+                                              (vector (vector-ref rec 0)   ; tag
+                                                      (vector-ref rec 1)   ; create-rev
+                                                      (vector-ref rec 2)   ; mod-rev
+                                                      (vector-ref rec 3)   ; version
+                                                      (vector-ref rec 4)   ; lease
+                                                      (make-bytevector 0 0)) ; blank value
+                                              rec)))))))
         ; -- scan NS-KEY namespace forward, group by user-key, pick visible version --
         (let ((rows (kv-scan ctx (mvcc-byte NS-KEY))))
           ; Iterate all KEY-CF rows in on-disk order.  Rows are ordered by
@@ -661,7 +717,7 @@
                     ; new key — flush previous group first, start new group
                     (else
                      (let ((new-results (if cur-uk (flush-group cur-uk (reverse cur-group)) results)))
-                       (collect (cdr rs) uk (list row) new-results)))))))))))
+                       (collect (cdr rs) uk (list row) new-results))))))))))))
 
 ; ---------------------------------------------------------------------------
 ; mvcc-digest-at / mvcc-snapshot-kvs  (cw-u4a.32 — Maintenance Status/Hash/HashKV/Snapshot)

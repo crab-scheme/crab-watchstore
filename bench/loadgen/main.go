@@ -39,6 +39,10 @@ func main() {
 	dur := flag.Duration("dur", 20*time.Second, "load duration")
 	conc := flag.Int("conc", 64, "concurrent writers")
 	valsize := flag.Int("valsize", 256, "value bytes")
+	op := flag.String("op", "put", "put | get")
+	serializable := flag.Bool("serializable", false, "get: serializable (stale-OK, any replica) vs linearizable (ReadIndex)")
+	follower := flag.Bool("follower", false, "get: route to a follower node (multi-region local read) instead of the leader")
+	seedKeys := flag.Int("seedkeys", 200, "get: keys per worker to seed before the timed read loop")
 	flag.Parse()
 
 	endpoints := strings.Split(*eps, ",")
@@ -54,6 +58,46 @@ func main() {
 		clients[i] = c
 	}
 	val := strings.Repeat("x", *valsize)
+	// route a key to an endpoint: leader = endpoints[group % n]; a follower for
+	// the same group (multi-region local read) = endpoints[(group+1) % n].
+	route := func(key string, i int) int {
+		switch *mode {
+		case "one":
+			return 0
+		case "rr":
+			return i % len(endpoints)
+		default: // sharded
+			ci := keyGroup(key, *shards) % len(endpoints)
+			if *op == "get" && *follower {
+				ci = (ci + 1) % len(endpoints)
+			}
+			return ci
+		}
+	}
+
+	// get mode: seed each worker's keyspace once (linearizable puts to the
+	// leader) so the timed read loop hits keys that exist.
+	if *op == "get" {
+		var swg sync.WaitGroup
+		for g := 0; g < *conc; g++ {
+			swg.Add(1)
+			go func(gid int) {
+				defer swg.Done()
+				for i := 0; i < *seedKeys; i++ {
+					key := fmt.Sprintf("k%d_%d", gid, i)
+					ci := keyGroup(key, *shards) % len(endpoints)
+					if *mode == "one" {
+						ci = 0
+					}
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					clients[ci].Put(ctx, key, val)
+					cancel()
+				}
+			}(g)
+		}
+		swg.Wait()
+	}
+
 	var ok, fail uint64
 	deadline := time.Now().Add(*dur)
 	var wg sync.WaitGroup
@@ -63,19 +107,25 @@ func main() {
 			defer wg.Done()
 			i := 0
 			for time.Now().Before(deadline) {
-				key := fmt.Sprintf("k%d_%d", gid, i)
-				i++
-				var ci int
-				switch *mode {
-				case "sharded":
-					ci = keyGroup(key, *shards) % len(endpoints)
-				case "one":
-					ci = 0
-				default: // rr
-					ci = i % len(endpoints)
+				var key string
+				if *op == "get" {
+					key = fmt.Sprintf("k%d_%d", gid, i%*seedKeys)
+				} else {
+					key = fmt.Sprintf("k%d_%d", gid, i)
 				}
+				ci := route(key, i)
+				i++
 				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-				_, err := clients[ci].Put(ctx, key, val)
+				var err error
+				if *op == "get" {
+					var opts []clientv3.OpOption
+					if *serializable {
+						opts = append(opts, clientv3.WithSerializable())
+					}
+					_, err = clients[ci].Get(ctx, key, opts...)
+				} else {
+					_, err = clients[ci].Put(ctx, key, val)
+				}
 				cancel()
 				if err != nil {
 					atomic.AddUint64(&fail, 1)
@@ -87,6 +137,19 @@ func main() {
 	}
 	wg.Wait()
 	secs := dur.Seconds()
-	fmt.Printf("mode=%s shards=%d conc=%d dur=%s -> ok=%d fail=%d  THROUGHPUT=%.0f writes/s (fail-rate=%.1f%%)\n",
-		*mode, *shards, *conc, dur.String(), ok, fail, float64(ok)/secs, 100*float64(fail)/float64(ok+fail+1))
+	unit := "writes/s"
+	tag := ""
+	if *op == "get" {
+		unit = "reads/s"
+		if *serializable {
+			tag = " serializable"
+		} else {
+			tag = " linearizable"
+		}
+		if *follower {
+			tag += " follower-routed"
+		}
+	}
+	fmt.Printf("op=%s%s mode=%s shards=%d conc=%d dur=%s -> ok=%d fail=%d  THROUGHPUT=%.0f %s (fail-rate=%.1f%%)\n",
+		*op, tag, *mode, *shards, *conc, dur.String(), ok, fail, float64(ok)/secs, unit, 100*float64(fail)/float64(ok+fail+1))
 }

@@ -84,6 +84,10 @@
          ; the original all-voters genesis.
          (genesis-learners (if (and (>= (length rest) 6) (list? (list-ref rest 5)))
                                (list-ref rest 5) '()))
+         ; 7 (cw-e9a) leader-node: pin leadership to THIS named voter (not just a
+         ; region). #f = no node pin (use leader-region / shard-rotated stagger).
+         (leader-node (if (and (>= (length rest) 7) (symbol? (list-ref rest 6)))
+                          (list-ref rest 6) #f))
          ; cw-gx4: this group's cs-net channel — one Raft group → one channel so
          ; groups don't serialize on Messages. SHARD-CHANNELS = {1,3,4,5}
          ; (Consensus/Workflow/Bulk/Observability); Control=0 + Messages=2 are
@@ -137,10 +141,18 @@
          ; Staggered election timeout, ROTATED by shard so leadership spreads:
          ; for shard S the voter at index S has the shortest timeout and tends to
          ; win it. Deterministic => no split votes, predictable failover.
-         (timeout (+ election-base (* (modulo (- (index-of node-name voters)
+         ; cw-e9a: when leader-node is pinned, that voter gets the strictly-shortest
+         ; timeout (election-base) and every other voter is staggered strictly above
+         ; it (base + 3 + index*3, distinct per node => no split votes), so the pinned
+         ; node wins the initial election; non-voters/absent pin falls through.
+         (timeout (if (and leader-node (member leader-node voters))
+                      (if (eqv? node-name leader-node)
+                          election-base
+                          (+ election-base 3 (* (index-of node-name voters) 3)))
+                      (+ election-base (* (modulo (- (index-of node-name voters)
                                      (let ((n (string->number shard-key))) (if n n 0)))
                                   (length voters))
-                          3))))
+                          3)))))
     ; ---- MVCC state machine (cw-u4a.6, ADR 0001) ----
     ; Apply one committed Raft entry as one etcd Txn: mvcc-apply stamps the new
     ; revision, writes the KEY-CF record + REV-CF event (+ lease index) and bumps
@@ -496,25 +508,38 @@
     (define XFER-EVERY 25)                  ; ticks between attempts (~3s at 120ms)
     (define xfer-ticks 0)
     (define (region-of n) (let ((hit (assv n region-map))) (and hit (cdr hit))))
+    ; cw-e9a: leader-NODE pin takes precedence — a leader that is not the pinned
+    ; node transfers straight to it (raft-transfer-leadership no-ops if the target
+    ; is down / lagging / not a voter, so a missing pin keeps leadership put).
+    ; When no node pin is set, fall back to the region pin (first caught-up voter
+    ; in leader-region).
+    (define (misplaced-leader? st)
+      (and (raft-leader? st)
+           (cond (leader-node   (not (eqv? node-name leader-node)))
+                 (leader-region (not (equal? (region-of node-name) leader-region)))
+                 (else #f))))
     (define (maybe-transfer-home! st)
-      (if (and leader-region
-               (raft-leader? st)
-               (not (equal? (region-of node-name) leader-region)))
+      (if (misplaced-leader? st)
           (begin
             (set! xfer-ticks (+ xfer-ticks 1))
             (if (>= xfer-ticks XFER-EVERY)
                 (begin
                   (set! xfer-ticks 0)
-                  (let try ((vs (aget st 'voters)))
-                    (cond
-                      ((null? vs) #f)        ; no caught-up preferred voter — stay
-                      ((and (not (eqv? (car vs) node-name))
-                            (equal? (region-of (car vs)) leader-region))
-                       (let ((r (raft-transfer-leadership st (car vs))))
-                         (if (eq? (car r) 'ok)
-                             (emit! (cadr r))
-                             (try (cdr vs)))))
-                      (else (try (cdr vs))))))))))
+                  (if leader-node
+                      ; node pin: transfer directly to the named voter
+                      (let ((r (raft-transfer-leadership st leader-node)))
+                        (if (eq? (car r) 'ok) (emit! (cadr r)) #f))
+                      ; region pin: first caught-up voter in leader-region
+                      (let try ((vs (aget st 'voters)))
+                        (cond
+                          ((null? vs) #f)        ; no caught-up preferred voter — stay
+                          ((and (not (eqv? (car vs) node-name))
+                                (equal? (region-of (car vs)) leader-region))
+                           (let ((r (raft-transfer-leadership st (car vs))))
+                             (if (eq? (car r) 'ok)
+                                 (emit! (cadr r))
+                                 (try (cdr vs)))))
+                          (else (try (cdr vs)))))))))))
     ; fsync the batch, then ack every buffered waiter from `base`.
     (define (flush-and-drain! base)
       (ctx-flush! ctx)

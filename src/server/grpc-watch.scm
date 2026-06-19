@@ -188,9 +188,28 @@
            (grpc-stream-close! h WG-UNAVAILABLE "etcdserver: no leader"))
           (else (await))))))
 
-  ; progress_request (§6): not exercised by the etcdctl proof; a no-op here
-  ; (the synced-watcher progress emit lives in the .14 streaming actor).
-  (define (do-progress) #f)
+  ; progress_request (§6, cw-5w8): etcd RequestProgress. The kube-apiserver watch
+  ; cache sends this to confirm a watch is caught up to its LIST revision; for an
+  ; UNCHANGING resource (no events ever flow) it is the ONLY way the cache reaches
+  ; "synced", so the old no-op left those informers hung forever (KCM controllers
+  ; stuck on "Waiting for caches to sync"; the scheduler's high-traffic pod/node
+  ; watches synced via events, masking it). Reply with a broadcast progress
+  ; notification — a WatchResponse with watch_id = -1 and the current store
+  ; revision, no events — exactly etcd's ProgressNotify (clientv3 advances every
+  ; substream on this stream to that revision). Drain any interleaved watcher
+  ; frames while awaiting the shard's cur-rev so delivery order is preserved.
+  (define (do-progress)
+    (send shard-pid (list 'cur-rev (self)))
+    (let await ()
+      (let ((r (raw-receive)))
+        (cond
+          ((not (pair? r)) (await))
+          ((eq? (car r) 'watch-response) (emit-wr! (cadr r)) (await))
+          ((eq? (car r) 'cur-rev-ok)
+           (emit-wr! (list -1 (cadr r) #f #f "" 0 '())))
+          ((eq? (car r) 'watch-not-leader)
+           (grpc-stream-close! h WG-UNAVAILABLE "etcdserver: no leader"))
+          (else (await))))))
 
   (define (handle-client-msg bytes)
     (let* ((req (pb-decode WatchRequest-schema bytes))

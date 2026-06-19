@@ -99,7 +99,11 @@ spec:
       - name: cws
         image: debian:bookworm-slim
         command: ["bash","/cfg/bootstrap.sh"]
-        args: ["--config","/etc/crab-watchstore.conf","--tick-ms","250","--election-ticks","10","--locality","{m['region']}","--leader-region","{leader_region}","--learners","{learners}"]
+        # cw-e9a: 2.5s election timeout (250ms x 10) let durable-fsync heartbeat
+        # stalls under k8s control-plane write load trigger spurious elections,
+        # bouncing leadership and wedging k0s. Widen to 10s (500ms x 20) so a
+        # transient fsync stall on the contended host can't cost leadership.
+        args: ["--config","/etc/crab-watchstore.conf","--tick-ms","500","--election-ticks","20","--locality","{m['region']}","--leader-region","{leader_region}","--leader-node","m1a","--learners","{learners}"]
         securityContext: {{ capabilities: {{ add: ["NET_ADMIN"] }} }}
         resources:
           requests: {{ cpu: "1", memory: 256Mi }}

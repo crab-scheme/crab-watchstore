@@ -110,6 +110,19 @@
 ; The first WatchRequest is read from the call slot via (grpc-request-bytes h).
 (define (grpc-watch-worker h shard-pid cluster-id member-id)
   (define live-wids '())   ; watch_ids established on THIS stream (for teardown)
+  ; cw-5w8 root-cause #2: once ANY watch on this stream sets progress_notify=true
+  ; (etcd's WithProgressNotify), the server owes PERIODIC progress notifications, not
+  ; just on-demand RequestProgress replies. The kube-apiserver watch cache marks a
+  ; static-resource informer "synced" off these periodic ticks; without them the
+  ; KCM controllers' caches (deployments/replicasets/endpoints/...) never reach
+  ; synced and the controllers never run. The main loop arms a receive timeout when
+  ; this is set and emits a broadcast progress frame on each idle interval (the timer
+  ; resets on every real message, so a busy stream — whose events already advance the
+  ; revision — does not emit, matching etcd's "suppress when events recently flowed").
+  (define any-progress? #f)
+  ; ponytail: 5s matches the apiserver progressRequester period; env knob if a
+  ; deployment needs it slower (CW_WATCH_PROGRESS_MS) — flat constant until then.
+  (define PROGRESS-INTERVAL-MS 5000)
 
   (define (ask-shard msg) (send shard-pid msg) (raw-receive))
   ; (rev . term) read from the shard — called only when the mailbox is clean
@@ -162,6 +175,7 @@
             ((eq? (car r) 'watch-created)
              (let ((wid (cdr r)))
                (set! live-wids (cons wid live-wids))
+               (if progress? (set! any-progress? #t))   ; arm periodic progress (cw-5w8 #2)
                ; etcd's immediate empty CREATED ack FIRST...
                (emit-wr! (list wid snap-rev #t #f "" 0 '()))
                ; ...then the buffered historical replay, in revision order.
@@ -243,8 +257,11 @@
 
   (handle-client-msg (grpc-request-bytes h))   ; the first WatchRequest
   (let loop ()
-    (let ((m (raw-receive)))
+    ; arm the idle timeout only on streams that requested progress_notify; others
+    ; block forever (no spurious wakeups, no progress they never asked for).
+    (let ((m (if any-progress? (raw-receive PROGRESS-INTERVAL-MS) (raw-receive))))
       (cond
+        ((eq? m '*timeout*) (do-progress) (loop))   ; idle interval -> periodic progress (cw-5w8 #2)
         ((not (pair? m)) (loop))
         ((eq? (car m) 'client-msg)     (handle-client-msg (cadr m)) (loop))
         ((eq? (car m) 'watch-response) (emit-wr! (cadr m)) (loop))

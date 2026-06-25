@@ -813,6 +813,13 @@
             ((eq? m '*timeout*)
              (flush-and-drain! flush-base)
              (loop (maybe-compact st #f) leader elapsed #f))
+            ;; cw-kp0: a global-rev refill request that bounced 'tryagain (the local
+            ;; authority replica was a follower with no known leader yet). Clear the
+            ;; in-flight flag so the next tick re-requests — otherwise the writer stalls
+            ;; forever (lease never warms -> every write bounces). gr-writer?-gated.
+            ((and gr-writer? rev-refill-inflight (eq? m 'tryagain))
+             (set! rev-refill-inflight #f)
+             (loop st leader elapsed flush-base))
             ((not (pair? m)) (loop st leader elapsed flush-base))
 
             ;; ---- Raft RPC from a peer ----

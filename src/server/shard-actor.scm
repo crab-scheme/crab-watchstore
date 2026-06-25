@@ -482,6 +482,18 @@
       (map (lambda (c) (let ((r (global-rev-rewrite c rev-lease)))
                          (set! rev-lease (cdr r)) (car r)))
            cmds))
+    ; report this writer's low-watermark contribution to the authority (Phase 3): the
+    ; lowest global rev it may still produce but has NOT applied. Conservatively
+    ; current-rev+1 while it has unconsumed leased revs OR in-flight writes; else #f
+    ; (caught up — does not constrain W). Sent on tick; no-op unless gr-writer?.
+    (define (gr-report-progress!)
+      (if gr-writer?
+          (let ((ap (gr-authority-pid)))
+            (if ap
+                (let ((active? (or (> (lease-remaining rev-lease) 0)
+                                   (> (hashtable-size pending) 0))))
+                  (send ap (list 'rev-progress (string->number shard-key)
+                                 (if active? (+ (mvcc-current-rev ctx) 1) #f))))))))
     ; ensure the lease holds >= `need` revs before a batch rewrite. Normally a no-op
     ; (refill-before-empty keeps it warm). Only when short does it request a grant and
     ; block for the reply, requeuing any other frame to `backlog` so nothing is lost.
@@ -906,6 +918,7 @@
             ;; flush-and-drain! is a no-op when nothing is dirty / deferred.
             ((eq? (car m) 'tick)
              (fwd-sweep!)                      ; expire wedged forwards (cw-lkq.13)
+             (gr-report-progress!)             ; cw-kp0 Phase 3: report low-watermark to authority (no-op unless gr-writer?)
              ; cw-lkq.15: long-lived server actors accumulate cyclic garbage the
              ; Rc heap can't free — sweep the (thread-local) cycle registry
              ; periodically. No-op on builds without tracing-cycle-collector.

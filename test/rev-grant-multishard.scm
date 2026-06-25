@@ -66,4 +66,20 @@
   (check "k2 value reads back"             "v2" (and r2 (utf8->string (car r2))))
   (check "k2 mod_revision = global rev 2"   2   (and r2 (caddr r2))))
 
+(section "writer reports progress on tick -> authority watermark reflects applied rev 2")
+; the writer applied up to global rev 2 and still holds leased revs, so it reports
+; lowest-unapplied = 3 each tick -> authority's global-watermark settles at 2.
+(define wm-src "
+  (define (ask pid msg) (send pid msg) (raw-receive))
+  (define (wm-checker)
+    (let ((o (table-lookup 'ws-shard-pid \"a:0\")))
+      (let loop ((i 0))
+        (let ((r (ask o (list 'global-watermark (self)))))
+          (cond ((and (pair? r) (eqv? (cadr r) 2)) (table-insert! 'ws-test \"wm\" 2))
+                ((> i 300) (table-insert! 'ws-test \"wm\" (cadr r)))
+                (else (sleep-ms 10) (loop (+ i 1))))))))")   ; yield so the poller ticks the writer
+(spawn-source wm-src 'wm-checker)
+(spin (lambda () (table-lookup 'ws-test "wm")) "watermark settles")
+(check "authority global-watermark = writer's applied rev 2" 2 (table-lookup 'ws-test "wm"))
+
 (done!)

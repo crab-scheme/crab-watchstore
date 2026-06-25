@@ -926,6 +926,7 @@
             ((eq? (car m) 'tick)
              (fwd-sweep!)                      ; expire wedged forwards (cw-lkq.13)
              (gr-report-progress!)             ; cw-kp0 Phase 3: report low-watermark to authority (no-op unless gr-writer?)
+             (if (raft-leader? st) (gr-maybe-refill!))  ; cw-kp0: pre-seed/keep the lease warm on the leader so no client op blocks on a cold cross-group grant (Jepsen-timeout fix)
              ; cw-lkq.15: long-lived server actors accumulate cyclic garbage the
              ; Rc heap can't free — sweep the (thread-local) cycle registry
              ; periodically. No-op on builds without tracing-cycle-collector.

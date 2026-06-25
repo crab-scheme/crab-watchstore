@@ -44,6 +44,10 @@
       (table-insert! 'ws-test \"w2\" (ask o (list 'global-watermark (self))))   ; still 4 (w1 constrains)
       (send o (list 'rev-progress 1 #f))                           ; writer 1 caught up
       (table-insert! 'ws-test \"w3\" (ask o (list 'global-watermark (self))))   ; all caught up -> 10
+      ; compaction admissibility (Phase 4): safe iff R <= watermark (now 10)
+      (table-insert! 'ws-test \"ca5\"  (ask o (list 'compact-admissible 5  (self))))   ; 5  <= 10 -> #t
+      (table-insert! 'ws-test \"ca10\" (ask o (list 'compact-admissible 10 (self))))   ; 10 <= 10 -> #t
+      (table-insert! 'ws-test \"ca11\" (ask o (list 'compact-admissible 11 (self))))   ; 11 >  10 -> #f
       (table-insert! 'ws-test \"done\" #t)))")
 (spawn-source client-src 'client)
 (spin (lambda () (table-lookup 'ws-test "done")) "watermark queries done")
@@ -52,5 +56,10 @@
 (check "writer 1 unapplied@5 -> watermark = 4"              (list 'global-watermark-ok 4)  (table-lookup 'ws-test "w1"))
 (check "idle writer 2 does NOT lower it -> still 4"          (list 'global-watermark-ok 4)  (table-lookup 'ws-test "w2"))
 (check "all writers caught up -> watermark back to high 10" (list 'global-watermark-ok 10) (table-lookup 'ws-test "w3"))
+
+(section "global compaction admissibility: safe iff R <= watermark")
+(check "compact at 5 admissible (5 <= 10)"      (list 'compact-admissible-ok #t) (table-lookup 'ws-test "ca5"))
+(check "compact at 10 admissible (10 <= 10)"    (list 'compact-admissible-ok #t) (table-lookup 'ws-test "ca10"))
+(check "compact at 11 REJECTED (11 > 10)"       (list 'compact-admissible-ok #f) (table-lookup 'ws-test "ca11"))
 
 (done!)

@@ -494,6 +494,13 @@
                                    (> (hashtable-size pending) 0))))
                   (send ap (list 'rev-progress (string->number shard-key)
                                  (if active? (+ (mvcc-current-rev ctx) 1) #f))))))))
+    ; authority-side: the current global low-watermark from the writer progress reports.
+    ; W = min over writers-with-unapplied of (lowest-unapplied - 1), else granted-high.
+    (define (gr-watermark-now)
+      (let wmark ((ks (vector->list (hashtable-keys rev-progress))) (w (mvcc-global-rev ctx)))
+        (if (null? ks) w
+            (let ((lu (hashtable-ref rev-progress (car ks) #f)))
+              (wmark (cdr ks) (if lu (min w (- lu 1)) w))))))
     ; ensure the lease holds >= `need` revs before a batch rewrite. Normally a no-op
     ; (refill-before-empty keeps it warm). Only when short does it request a grant and
     ; block for the reply, requeuing any other frame to `backlog` so nothing is lost.
@@ -1176,12 +1183,15 @@
             ;; as header.revision (everything <= W is applied on its owning group). W =
             ;; min over writers-with-unapplied of (lowest-unapplied - 1), else granted-high.
             ((eq? (car m) 'global-watermark)
-             (let ((high (mvcc-global-rev ctx)))
-               (let wmark ((ks (vector->list (hashtable-keys rev-progress))) (w high))
-                 (if (null? ks)
-                     (send (cadr m) (list 'global-watermark-ok w))
-                     (let ((lu (hashtable-ref rev-progress (car ks) #f)))
-                       (wmark (cdr ks) (if lu (min w (- lu 1)) w))))))
+             (send (cadr m) (list 'global-watermark-ok (gr-watermark-now)))
+             (loop st leader elapsed flush-base))
+
+            ;; cw-kp0 Phase 4: global compaction admissibility. A compaction below R is
+            ;; safe only once R <= the low-watermark — never discard history a pending
+            ;; op could still reference (ADR 0006). The coordinator asks here before
+            ;; broadcasting "compact < R" to the groups. (compact-admissible R reply-pid)
+            ((eq? (car m) 'compact-admissible)
+             (send (caddr m) (list 'compact-admissible-ok (<= (cadr m) (gr-watermark-now))))
              (loop st leader elapsed flush-base))
 
             ;; ---- Auth read seams (cw-u4a.26) — pure reads over NS-AUTH on THIS

@@ -1087,6 +1087,14 @@
 
 (define (cmd-op cmd) (utf8->string (car cmd)))
 
+; cw-kp0 Phase 4 cross-shard 2PC: per-shard prepared-txn stage, txnid -> (rev . ops).
+; Built deterministically by applying TXN-PREPARE on every replica (it rides the Raft
+; log), drained by TXN-COMMIT/ABORT. ponytail: lives outside ctx so a snapshot taken
+; between PREPARE and COMMIT won't carry it — acceptable for the short prepare→commit
+; window (the coordinator re-drives on a leader change); move into ctx if snapshots
+; ever land mid-txn in practice.
+(define txn-stage (make-eqv-hashtable))
+
 (define (mvcc-apply ctx cmd)
   (let* ((prev-rev (mvcc-current-rev ctx))
          (main     (+ prev-rev 1))
@@ -1122,6 +1130,38 @@
                (mvcc-put! ctx K V lease at 0)
                (mvcc-set-current-rev! ctx at)
                (cons "PUT" at)))))
+      ((string=? op "TXN-PREPARE")
+       ; cw-kp0 Phase 4 cross-shard 2PC, participant side: check THIS shard's guards and,
+       ; if all hold, STAGE this shard's ops under txnid at the txn's global rev (not yet
+       ; visible). Deterministic on every replica. Reply (list "TXN-PREPARE" txnid bool).
+       ; ("TXN-PREPARE" txnidBytes revBytes subtxnBytes) — subtxn = (make-txn guards ops ()).
+       (let* ((txnid (bytes->int (list-ref cmd 1)))
+              (rev   (bytes->int (list-ref cmd 2)))
+              (sub   (txn-decode (list-ref cmd 3)))
+              (ok    (compares-all-true? ctx (txn-compares sub))))
+         (if ok (hashtable-set! txn-stage txnid (cons rev (txn-success sub))))
+         (list "TXN-PREPARE" txnid ok)))
+      ((string=? op "TXN-COMMIT")
+       ; apply the staged ops at the txn's global rev (deterministic), make them visible,
+       ; drop the stage. Idempotent: a missing stage (already committed/never prepared
+       ; here) is a no-op. ("TXN-COMMIT" txnidBytes)
+       (let* ((txnid (bytes->int (list-ref cmd 1)))
+              (stg   (hashtable-ref txn-stage txnid #f)))
+         (if stg
+             (let ((rev (car stg)))
+               (let loop ((ops (cdr stg)) (sub 0))
+                 (when (pair? ops)
+                   (op-eval-apply ctx (car ops) rev sub)
+                   (loop (cdr ops) (+ sub 1))))
+               (mvcc-set-current-rev! ctx rev)
+               (hashtable-delete! txn-stage txnid)))
+         (list "TXN-COMMIT" txnid)))
+      ((string=? op "TXN-ABORT")
+       ; drop the stage (guards failed on some participant, or coordinator gave up).
+       ; Idempotent. ("TXN-ABORT" txnidBytes)
+       (let ((txnid (bytes->int (list-ref cmd 1))))
+         (hashtable-delete! txn-stage txnid)
+         (list "TXN-ABORT" txnid)))
       ((string=? op "PUT")
        (let* ((K     (list-ref cmd 1))
               (V     (list-ref cmd 2))

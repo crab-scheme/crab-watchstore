@@ -198,6 +198,7 @@
 (define META-CURRENT-REV (meta-key "current-rev"))
 (define META-COMPACT-REV (meta-key "compact-rev"))
 (define META-LEASE-ID-SEQ (meta-key "lease-id-seq"))   ; lease auto-id counter (cw-u4a.17)
+(define META-GLOBAL-REV   (meta-key "global-rev"))     ; cw-kp0: rev-authority's granted high (separate from current-rev)
 
 ; ---------------------------------------------------------------------------
 ; KeyValue record (self-describing, length-prefixed; ADR §4)
@@ -303,6 +304,15 @@
 (define (mvcc-set-current-rev! ctx main)
   (set-shard-ctx-crev! ctx main)
   (kv-put! ctx META-CURRENT-REV (u64->bytes main)))
+
+; cw-kp0 phase 2: the global revision authority's counter (highest revision GRANTED
+; across all shard groups). Separate from current-rev — granting does not commit a
+; write, it reserves revisions. Only the designated authority shard maintains it.
+(define (mvcc-global-rev ctx)
+  (let ((b (kv-get ctx META-GLOBAL-REV)))
+    (if (and b (>= (bytevector-length b) 8)) (bytes->u64 b 0) 0)))
+(define (mvcc-set-global-rev! ctx v)
+  (kv-put! ctx META-GLOBAL-REV (u64->bytes v)))
 
 ; compact revision (read floor); 0 if never compacted.  (Written by .8.)
 (define (mvcc-compact-rev ctx)
@@ -1082,6 +1092,17 @@
          (main     (+ prev-rev 1))
          (op       (cmd-op cmd)))
     (cond
+      ((string=? op "REV-GRANT")
+       ; cw-kp0 phase 2: the rev-authority hands out a contiguous block of N global
+       ; revisions. Advances the SEPARATE global-rev counter (NOT current-rev — a
+       ; grant reserves revisions, it does not commit a write) and returns the
+       ; block's low revision; hi = lo+N-1. Per-batch grants sized to the batch are
+       ; hole-free (ADR 0006). Only the authority shard ever applies this command.
+       (let* ((n  (let ((x (bytes->int (list-ref cmd 1)))) (if (and x (> x 0)) x 1)))
+              (g  (mvcc-global-rev ctx))
+              (lo (+ g 1)))
+         (mvcc-set-global-rev! ctx (+ g n))
+         (cons "REV-GRANT" lo)))
       ((string=? op "PUT")
        (let* ((K     (list-ref cmd 1))
               (V     (list-ref cmd 2))

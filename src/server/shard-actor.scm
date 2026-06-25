@@ -88,6 +88,14 @@
          ; region). #f = no node pin (use leader-region / shard-rotated stagger).
          (leader-node (if (and (>= (length rest) 7) (symbol? (list-ref rest 6)))
                           (list-ref rest 6) #f))
+         ; 8 (cw-kp0) global-rev?: when #t this group participates in the synthetic
+         ; global revision allocator — shard "0" is the rev-authority (holds the
+         ; replicated global-rev counter, ADR 0006), others request grants from it.
+         ; Default #f = today's per-shard revision (single-group semantics intact);
+         ; the rest of the wiring (grant request at propose, watermark gate) gates
+         ; on this flag, so OFF is byte-identical to the current path.
+         (global-rev? (if (>= (length rest) 8) (and (list-ref rest 7) #t) #f))
+         (rev-authority? (and global-rev? (string=? shard-key "0")))
          ; cw-gx4: this group's cs-net channel — one Raft group → one channel so
          ; groups don't serialize on Messages. SHARD-CHANNELS = {1,3,4,5}
          ; (Consensus/Workflow/Bulk/Observability); Control=0 + Messages=2 are

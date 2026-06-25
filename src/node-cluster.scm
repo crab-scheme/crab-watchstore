@@ -78,6 +78,9 @@
 (define dbbase  (arg-after "--db" "/tmp/cws-node"))
 (define durable (string=? (arg-after "--durable" "no") "yes"))
 (define cluster-spec (arg-after "--cluster" "a:127.0.0.1:7001:6001"))
+; cw-kp0: enable the synthetic global revision allocator across shard groups
+; (shard "0" = rev-authority). Default off = today's per-shard revision semantics.
+(define global-rev (string=? (arg-after "--global-rev" "no") "yes"))
 
 ; ---- dynamic-membership join (cw-u4a.29) ----
 ; `--join yes` brings this node up as a NON-VOTER that dials every existing member, then
@@ -169,6 +172,10 @@
         (else (mesh (+ tries 1)))))
 (display "node ") (display me) (display ": mesh up (")
 (display (node-peer-count (symbol->string me))) (display " peers)") (newline)
+(if global-rev
+    (begin (display "node ") (display me)
+           (display ": global-rev allocator ENABLED (cw-kp0; shard 0 = rev-authority)")
+           (newline)))
 
 ; ---- single shard "0": one replica, voters = all nodes ----
 ; Dedicated thread — blocking RocksDB fsync must not freeze a shared green
@@ -254,7 +261,7 @@
    (spawn-source-dedicated "(include \"src/server/shard-actor.scm\")" 'shard-main
                  sk shard-voters me (string-append dbbase "-shard" sk) durable apply-shards
                  election-ticks leader-region region-map serializable-max-lag shard-learners
-                 leader-node))
+                 leader-node global-rev))
  shard-key-list)
 
 (define dial-addrs (map raft-addr dial-peers))

@@ -45,6 +45,7 @@
                               ; shard applies AUTH-* (mvcc-apply) + serves the auth read seams.
 (include "src/watch.scm")     ; Watch backend: registry + replay->live dispatch (cw-u4a.13)
 (include "src/raft.scm")
+(include "src/rev-lease-consumer.scm")  ; cw-kp0: writer-side revision lease + PUT->PUT-AT rewrite (global-rev mode)
 
 (define (raft-applied st) (aget st 'applied))
 
@@ -441,6 +442,16 @@
     (define fwd-pending (make-eqv-hashtable))
     (define fwd-seq 0)
     (define fwd-ticks 0)
+    ; ---- cw-kp0 global-rev: writer-side revision lease (gated on global-rev? AND
+    ; NOT rev-authority?). The leader draws a global rev per write from this buffer
+    ; (global-rev-rewrite) and refills it from the authority before it empties
+    ; (rev-refill-inflight = the block size of an outstanding REV-GRANT request, #f
+    ; when none). All inert unless global-rev? — the default single-group path never
+    ; touches these. The propose-branch hook that consumes them is the next increment.
+    (define REV-BLOCK 64)                 ; revs per refill — amortizes the grant round-trip
+    (define REV-LOW   8)                   ; refill when remaining drops to this
+    (define rev-lease (lease-new))         ; FIFO buffer of granted (lo . hi) blocks
+    (define rev-refill-inflight #f)        ; block size of an outstanding REV-GRANT, or #f
     (define FWD-EXPIRE-TICKS 25)              ; ~3s at the default 120ms tick
     ; ---- snapshot shipping, leader side (cw-lkq.15) ----
     ; The engine marks (snap-req) any peer that rejected AppendEntries at the
@@ -1068,6 +1079,17 @@
             ((eq? (car m) 'cur-rev)
              (let ((conn (cadr m)))
                (send conn (list 'cur-rev-ok (mvcc-current-rev ctx) (raft-term st))))
+             (loop st leader elapsed flush-base))
+
+            ;; cw-kp0 global-rev: refill reply from the rev-authority. The grant rides the
+            ;; standard client-proposal ack path, so it arrives as ("REV-GRANT" . lo);
+            ;; enqueue the granted block [lo, lo+N) into the writer lease (N = the size of
+            ;; the outstanding request). Inert unless global-rev?; the propose-branch hook
+            ;; that requests refills + draws revs from rev-lease is the next increment.
+            ((and global-rev? (pair? m) (string? (car m)) (string=? (car m) "REV-GRANT"))
+             (if rev-refill-inflight
+                 (begin (set! rev-lease (lease-add rev-lease (cdr m) rev-refill-inflight))
+                        (set! rev-refill-inflight #f)))
              (loop st leader elapsed flush-base))
 
             ;; ---- Auth read seams (cw-u4a.26) — pure reads over NS-AUTH on THIS

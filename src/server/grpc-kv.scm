@@ -394,6 +394,21 @@
    (map etcd-requestop->internal (galist 'success tr '()))
    (map etcd-requestop->internal (galist 'failure tr '()))))
 
+; cw-kp0 Phase 4: the distinct keys a Txn reads or writes — compare targets plus the
+; put/del/range op keys of BOTH branches (success+failure), since either may execute.
+; (put/del/range all carry the key at vector slot 1.) Foundation for cross-shard txn
+; routing: map these to shards (key-shard) to get the Txn's PARTICIPANT shards — all on
+; one shard ⇒ commit there atomically as today; spanning shards ⇒ the 2PC coordinator.
+; Pure (no shard-groups dependency) so it is unit-testable on its own.
+(define (txn-touched-keys t)
+  (let loop ((in (append (map cmp-key (txn-compares t))
+                         (map (lambda (o) (vector-ref o 1)) (txn-success t))
+                         (map (lambda (o) (vector-ref o 1)) (txn-failure t))))
+             (out '()))
+    (cond ((null? in) (reverse out))
+          ((member (car in) out) (loop (cdr in) out))   ; equal? dedups bytevectors
+          (else (loop (cdr in) (cons (car in) out))))))
+
 ; internal op-response -> etcd ResponseOp (alist), the inverse of the request side.
 ; Internal response shapes (from txn-eval-apply / op-eval-apply, src/txn.scm):
 ;   (cons 'put mod-rev)          -> response_put : PutResponse{header}

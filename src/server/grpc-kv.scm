@@ -409,6 +409,28 @@
           ((member (car in) out) (loop (cdr in) out))   ; equal? dedups bytevectors
           (else (loop (cdr in) (cons (car in) out))))))
 
+; cw-kp0 Phase 4: split a Txn into per-participant-shard sub-txns. shard->fn maps a key
+; to its shard index; each compare/success-op/failure-op is filed under its key's shard.
+; Returns an alist (shard-idx . sub-txn) where sub-txn = (make-txn its-compares its-
+; success-ops its-failure-ops), preserving op order within each shard. The coordinator
+; PREPAREs each sub-txn at one global rev R, then COMMITs all (or ABORTs all). Pure given
+; shard-of (the key->shard fn) so it is unit-testable.
+(define (txn-split-by-shard t shard-of)
+  (let ((parts (make-eqv-hashtable)))            ; shard -> #(compares success failure), reversed
+    (define (add! key slot item)
+      (let ((cur (or (hashtable-ref parts (shard-of key) #f) (vector '() '() '()))))
+        (vector-set! cur slot (cons item (vector-ref cur slot)))
+        (hashtable-set! parts (shard-of key) cur)))
+    (for-each (lambda (c) (add! (cmp-key c)        0 c)) (txn-compares t))
+    (for-each (lambda (o) (add! (vector-ref o 1)   1 o)) (txn-success  t))
+    (for-each (lambda (o) (add! (vector-ref o 1)   2 o)) (txn-failure  t))
+    (map (lambda (s)
+           (let ((v (hashtable-ref parts s #f)))
+             (cons s (make-txn (reverse (vector-ref v 0))
+                               (reverse (vector-ref v 1))
+                               (reverse (vector-ref v 2))))))
+         (vector->list (hashtable-keys parts)))))
+
 ; internal op-response -> etcd ResponseOp (alist), the inverse of the request side.
 ; Internal response shapes (from txn-eval-apply / op-eval-apply, src/txn.scm):
 ;   (cons 'put mod-rev)          -> response_put : PutResponse{header}

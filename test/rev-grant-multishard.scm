@@ -42,7 +42,9 @@
 (define client-src "
   (define (b s) (string->utf8 s))
   (define (ask pid msg) (send pid msg) (raw-receive))
-  (define (propose pid cmd) (ask pid (cons (self) cmd)))
+  ; a global-rev writer may bounce 'tryagain while its lease warms — retry (as the real client does)
+  (define (propose pid cmd)
+    (let loop () (let ((r (ask pid (cons (self) cmd)))) (if (eq? r 'tryagain) (begin (sleep-ms 5) (loop)) r))))
   (define (client)
     (let ((w (table-lookup 'ws-shard-pid \"a:1\")))    ; the WRITER group's shard pid
       (table-insert! 'ws-test \"p1\" (propose w (list (b \"PUT\") (b \"k1\") (b \"v1\"))))

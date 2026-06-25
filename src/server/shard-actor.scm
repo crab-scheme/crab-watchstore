@@ -1687,26 +1687,34 @@
                           (else
                            (if (not (eq? nxt '*timeout*))
                                (set! backlog (append backlog (list nxt))))
-                           (let ((batch (reverse acc)) (base-idx (log-len st)))
-                             ; cw-kp0: in a global-rev writer group, secure enough leased
-                             ; global revisions for this batch's PUTs, then rewrite each
-                             ; PUT -> PUT-AT <rev> so all replicas apply the same rev. A
-                             ; no-op (byte-identical to the default path) unless gr-writer?.
-                             (gr-ensure! (if gr-writer? (gr-count-puts (map cdr batch)) 0))
-                             ; register each waiter at its prospective log index
-                             (let reg ((bs batch) (i 1))
-                               (when (pair? bs)
-                                 (hashtable-set! pending (+ base-idx i) (caar bs))
-                                 (reg (cdr bs) (+ i 1))))
-                             (prof-tick! n)
-                             (let* ((r (raft-propose-batch
-                                         st (if gr-writer? (gr-rewrite-batch! (map cdr batch)) (map cdr batch))))
-                                    (st1 (car r)) (outs1 (cdr r)))
-                               (emit! outs1)              ; ONE AE round for the whole batch
-                               (rtt-mark-emit!)
-                               (gr-maybe-refill!)         ; cw-kp0: keep the lease warm
-                               (let ((st2 (maybe-commit st1))) ; solo commits now; cluster waits for AERs
-                                 (if (> (raft-applied st2) old) (persist-applied! st2))
-                                 ; this branch only runs on the leader -> #t
-                                 (let ((nb (settle! #t old flush-base)))  ; defer ack (durable) or ack now
-                                   (loop (maybe-compact st2 nb) node-name elapsed nb))))))))))))))))))))
+                           (let* ((batch    (reverse acc)) (base-idx (log-len st))
+                                  (raw-cmds (map cdr batch))
+                                  (need     (if gr-writer? (gr-count-puts raw-cmds) 0)))
+                             ; cw-kp0: a global-rev writer group draws `need` leased global
+                             ; revisions for this batch's PUTs, then rewrites PUT -> PUT-AT <rev>.
+                             ; If the lease can't cover it, async-refill + BOUNCE the batch
+                             ; ('tryagain — the client retries once the grant lands), and NEVER
+                             ; block the actor loop on the cross-group grant round-trip (the
+                             ; liveness fix). No-op / byte-identical to default unless gr-writer?.
+                             (if (and gr-writer? (> need 0) (< (lease-remaining rev-lease) need))
+                                 (begin
+                                   (gr-maybe-refill!)
+                                   (for-each (lambda (bc) (ack-waiter! (car bc) 'tryagain)) batch)
+                                   (loop st node-name elapsed flush-base))
+                                 (begin
+                                   ; register each waiter at its prospective log index
+                                   (let reg ((bs batch) (i 1))
+                                     (when (pair? bs)
+                                       (hashtable-set! pending (+ base-idx i) (caar bs))
+                                       (reg (cdr bs) (+ i 1))))
+                                   (prof-tick! n)
+                                   (let* ((r (raft-propose-batch
+                                               st (if gr-writer? (gr-rewrite-batch! raw-cmds) raw-cmds)))
+                                          (st1 (car r)) (outs1 (cdr r)))
+                                     (emit! outs1)            ; ONE AE round for the whole batch
+                                     (rtt-mark-emit!)
+                                     (gr-maybe-refill!)       ; cw-kp0: keep the lease warm
+                                     (let ((st2 (maybe-commit st1)))
+                                       (if (> (raft-applied st2) old) (persist-applied! st2))
+                                       (let ((nb (settle! #t old flush-base)))
+                                         (loop (maybe-compact st2 nb) node-name elapsed nb))))))))))))))))))))))

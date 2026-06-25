@@ -16,6 +16,8 @@
 #
 #   NODES=60 PODS=600 ./test/geo-k8s-kwok.sh           # default scale
 #   NODES=300 PODS=3000 ./test/geo-k8s-kwok.sh          # heavier sweep
+#   NODES=10000 PODS=100000 ./test/geo-k8s-kwok.sh      # cw-nzm massive scale (needs node headroom)
+#   CHURN_SECS=120 ./test/geo-k8s-kwok.sh               # cw-nzm: sustained scale-churn soak
 #   CLEAN=1 ./test/geo-k8s-kwok.sh                       # delete sim objects + exit
 set -uo pipefail
 
@@ -26,6 +28,8 @@ PODS="${PODS:-600}"           # fake pods scheduled onto them
 REGIONS=(us-east eu-west ap-south)
 TIMEOUT_NODES="${TIMEOUT_NODES:-120}"   # s to wait for all nodes Ready
 TIMEOUT_PODS="${TIMEOUT_PODS:-300}"     # s to wait for all pods Running
+CHURN_SECS="${CHURN_SECS:-0}"           # cw-nzm: >0 runs a sustained scale-churn soak
+CHURN_DELTA="${CHURN_DELTA:-100}"       # replicas added/removed each churn cycle
 
 export KUBECONFIG="$KUBECONFIG_GTR"
 OUTER=(kubectl -n "$NS")
@@ -50,6 +54,19 @@ echo "== gate: k0s control plane healthy on the multi-region crab-watchstore sto
 RZ=$("${K0S[@]}" get --raw /readyz 2>/dev/null)
 [ "$RZ" = "ok" ] && ok "k0s /readyz=ok (apiserver serving on stretched store)" \
   || { bad "k0s not ready (/readyz='$RZ')"; exit 1; }
+
+# ---- pre-clean: drop any fake-pod deployment from a prior run so the per-region
+# tally counts only THIS run's pods (leftover pods otherwise pollute the spread
+# check). Best-effort + bounded so a degraded host can't make it hang. NODES are
+# applied idempotently below, so we leave them.
+if [ "${NO_PRECLEAN:-0}" != 1 ]; then
+  "${K0S[@]}" delete deploy fake-pod -n default --ignore-not-found --wait=false 2>/dev/null
+  "${K0S[@]}" delete pods -n default -l app=fake-pod --grace-period=0 --force --wait=false 2>/dev/null
+  for _ in $(seq 1 30); do
+    [ "$("${K0S[@]}" get pods -n default -l app=fake-pod --no-headers 2>/dev/null | wc -l | tr -d ' ')" = 0 ] && break
+    sleep 2
+  done
+fi
 
 # ---- fake nodes -------------------------------------------------------------
 echo "== applying $NODES fake KWOK nodes across ${#REGIONS[@]} regions =="
@@ -195,6 +212,43 @@ if [ -n "$LT0" ]; then
   ok "LIST $PC pods served in ${LT}ms (full read through k0s -> crab-watchstore)"
 else
   ok "LIST returned $PC pods"
+fi
+
+# ---- cw-nzm: sustained scale-churn soak -------------------------------------
+# A massive cluster's steady state is constant pod churn (deploys, scale, evictions),
+# which is the high-write-rate path that stresses the store's revision + watch fan-out.
+# Repeatedly scale fake-pod between PODS and PODS+CHURN_DELTA for CHURN_SECS, timing
+# each reconcile cycle; assert every cycle settles within TIMEOUT (store keeps up).
+if [ "${CHURN_SECS:-0}" -gt 0 ]; then
+  echo "== churn soak: ${CHURN_SECS}s of +/-${CHURN_DELTA}-replica reconcile cycles =="
+  C_END=$(( $(now) + CHURN_SECS ))
+  CYCLES=0; SLOWEST=0; CHURN_FAIL=0; HIGH=$(( PODS + CHURN_DELTA ))
+  while [ "$(now)" -lt "$C_END" ]; do
+    for TARGET in "$HIGH" "$PODS"; do
+      CT0=$(now)
+      "${K0S[@]}" scale deploy fake-pod -n default --replicas="$TARGET" >/dev/null 2>&1
+      settled=0
+      for _ in $(seq 1 "$TIMEOUT_PODS"); do
+        rr=$("${K0S[@]}" get deploy fake-pod -n default -o jsonpath='{.status.readyReplicas}' 2>/dev/null)
+        [ "${rr:-0}" = "$TARGET" ] && { settled=1; break; }
+        sleep 1
+        [ "$(now)" -ge "$C_END" ] && break
+      done
+      DT=$(( $(now) - CT0 ))
+      # Only count a genuine STALL (didn't settle while the window was still open).
+      # A cycle cut short by the CHURN_SECS window ending is NOT a stall — stop cleanly.
+      if [ "$settled" = 1 ]; then
+        [ "$DT" -gt "$SLOWEST" ] && SLOWEST=$DT
+        CYCLES=$(( CYCLES + 1 ))
+      elif [ "$(now)" -lt "$C_END" ]; then
+        CHURN_FAIL=$(( CHURN_FAIL + 1 ))   # real stall: didn't settle within TIMEOUT_PODS
+      fi
+      [ "$(now)" -ge "$C_END" ] && break
+    done
+  done
+  [ "$CHURN_FAIL" = 0 ] \
+    && ok "churn soak sustained $CYCLES reconcile cycles (slowest ${SLOWEST}s), 0 stalls" \
+    || bad "churn soak: $CHURN_FAIL cycle(s) did not settle within ${TIMEOUT_PODS}s (slowest ${SLOWEST}s)"
 fi
 
 echo

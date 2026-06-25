@@ -1028,31 +1028,63 @@
         (else (cons 'err (cons GRPC-INTERNAL "compact: unexpected ack"))))))
 
   ; ---- KV/Txn (translators are top-level; see etcd-txn->internal et al.) ----
+  ; cw-kp0 Phase 4: cross-shard 2PC coordinator for a Txn spanning groups. Acquire ONE
+  ; global rev R from the authority, PREPARE each participant with its sub-txn at R (each
+  ; checks its guards + stages its ops, invisibly), then if ALL voted yes COMMIT all at R
+  ; (atomic — every key's put lands on its own shard at the same rev) else ABORT all. The
+  ; global watermark holds < R until the commits apply, so no read sees a partial txn.
+  ; ponytail: a coordinator crash between PREPARE and COMMIT can leave a stage pending on a
+  ; participant (classic 2PC) — fine for the optimistic/retry workloads here; a stage GC by
+  ; watermark is the follow-up if it bites. Failure-branch ops on a guard-fail are not
+  ; applied cross-shard (abort = apply nothing) — matches etcd optimistic txns (empty else).
+  (define (txn-2pc itxn parts)
+    (let ((gack (ask-shard (cons (self) (list (string->utf8 "REV-GRANT") (int->bytes 1))))))
+      (if (not (and (pair? gack) (string? (car gack)) (string=? (car gack) "REV-GRANT")))
+          (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: request timed out"))   ; authority unavailable
+          (let* ((R     (cdr gack))
+                 (split (txn-split-by-shard itxn key-shard))   ; (shard . sub-txn) alist
+                 (votes (map (lambda (sp)
+                               (let ((a (ask-shard-on (shard-pid-idx (car sp))
+                                          (cons (self) (list (string->utf8 "TXN-PREPARE")
+                                                             (int->bytes R) (int->bytes R)
+                                                             (txn-encode (cdr sp)))))))
+                                 (and (pair? a) (string? (car a))
+                                      (string=? (car a) "TXN-PREPARE") (caddr a))))
+                             split))
+                 (ok?   (and (pair? votes) (not (memv #f votes)))))
+            (for-each (lambda (sp)
+                        (ask-shard-on (shard-pid-idx (car sp))
+                          (cons (self) (list (string->utf8 (if ok? "TXN-COMMIT" "TXN-ABORT"))
+                                             (int->bytes R)))))
+                      split)
+            (let* ((branch (if ok? (txn-success itxn) (txn-failure itxn)))
+                   (resps  (map (lambda (op)
+                                  (cond ((eq? (vector-ref op 0) 'del)   (cons 'del-count 0))
+                                        ((eq? (vector-ref op 0) 'range) (cons 0 '()))
+                                        (else (cons 'put R))))
+                                branch))
+                   (hdr    (make-header cluster-id member-id R 0)))
+              (cons 'ok (pb-encode TxnResponse-schema
+                                   (internal-txn-result->etcd (cons ok? resps) hdr))))))))
   (define (handle-txn h bytes)
     (let* ((tr   (pb-decode TxnRequest-schema bytes))
            (deny (txn-authz-deny? h tr)))   ; compares=READ, inner put/del=WRITE, range=READ
       (if deny (cons 'err deny)
       (let* ((itxn  (etcd-txn->internal tr))
-             (flat  (txn-encode itxn))
-             (parts (txn-participant-shards itxn))
-             ; cw-kp0 Phase 4: route the Txn to a participant shard so its keys land on
-             ; the SAME shard reads of them route to (key-shard) — fixes the old blob-hash
-             ; routing that sent every Txn to a random shard. <=1 participant -> atomic on
-             ; that shard. >1 (spans groups) -> STOPGAP: first participant only; the keys on
-             ; OTHER participants still mis-route until the cross-shard 2PC coordinator
-             ; (commit all participants at one global rev) lands — that is the next increment.
-             (tgt   (if (null? parts) 0 (car parts)))
-             (ack   (ask-shard-on (shard-pid-idx tgt)
-                                  (cons (self) (list (string->utf8 "TXN") flat)))))
-      (cond
-        ((and (pair? ack) (boolean? (car ack)))    ; (succeeded? . responses)
-         ; the Txn bumped current-rev iff a branch mutated; either way the ResponseHeader
-         ; carries the store's CURRENT revision after apply (etcd semantics).
-         (let ((hdr (shard-header)))
-           (cons 'ok (pb-encode TxnResponse-schema (internal-txn-result->etcd ack hdr)))))
-        ((eq? ack 'tryagain)      (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: not leader")))
-        ((eq? ack 'indeterminate) (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: leader changed")))
-        (else (cons 'err (cons GRPC-INTERNAL "txn: unexpected ack"))))))))
+             (parts (txn-participant-shards itxn)))
+        ; cw-kp0 Phase 4: <=1 participant -> route the whole Txn to its one shard (atomic
+        ; there, fast path). >1 (spans groups) -> the cross-shard 2PC coordinator.
+        (if (> (length parts) 1)
+            (txn-2pc itxn parts)
+            (let* ((tgt (if (null? parts) 0 (car parts)))
+                   (ack (ask-shard-on (shard-pid-idx tgt)
+                                      (cons (self) (list (string->utf8 "TXN") (txn-encode itxn))))))
+              (cond
+                ((and (pair? ack) (boolean? (car ack)))
+                 (cons 'ok (pb-encode TxnResponse-schema (internal-txn-result->etcd ack (shard-header)))))
+                ((eq? ack 'tryagain)      (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: not leader")))
+                ((eq? ack 'indeterminate) (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: leader changed")))
+                (else (cons 'err (cons GRPC-INTERNAL "txn: unexpected ack"))))))))))
 
   ; ---- Lease/LeaseGrant (UNARY, cw-u4a.17) ----
   ; Propose ("LEASE-GRANT" id ttl) through the shard's async commit->ack bridge;

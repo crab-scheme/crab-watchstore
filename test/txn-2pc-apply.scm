@@ -48,4 +48,21 @@
 (commit 102)   ; no-op (stage already dropped)
 (check "still not visible after commit of aborted txn" #f (val-of (latest "k3")))
 
+(section "ISOLATION: a second prepare overlapping an in-flight stage conflicts (votes #f)")
+; txn 200 prepares + stages key kx (held until commit/abort)
+(check "txn 200 prepared" (list "TXN-PREPARE" 200 #t)
+       (prepare 200 8 (make-txn '() (list (op-put (b "kx") (b "a") 0)) '())))
+; txn 201 touches the SAME key kx while 200 is in-flight -> conflict -> votes #f
+(check "txn 201 on the same key CONFLICTS (votes #f)" (list "TXN-PREPARE" 201 #f)
+       (prepare 201 9 (make-txn '() (list (op-put (b "kx") (b "b") 0)) '())))
+(check "kx still not visible (neither committed)" #f (val-of (latest "kx")))
+; commit 200 -> visible; its lock released
+(commit 200)
+(check "after 200 commits, kx = a" "a" (val-of (latest "kx")))
+; a disjoint key never conflicts
+(check "txn 202 on a disjoint key prepares" (list "TXN-PREPARE" 202 #t)
+       (prepare 202 10 (make-txn '() (list (op-put (b "ky") (b "c") 0)) '())))
+(commit 202)
+(check "disjoint commit visible" "c" (val-of (latest "ky")))
+
 (done!)

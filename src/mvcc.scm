@@ -1095,6 +1095,22 @@
 ; ever land mid-txn in practice.
 (define txn-stage (make-eqv-hashtable))
 
+; cw-kp0 Phase 4 ISOLATION: a prepared txn holds its keys until commit/abort. A new
+; PREPARE whose keys overlap ANY other in-flight staged txn's written keys conflicts
+; (votes no) — without this, two concurrent txns on the same key both pass their guards
+; against the pre-commit state and both commit => lost update (Elle :G0/:G-single-item).
+; No-wait (conflict => abort+retry, never block) so no deadlock. The stage is small
+; (only in-flight prepared txns), so a linear scan is fine.
+(define (any-key-member? ks pool)
+  (cond ((null? ks) #f) ((member (car ks) pool) #t) (else (any-key-member? (cdr ks) pool))))
+(define (txn-stage-conflict? txnid mykeys)
+  (let loop ((ids (vector->list (hashtable-keys txn-stage))))
+    (cond ((null? ids) #f)
+          ((= (car ids) txnid) (loop (cdr ids)))
+          (else (let ((stg (hashtable-ref txn-stage (car ids) #f)))
+                  (if (and stg (any-key-member? mykeys (map (lambda (o) (vector-ref o 1)) (cdr stg))))
+                      #t (loop (cdr ids))))))))
+
 (define (mvcc-apply ctx cmd)
   (let* ((prev-rev (mvcc-current-rev ctx))
          (main     (+ prev-rev 1))
@@ -1135,10 +1151,15 @@
        ; if all hold, STAGE this shard's ops under txnid at the txn's global rev (not yet
        ; visible). Deterministic on every replica. Reply (list "TXN-PREPARE" txnid bool).
        ; ("TXN-PREPARE" txnidBytes revBytes subtxnBytes) — subtxn = (make-txn guards ops ()).
-       (let* ((txnid (bytes->int (list-ref cmd 1)))
-              (rev   (bytes->int (list-ref cmd 2)))
-              (sub   (txn-decode (list-ref cmd 3)))
-              (ok    (compares-all-true? ctx (txn-compares sub))))
+       (let* ((txnid  (bytes->int (list-ref cmd 1)))
+              (rev    (bytes->int (list-ref cmd 2)))
+              (sub    (txn-decode (list-ref cmd 3)))
+              (mykeys (append (map cmp-key (txn-compares sub))
+                              (map (lambda (o) (vector-ref o 1)) (txn-success sub))
+                              (map (lambda (o) (vector-ref o 1)) (txn-failure sub))))
+              ; vote yes only if no in-flight txn holds my keys (isolation) AND my guards hold
+              (ok     (and (not (txn-stage-conflict? txnid mykeys))
+                           (compares-all-true? ctx (txn-compares sub)))))
          (if ok (hashtable-set! txn-stage txnid (cons rev (txn-success sub))))
          (list "TXN-PREPARE" txnid ok)))
       ((string=? op "TXN-COMMIT")

@@ -452,6 +452,53 @@
     (define REV-LOW   8)                   ; refill when remaining drops to this
     (define rev-lease (lease-new))         ; FIFO buffer of granted (lo . hi) blocks
     (define rev-refill-inflight #f)        ; block size of an outstanding REV-GRANT, or #f
+    (define gr-writer? (and global-rev? (not rev-authority?)))   ; this group draws global revs
+    ; the local rev-authority (shard "0") replica pid; a grant request to a follower
+    ; replica forwards to the authority leader via the standard fwd-write path, and the
+    ; reply returns here — so the writer just sends to its local shard-0 pid.
+    (define (gr-authority-pid)
+      (and gr-writer? (table-lookup 'ws-shard-pid (string-append (symbol->string node-name) ":0"))))
+    ; async refill: request REV-BLOCK revs if low and none in flight (never blocks).
+    (define (gr-maybe-refill!)
+      (if (and gr-writer? (not rev-refill-inflight) (lease-needs-refill? rev-lease REV-LOW))
+          (let ((ap (gr-authority-pid)))
+            (if ap
+                (begin (set! rev-refill-inflight REV-BLOCK)
+                       (send ap (cons (self) (list (string->utf8 "REV-GRANT")
+                                                   (string->utf8 (number->string REV-BLOCK))))))))))
+    (define (gr-count-puts cmds)           ; PUTs each need one global rev
+      (let loop ((cs cmds) (n 0))
+        (if (null? cs) n
+            (loop (cdr cs) (if (and (pair? (car cs)) (string=? (utf8->string (caar cs)) "PUT"))
+                               (+ n 1) n)))))
+    ; PUT -> PUT-AT <leased rev> for each cmd, drawing from rev-lease (caller guarantees
+    ; lease covers all PUTs). Non-PUT passes through. Threads + persists the lease.
+    (define (gr-rewrite-batch! cmds)
+      (map (lambda (c) (let ((r (global-rev-rewrite c rev-lease)))
+                         (set! rev-lease (cdr r)) (car r)))
+           cmds))
+    ; ensure the lease holds >= `need` revs before a batch rewrite. Normally a no-op
+    ; (refill-before-empty keeps it warm). Only when short does it request a grant and
+    ; block for the reply, requeuing any other frame to `backlog` so nothing is lost.
+    ; ponytail: blocks the loop only on a cold/burst miss; the warm lease makes it rare —
+    ; a become-leader pre-seed would remove even that.
+    (define (gr-ensure! need)
+      (if (and gr-writer? (> need 0))
+          (let wait ()
+            (if (>= (lease-remaining rev-lease) need) #t
+                (begin
+                  (if (not rev-refill-inflight)
+                      (let ((ap (gr-authority-pid)))
+                        (if ap (begin (set! rev-refill-inflight REV-BLOCK)
+                                      (send ap (cons (self) (list (string->utf8 "REV-GRANT")
+                                                                  (string->utf8 (number->string (max REV-BLOCK need))))))))))
+                  (let ((r (raw-receive)))
+                    (if (and (pair? r) (string? (car r)) (string=? (car r) "REV-GRANT"))
+                        (if rev-refill-inflight
+                            (begin (set! rev-lease (lease-add rev-lease (cdr r) rev-refill-inflight))
+                                   (set! rev-refill-inflight #f)))
+                        (set! backlog (append backlog (list r)))))
+                  (wait))))))
     (define FWD-EXPIRE-TICKS 25)              ; ~3s at the default 120ms tick
     ; ---- snapshot shipping, leader side (cw-lkq.15) ----
     ; The engine marks (snap-req) any peer that rejected AppendEntries at the
@@ -1585,16 +1632,23 @@
                            (if (not (eq? nxt '*timeout*))
                                (set! backlog (append backlog (list nxt))))
                            (let ((batch (reverse acc)) (base-idx (log-len st)))
+                             ; cw-kp0: in a global-rev writer group, secure enough leased
+                             ; global revisions for this batch's PUTs, then rewrite each
+                             ; PUT -> PUT-AT <rev> so all replicas apply the same rev. A
+                             ; no-op (byte-identical to the default path) unless gr-writer?.
+                             (gr-ensure! (if gr-writer? (gr-count-puts (map cdr batch)) 0))
                              ; register each waiter at its prospective log index
                              (let reg ((bs batch) (i 1))
                                (when (pair? bs)
                                  (hashtable-set! pending (+ base-idx i) (caar bs))
                                  (reg (cdr bs) (+ i 1))))
                              (prof-tick! n)
-                             (let* ((r (raft-propose-batch st (map cdr batch)))
+                             (let* ((r (raft-propose-batch
+                                         st (if gr-writer? (gr-rewrite-batch! (map cdr batch)) (map cdr batch))))
                                     (st1 (car r)) (outs1 (cdr r)))
                                (emit! outs1)              ; ONE AE round for the whole batch
                                (rtt-mark-emit!)
+                               (gr-maybe-refill!)         ; cw-kp0: keep the lease warm
                                (let ((st2 (maybe-commit st1))) ; solo commits now; cluster waits for AERs
                                  (if (> (raft-applied st2) old) (persist-applied! st2))
                                  ; this branch only runs on the leader -> #t

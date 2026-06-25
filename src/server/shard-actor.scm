@@ -452,6 +452,11 @@
     (define REV-LOW   8)                   ; refill when remaining drops to this
     (define rev-lease (lease-new))         ; FIFO buffer of granted (lo . hi) blocks
     (define rev-refill-inflight #f)        ; block size of an outstanding REV-GRANT, or #f
+    ; authority-side low-watermark aggregator (rev-authority? only): writer-shard-num ->
+    ; lowest global rev that writer has NOT yet applied (#f = caught up to its lease).
+    ; W = min over writers-with-unapplied of (lowest-unapplied - 1), else granted-high —
+    ; an idle/caught-up writer never freezes W below high (ADR 0006).
+    (define rev-progress (make-eqv-hashtable))
     (define gr-writer? (and global-rev? (not rev-authority?)))   ; this group draws global revs
     ; the local rev-authority (shard "0") replica pid; a grant request to a follower
     ; replica forwards to the authority leader via the standard fwd-write path, and the
@@ -1145,6 +1150,25 @@
             ;; any shard may query the authority group.
             ((eq? (car m) 'global-high)
              (send (cadr m) (list 'global-high-ok (mvcc-global-rev ctx)))
+             (loop st leader elapsed flush-base))
+
+            ;; cw-kp0 Phase 3: a writer reports the lowest global rev it has NOT yet
+            ;; applied (#f = caught up). The authority records it for the low-watermark.
+            ;; (rev-progress writer-shard-num lowest-unapplied|#f)
+            ((eq? (car m) 'rev-progress)
+             (if rev-authority? (hashtable-set! rev-progress (cadr m) (caddr m)))
+             (loop st leader elapsed flush-base))
+
+            ;; cw-kp0 Phase 3: the global low-watermark — the highest rev safe to surface
+            ;; as header.revision (everything <= W is applied on its owning group). W =
+            ;; min over writers-with-unapplied of (lowest-unapplied - 1), else granted-high.
+            ((eq? (car m) 'global-watermark)
+             (let ((high (mvcc-global-rev ctx)))
+               (let wmark ((ks (vector->list (hashtable-keys rev-progress))) (w high))
+                 (if (null? ks)
+                     (send (cadr m) (list 'global-watermark-ok w))
+                     (let ((lu (hashtable-ref rev-progress (car ks) #f)))
+                       (wmark (cdr ks) (if lu (min w (- lu 1)) w))))))
              (loop st leader elapsed flush-base))
 
             ;; ---- Auth read seams (cw-u4a.26) — pure reads over NS-AUTH on THIS

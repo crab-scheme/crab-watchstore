@@ -65,4 +65,20 @@
 (commit 202)
 (check "disjoint commit visible" "c" (val-of (latest "ky")))
 
+(section "ISOLATION: read-write conflict (my write vs their read; rr does NOT conflict)")
+; txn 300 READS kr (guard, version=0 since absent -> passes) and writes ka; stages
+(check "txn 300 prepared (reads kr, writes ka)" (list "TXN-PREPARE" 300 #t)
+       (prepare 300 11 (make-txn (list (make-compare CMP-VERSION RES-EQUAL (b "kr") (u64->bytes 0)))
+                                 (list (op-put (b "ka") (b "x") 0)) '())))
+; txn 301 WRITES kr while 300 holds a read on kr -> rw conflict -> votes #f
+(check "txn 301 writing a key 300 READS conflicts" (list "TXN-PREPARE" 301 #f)
+       (prepare 301 12 (make-txn '() (list (op-put (b "kr") (b "y") 0)) '())))
+(abort 300)
+; two pure-READ txns on the same key do NOT conflict (rr is safe)
+(check "txn 302 read-only on kr prepares" (list "TXN-PREPARE" 302 #t)
+       (prepare 302 13 (make-txn (list (make-compare CMP-VERSION RES-EQUAL (b "kr") (u64->bytes 0))) '() '())))
+(check "txn 303 read-only on the SAME kr also prepares (rr ok)" (list "TXN-PREPARE" 303 #t)
+       (prepare 303 14 (make-txn (list (make-compare CMP-VERSION RES-EQUAL (b "kr") (u64->bytes 0))) '() '())))
+(abort 302) (abort 303)
+
 (done!)

@@ -1101,14 +1101,21 @@
 ; against the pre-commit state and both commit => lost update (Elle :G0/:G-single-item).
 ; No-wait (conflict => abort+retry, never block) so no deadlock. The stage is small
 ; (only in-flight prepared txns), so a linear scan is fine.
+; stage entry = #(rev rkeys wkeys ops): rkeys = guard/read keys, wkeys = written keys,
+; ops = the ops to apply on commit. Conflict (serializability) is rw/wr/ww — a shared key
+; where at least one side WRITES it; two pure reads (rr) of the same key do NOT conflict.
 (define (any-key-member? ks pool)
   (cond ((null? ks) #f) ((member (car ks) pool) #t) (else (any-key-member? (cdr ks) pool))))
-(define (txn-stage-conflict? txnid mykeys)
+(define (txn-stage-conflict? txnid my-rkeys my-wkeys)
   (let loop ((ids (vector->list (hashtable-keys txn-stage))))
     (cond ((null? ids) #f)
           ((= (car ids) txnid) (loop (cdr ids)))
           (else (let ((stg (hashtable-ref txn-stage (car ids) #f)))
-                  (if (and stg (any-key-member? mykeys (map (lambda (o) (vector-ref o 1)) (cdr stg))))
+                  (if (and stg
+                           (let ((o-rkeys (vector-ref stg 1)) (o-wkeys (vector-ref stg 2)))
+                             (or (any-key-member? my-wkeys o-rkeys)   ; my write vs their read
+                                 (any-key-member? my-wkeys o-wkeys)   ; ww
+                                 (any-key-member? my-rkeys o-wkeys)))) ; my read vs their write
                       #t (loop (cdr ids))))))))
 
 (define (mvcc-apply ctx cmd)
@@ -1154,13 +1161,13 @@
        (let* ((txnid  (bytes->int (list-ref cmd 1)))
               (rev    (bytes->int (list-ref cmd 2)))
               (sub    (txn-decode (list-ref cmd 3)))
-              (mykeys (append (map cmp-key (txn-compares sub))
-                              (map (lambda (o) (vector-ref o 1)) (txn-success sub))
+              (rkeys  (map cmp-key (txn-compares sub)))
+              (wkeys  (append (map (lambda (o) (vector-ref o 1)) (txn-success sub))
                               (map (lambda (o) (vector-ref o 1)) (txn-failure sub))))
-              ; vote yes only if no in-flight txn holds my keys (isolation) AND my guards hold
-              (ok     (and (not (txn-stage-conflict? txnid mykeys))
+              ; vote yes only if no in-flight txn conflicts (rw/wr/ww) AND my guards hold
+              (ok     (and (not (txn-stage-conflict? txnid rkeys wkeys))
                            (compares-all-true? ctx (txn-compares sub)))))
-         (if ok (hashtable-set! txn-stage txnid (cons rev (txn-success sub))))
+         (if ok (hashtable-set! txn-stage txnid (vector rev rkeys wkeys (txn-success sub))))
          (list "TXN-PREPARE" txnid ok)))
       ((string=? op "TXN-COMMIT")
        ; apply the staged ops at the txn's global rev (deterministic), make them visible,
@@ -1169,8 +1176,8 @@
        (let* ((txnid (bytes->int (list-ref cmd 1)))
               (stg   (hashtable-ref txn-stage txnid #f)))
          (if stg
-             (let ((rev (car stg)))
-               (let loop ((ops (cdr stg)) (sub 0))
+             (let ((rev (vector-ref stg 0)))
+               (let loop ((ops (vector-ref stg 3)) (sub 0))
                  (when (pair? ops)
                    (op-eval-apply ctx (car ops) rev sub)
                    (loop (cdr ops) (+ sub 1))))

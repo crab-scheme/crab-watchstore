@@ -1037,12 +1037,16 @@
   ; participant (classic 2PC) — fine for the optimistic/retry workloads here; a stage GC by
   ; watermark is the follow-up if it bites. Failure-branch ops on a guard-fail are not
   ; applied cross-shard (abort = apply nothing) — matches etcd optimistic txns (empty else).
-  (define (txn-2pc itxn parts)
+  (define (txn-2pc itxn)
+   (let ((split0 (txn-split-by-shard itxn key-shard)))
+    (if (null? split0)            ; an empty Txn (no keys) trivially succeeds, no rev needed
+        (cons 'ok (pb-encode TxnResponse-schema
+                             (internal-txn-result->etcd (cons #t '()) (shard-header))))
     (let ((gack (ask-shard (cons (self) (list (string->utf8 "REV-GRANT") (int->bytes 1))))))
       (if (not (and (pair? gack) (string? (car gack)) (string=? (car gack) "REV-GRANT")))
           (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: request timed out"))   ; authority unavailable
           (let* ((R     (cdr gack))
-                 (split (txn-split-by-shard itxn key-shard))   ; (shard . sub-txn) alist
+                 (split split0)                                ; (shard . sub-txn) alist
                  (votes (map (lambda (sp)
                                (let ((a (ask-shard-on (shard-pid-idx (car sp))
                                           (cons (self) (list (string->utf8 "TXN-PREPARE")
@@ -1065,17 +1069,20 @@
                                 branch))
                    (hdr    (make-header cluster-id member-id R 0)))
               (cons 'ok (pb-encode TxnResponse-schema
-                                   (internal-txn-result->etcd (cons ok? resps) hdr))))))))
+                                   (internal-txn-result->etcd (cons ok? resps) hdr))))))))))
   (define (handle-txn h bytes)
     (let* ((tr   (pb-decode TxnRequest-schema bytes))
            (deny (txn-authz-deny? h tr)))   ; compares=READ, inner put/del=WRITE, range=READ
       (if deny (cons 'err deny)
       (let* ((itxn  (etcd-txn->internal tr))
              (parts (txn-participant-shards itxn)))
-        ; cw-kp0 Phase 4: <=1 participant -> route the whole Txn to its one shard (atomic
-        ; there, fast path). >1 (spans groups) -> the cross-shard 2PC coordinator.
-        (if (> (length parts) 1)
-            (txn-2pc itxn parts)
+        ; cw-kp0 Phase 4: in MULTI-GROUP mode every Txn goes through the 2PC coordinator so
+        ; it commits at a global rev — even a single-participant Txn, otherwise it would use
+        ; the shard's LOCAL rev and a key written by both a single-shard Txn and a cross-shard
+        ; Txn would get two incompatible rev sequences (Elle :incompatible-order). Single-group
+        ; (shard-groups=1, no authority) keeps the original local-rev fast path.
+        (if (> shard-groups 1)
+            (txn-2pc itxn)
             (let* ((tgt (if (null? parts) 0 (car parts)))
                    (ack (ask-shard-on (shard-pid-idx tgt)
                                       (cons (self) (list (string->utf8 "TXN") (txn-encode itxn))))))

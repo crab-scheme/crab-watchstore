@@ -60,8 +60,11 @@
   ;; cw-kp0: when --shard-groups > 1, launch N independent Raft groups so the
   ;; checkers exercise the global-revision allocator across groups. Default 1
   ;; preserves today's single-group launch + semantics exactly (flag omitted).
+  ;; >1 groups: also enable the synthetic global-revision allocator (--global-rev),
+  ;; so cross-group revisions are etcd-faithful (without it, N groups have independent
+  ;; per-shard revisions = ADR 0005 option A, which the checkers would flag).
   (let [sg    (:shard-groups test)
-        extra (if (and sg (> sg 1)) ["--shard-groups" (str sg)] [])]
+        extra (if (and sg (> sg 1)) ["--shard-groups" (str sg) "--global-rev" "yes"] [])]
     (apply cu/start-daemon!
       {:logfile logfile
        :pidfile pidfile

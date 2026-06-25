@@ -69,6 +69,11 @@
    [nil "--[no-]durable" "fsync every write (RocksDB durable mode)"
     :default true]
 
+   [nil "--shard-groups N" "Independent Raft groups (multi-shard, cw-kp0). 1 = single group (today's default + semantics). >1 validates the global-revision allocator: the register/append/watch checkers assert etcd's cross-shard revision invariants hold across groups."
+    :default  1
+    :parse-fn #(Long/parseLong %)
+    :validate [pos? "must be positive"]]
+
    [nil "--rate HZ" "Approx requests/sec/thread"
     :default  50
     :parse-fn #(Double/parseDouble %)

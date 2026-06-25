@@ -57,16 +57,22 @@
   "Launch the node-cluster process under start-stop-daemon. chdir to `dir` so the
    script's relative (include \"src/...\") forms resolve."
   [test node]
-  (cu/start-daemon!
-    {:logfile logfile
-     :pidfile pidfile
-     :chdir   dir}
-    binary
-    "run" "src/node-cluster.scm" "--"
-    "--node"    (name node)
-    "--durable" (if (:durable test) "yes" "no")
-    "--db"      (str data-dir "/cw")
-    "--cluster" (cluster-spec test)))
+  ;; cw-kp0: when --shard-groups > 1, launch N independent Raft groups so the
+  ;; checkers exercise the global-revision allocator across groups. Default 1
+  ;; preserves today's single-group launch + semantics exactly (flag omitted).
+  (let [sg    (:shard-groups test)
+        extra (if (and sg (> sg 1)) ["--shard-groups" (str sg)] [])]
+    (apply cu/start-daemon!
+      {:logfile logfile
+       :pidfile pidfile
+       :chdir   dir}
+      binary
+      "run" "src/node-cluster.scm" "--"
+      "--node"    (name node)
+      "--durable" (if (:durable test) "yes" "no")
+      "--db"      (str data-dir "/cw")
+      "--cluster" (cluster-spec test)
+      extra)))
 
 (defn signal!
   "Send a signal to the node process by cmdline match. Tolerates 'no process'."

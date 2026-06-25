@@ -1139,6 +1139,14 @@
                         (set! rev-refill-inflight #f)))
              (loop st leader elapsed flush-base))
 
+            ;; cw-kp0 Phase 3: the rev-authority's current granted global-rev high
+            ;; (META-GLOBAL-REV). A building block for the global header.revision /
+            ;; low-watermark coordinator. Harmless leader-local read (0 in default mode);
+            ;; any shard may query the authority group.
+            ((eq? (car m) 'global-high)
+             (send (cadr m) (list 'global-high-ok (mvcc-global-rev ctx)))
+             (loop st leader elapsed flush-base))
+
             ;; ---- Auth read seams (cw-u4a.26) — pure reads over NS-AUTH on THIS
             ;; node's committed ctx (auth.scm).  The gRPC handler (grpc-kv) owns the
             ;; leader-local token table + identity resolution; it asks here for the

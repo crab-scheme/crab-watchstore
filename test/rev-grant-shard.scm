@@ -44,6 +44,7 @@
     (let ((o (table-lookup 'ws-shard-pid \"a:0\")))
       (table-insert! 'ws-test \"g1\" (propose o (list (b \"REV-GRANT\") (b \"3\"))))
       (table-insert! 'ws-test \"g2\" (propose o (list (b \"REV-GRANT\") (b \"2\"))))
+      (table-insert! 'ws-test \"gh\" (ask o (list 'global-high (self))))
       (table-insert! 'ws-test \"p1\" (propose o (list (b \"PUT\") (b \"k\") (b \"v\"))))
       (table-insert! 'ws-test \"done\" #t)))")
 (spawn-source client-src 'client)
@@ -52,5 +53,7 @@
 (check "grant of 3 -> block lo=1"                        (cons "REV-GRANT" 1) (table-lookup 'ws-test "g1"))
 (check "grant of 2 -> block lo=4 (monotonic, no overlap)" (cons "REV-GRANT" 4) (table-lookup 'ws-test "g2"))
 (check "a PUT commits at current-rev 1 (independent of global-rev)" (cons "PUT" 1) (table-lookup 'ws-test "p1"))
+(check "global-high query returns granted high = 5 (after grant 3 + grant 2)"
+       (list 'global-high-ok 5) (table-lookup 'ws-test "gh"))
 
 (done!)

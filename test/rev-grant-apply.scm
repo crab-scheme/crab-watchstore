@@ -16,6 +16,8 @@
 (define (b s) (string->utf8 s))
 (define (grant n) (mvcc-apply CTX (map b (list "REV-GRANT" (number->string n)))))
 (define (put . parts) (mvcc-apply CTX (map b parts)))
+(define (put-at rev k v) (mvcc-apply CTX (map b (list "PUT-AT" (number->string rev) k v))))
+(define (latest k) (mvcc-get-latest CTX (b k)))
 
 ; ---- monotonic, contiguous, non-overlapping blocks --------------------------
 (check "grant of 3 returns block lo=1"      (cons "REV-GRANT" 1) (grant 3))
@@ -36,5 +38,16 @@
 
 ; ---- persistence: global-rev is read straight from the META key every time ---
 (check "global-rev persisted in META (re-read)" 7 (mvcc-global-rev CTX))
+
+; ---- PUT-AT: apply a write at an EXPLICIT embedded revision (2b.4) -----------
+; In global-rev mode the leader proposes PUT-AT <granted-rev>; all replicas apply
+; at that rev deterministically and current-rev tracks the granted global sequence.
+(check "PUT-AT 100 acks at the embedded rev"   (cons "PUT" 100) (put-at 100 "gk" "gv"))
+(check "current-rev jumped TO the embedded rev" 100 (mvcc-current-rev CTX))
+(let ((r (latest "gk")))
+  (check "PUT-AT key value"                "gv" (utf8->string (kv-rec-value r)))
+  (check "PUT-AT mod_revision = embedded"   100 (kv-rec-mod-rev r)))
+(check "later PUT-AT 105 advances current-rev" (cons "PUT" 105) (put-at 105 "gk" "gv2"))
+(check "current-rev = 105"                      105 (mvcc-current-rev CTX))
 
 (done!)

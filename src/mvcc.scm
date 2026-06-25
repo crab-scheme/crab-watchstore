@@ -1103,6 +1103,25 @@
               (lo (+ g 1)))
          (mvcc-set-global-rev! ctx (+ g n))
          (cons "REV-GRANT" lo)))
+      ((string=? op "PUT-AT")
+       ; cw-kp0 phase 2b.4: apply a PUT at an EXPLICIT revision carried in the entry
+       ; (the global rev the leader granted at propose time, ADR 0006). All replicas
+       ; apply at the same embedded rev => deterministic. current-rev is set TO that
+       ; rev (not prev+1). In global-rev mode every write is a PUT-AT, so current-rev
+       ; tracks the granted global sequence. Reply shape matches PUT ("PUT" . rev).
+       ; ("PUT-AT" revStr K V [leaseStr])
+       (let* ((at    (bytes->int (list-ref cmd 1)))
+              (K     (list-ref cmd 2))
+              (V     (list-ref cmd 3))
+              (lease (if (>= (length cmd) 5)
+                         (let ((l (bytes->int (list-ref cmd 4)))) (if l l 0))
+                         0)))
+         (if (and (not (= lease 0)) (not (mvcc-lease-exists? ctx lease)))
+             (cons 'err-lease-not-found lease)
+             (begin
+               (mvcc-put! ctx K V lease at 0)
+               (mvcc-set-current-rev! ctx at)
+               (cons "PUT" at)))))
       ((string=? op "PUT")
        (let* ((K     (list-ref cmd 1))
               (V     (list-ref cmd 2))

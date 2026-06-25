@@ -47,6 +47,9 @@
     (let ((w (table-lookup 'ws-shard-pid \"a:1\")))    ; the WRITER group's shard pid
       (table-insert! 'ws-test \"p1\" (propose w (list (b \"PUT\") (b \"k1\") (b \"v1\"))))
       (table-insert! 'ws-test \"p2\" (propose w (list (b \"PUT\") (b \"k2\") (b \"v2\"))))
+      ; read the writes back: (get conn key) -> (value create-rev mod-rev version)
+      (table-insert! 'ws-test \"r1\" (ask w (list 'get (self) (b \"k1\"))))
+      (table-insert! 'ws-test \"r2\" (ask w (list 'get (self) (b \"k2\"))))
       (table-insert! 'ws-test \"done\" #t)))")
 (spawn-source client-src 'client)
 (spin (lambda () (table-lookup 'ws-test "done")) "writer writes acked")
@@ -55,5 +58,12 @@
 ; applied as PUT-AT so every replica would agree. Reply shape matches PUT.
 (check "writer PUT 1 commits at global rev 1" (cons "PUT" 1) (table-lookup 'ws-test "p1"))
 (check "writer PUT 2 commits at global rev 2" (cons "PUT" 2) (table-lookup 'ws-test "p2"))
+
+(section "the writes are READABLE at their global revisions (data persisted)")
+(let ((r1 (table-lookup 'ws-test "r1")) (r2 (table-lookup 'ws-test "r2")))
+  (check "k1 value reads back"             "v1" (and r1 (utf8->string (car r1))))
+  (check "k1 mod_revision = global rev 1"   1   (and r1 (caddr r1)))
+  (check "k2 value reads back"             "v2" (and r2 (utf8->string (car r2))))
+  (check "k2 mod_revision = global rev 2"   2   (and r2 (caddr r2))))
 
 (done!)

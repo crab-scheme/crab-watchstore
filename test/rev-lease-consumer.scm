@@ -45,6 +45,26 @@
       (check "post-refill no longer needs refill" (lease-needs-refill? L3 2) #f)
       (check "continues 3,4 then jumps to 20,21,22" (drain L3 6) '(3 4 20 21 22 #f)))))
 
+; ---- propose-time rewrite: PUT -> PUT-AT <leased rev> -----------------------
+(define (b s) (string->utf8 s))
+(define (str x) (utf8->string x))
+; a PUT with a non-empty lease becomes PUT-AT carrying the next rev
+(let* ((L (lease-add (lease-new) 7 2))               ; lease [7,9): revs 7,8
+       (r (global-rev-rewrite (list (b "PUT") (b "k") (b "v")) L))
+       (cmd (car r)) (L2 (cdr r)))
+  (check "PUT rewritten to PUT-AT"        "PUT-AT" (str (list-ref cmd 0)))
+  (check "PUT-AT carries the leased rev 7" "7"     (str (list-ref cmd 1)))
+  (check "key preserved"                  "k"      (str (list-ref cmd 2)))
+  (check "value preserved"                "v"      (str (list-ref cmd 3)))
+  (check "lease advanced (rev 7 consumed)" 1       (lease-remaining L2)))
+; an empty lease yields #f -> caller must refill + retry (never propose without a rev)
+(let ((r (global-rev-rewrite (list (b "PUT") (b "k") (b "v")) (lease-new))))
+  (check "empty lease -> #f cmd (refill+retry)" #f (car r)))
+; a non-PUT command passes through unchanged
+(let* ((del (list (b "DEL") (b "k")))
+       (r (global-rev-rewrite del (lease-add (lease-new) 7 2))))
+  (check "non-PUT passes through unchanged" "DEL" (str (list-ref (car r) 0))))
+
 (newline)
 (if (= fails 0)
     (begin (display "rev-lease-consumer: ALL PASS — writer draws global revs from a ")

@@ -36,3 +36,24 @@
 ; refill when the remaining buffer drops to `low` or below — request the next grant
 ; while there are still revs to serve, so the request/reply round overlaps real work.
 (define (lease-needs-refill? blocks low) (<= (lease-remaining blocks) low))
+
+; ---------------------------------------------------------------------------
+; propose-time rewrite: the exact transform the writer-group leader applies in
+; global-rev mode before proposing a client write — PUT becomes PUT-AT carrying the
+; next leased global revision, so all replicas apply that rev deterministically
+; (2b.4). Pure so the propose-path hook is a one-liner over proven logic.
+; cmd = ("PUT" K V [lease]) as bytevectors. Returns (cons cmd' lease'):
+;   cmd' = ("PUT-AT" revStr K V [lease])         when a rev was available
+;   cmd' = #f (lease unchanged)                  when the lease is EMPTY — the caller
+;          must refill (request a REV-GRANT) and retry; never propose without a rev.
+; A non-PUT cmd passes through unchanged (DEL/TXN global-rev handling is a later phase).
+; ---------------------------------------------------------------------------
+(define (global-rev-rewrite cmd lease)
+  (if (and (pair? cmd) (string=? (utf8->string (car cmd)) "PUT"))
+      (let ((t (lease-take lease)))
+        (if (car t)
+            (cons (cons (string->utf8 "PUT-AT")
+                        (cons (string->utf8 (number->string (car t))) (cdr cmd)))
+                  (cdr t))
+            (cons #f lease)))
+      (cons cmd lease)))

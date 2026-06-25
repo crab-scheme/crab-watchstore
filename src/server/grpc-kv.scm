@@ -481,6 +481,14 @@
                       (modulo (* (bitwise-xor h (bytevector-u8-ref key i)) 16777619)
                               4294967296)))))))
   (define (shard-pid-for key) (shard-pid-idx (key-shard key)))
+  ; cw-kp0 Phase 4: the distinct shard indices a Txn's keys map to (its participants).
+  ; <=1 -> the Txn commits atomically on that one shard (route there). >1 -> it spans
+  ; groups and needs the cross-shard 2PC coordinator. Empty (no keys) -> group 0.
+  (define (txn-participant-shards itxn)
+    (let loop ((ks (txn-touched-keys itxn)) (out '()))
+      (cond ((null? ks) out)
+            ((memv (key-shard (car ks)) out) (loop (cdr ks) out))
+            (else (loop (cdr ks) (cons (key-shard (car ks)) out))))))
   ; cluster-members (cw-u4a.30): the static --cluster spec as a list of
   ; (name-string peerurl-string), e.g. (("a" "http://127.0.0.1:7001") ...).  Used by
   ; the Cluster service to report peerURLs in MemberList and as an extra id->name
@@ -1004,7 +1012,16 @@
       (if deny (cons 'err deny)
       (let* ((itxn  (etcd-txn->internal tr))
              (flat  (txn-encode itxn))
-             (ack   (shard-write (list (string->utf8 "TXN") flat))))
+             (parts (txn-participant-shards itxn))
+             ; cw-kp0 Phase 4: route the Txn to a participant shard so its keys land on
+             ; the SAME shard reads of them route to (key-shard) — fixes the old blob-hash
+             ; routing that sent every Txn to a random shard. <=1 participant -> atomic on
+             ; that shard. >1 (spans groups) -> STOPGAP: first participant only; the keys on
+             ; OTHER participants still mis-route until the cross-shard 2PC coordinator
+             ; (commit all participants at one global rev) lands — that is the next increment.
+             (tgt   (if (null? parts) 0 (car parts)))
+             (ack   (ask-shard-on (shard-pid-idx tgt)
+                                  (cons (self) (list (string->utf8 "TXN") flat)))))
       (cond
         ((and (pair? ack) (boolean? (car ack)))    ; (succeeded? . responses)
          ; the Txn bumped current-rev iff a branch mutated; either way the ResponseHeader

@@ -52,7 +52,10 @@
 
 (check "grant of 3 -> block lo=1"                        (cons "REV-GRANT" 1) (table-lookup 'ws-test "g1"))
 (check "grant of 2 -> block lo=4 (monotonic, no overlap)" (cons "REV-GRANT" 4) (table-lookup 'ws-test "g2"))
-(check "a PUT commits at current-rev 1 (independent of global-rev)" (cons "PUT" 1) (table-lookup 'ws-test "p1"))
+; cw-kp0: the authority's own data PUT now draws the NEXT global rev (PUT-GLOBAL) so shard-0
+; keys share the one global rev space. After granting 5 (3+2), the next global rev is 6.
+(check "a PUT commits at the next GLOBAL rev 6 (authority shares the global rev space)"
+       (cons "PUT" 6) (table-lookup 'ws-test "p1"))
 (check "global-high query returns granted high = 5 (after grant 3 + grant 2)"
        (list 'global-high-ok 5) (table-lookup 'ws-test "gh"))
 

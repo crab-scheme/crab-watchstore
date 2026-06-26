@@ -1153,6 +1153,25 @@
                (mvcc-put! ctx K V lease at 0)
                (mvcc-set-current-rev! ctx at)
                (cons "PUT" at)))))
+      ((string=? op "PUT-GLOBAL")
+       ; cw-kp0: the AUTHORITY's own data PUT. Draw the next GLOBAL rev from the authority's
+       ; counter at APPLY time (deterministic — every replica has the same mvcc-global-rev),
+       ; so shard-0 keys share the ONE global rev space and never collide with a writer's
+       ; granted global rev. The authority is the sole advancer of this counter (grants +
+       ; its own writes interleave monotonically). ("PUT-GLOBAL" K V [leaseStr])
+       (let* ((at    (+ (mvcc-global-rev ctx) 1))
+              (K     (list-ref cmd 1))
+              (V     (list-ref cmd 2))
+              (lease (if (>= (length cmd) 4)
+                         (let ((l (bytes->int (list-ref cmd 3)))) (if l l 0))
+                         0)))
+         (if (and (not (= lease 0)) (not (mvcc-lease-exists? ctx lease)))
+             (cons 'err-lease-not-found lease)
+             (begin
+               (mvcc-set-global-rev! ctx at)
+               (mvcc-put! ctx K V lease at 0)
+               (mvcc-set-current-rev! ctx at)
+               (cons "PUT" at)))))
       ((string=? op "TXN-PREPARE")
        ; cw-kp0 Phase 4 cross-shard 2PC, participant side: check THIS shard's guards and,
        ; if all hold, STAGE this shard's ops under txnid at the txn's global rev (not yet

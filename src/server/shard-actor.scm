@@ -482,6 +482,15 @@
       (map (lambda (c) (let ((r (global-rev-rewrite c rev-lease)))
                          (set! rev-lease (cdr r)) (car r)))
            cmds))
+    ; cw-kp0: the AUTHORITY rewrites its own data PUTs to PUT-GLOBAL so they draw the next
+    ; global rev at apply time (mvcc-apply) from the shared counter — no lease (so it never
+    ; reports a writer watermark) and no rev collision with writers. Non-PUT passes through.
+    (define (auth-rewrite-batch cmds)
+      (map (lambda (c)
+             (if (and (pair? c) (string=? (utf8->string (car c)) "PUT"))
+                 (cons (string->utf8 "PUT-GLOBAL") (cdr c))
+                 c))
+           cmds))
     ; report this writer's low-watermark contribution to the authority (Phase 3): the
     ; lowest global rev it may still produce but has NOT applied. Conservatively
     ; current-rev+1 while it has unconsumed leased revs OR in-flight writes; else #f
@@ -1716,7 +1725,9 @@
                                        (reg (cdr bs) (+ i 1))))
                                    (prof-tick! n)
                                    (let* ((r (raft-propose-batch
-                                               st (if gr-writer? (gr-rewrite-batch! raw-cmds) raw-cmds)))
+                                               st (cond (gr-writer?    (gr-rewrite-batch! raw-cmds))
+                                                        (rev-authority? (auth-rewrite-batch raw-cmds))  ; PUT -> PUT-GLOBAL
+                                                        (else raw-cmds))))
                                           (st1 (car r)) (outs1 (cdr r)))
                                      (emit! outs1)            ; ONE AE round for the whole batch
                                      (rtt-mark-emit!)

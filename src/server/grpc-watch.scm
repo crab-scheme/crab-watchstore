@@ -153,17 +153,28 @@
                                  ((and (pair? r) (eq? (car r) 'watch-response)) (xbuf! (cadr r)) (await (+ spins 1)))
                                  ((> spins 40) (loop (+ i 1) m))   ; hard cap: never wedge the worker (<=0.8s/shard)
                                  (else (await (+ spins 1)))))))))))
+  ; BATCH a rev-ordered list of single-event wr-sexps into ONE WatchResponse and send it.
+  ; cw-kp0 THROUGHPUT FIX: emit-wr! routes through the shared gRPC dispatcher; one send per
+  ; event floods it under watch load and starves the write/ack path (write throughput
+  ; collapse). etcd allows many events per WatchResponse, so coalesce per flush -> ~1 send
+  ; instead of N. wr-sexp = (wid header-rev created? canceled? reason compact events).
+  (define (emit-batch! wrs)
+    (when (pair? wrs)
+      (let ((wid (car (car wrs)))
+            (hdr (let mx ((l wrs) (m 0)) (if (null? l) m (mx (cdr l) (max m (cadr (car l)))))))
+            (evs (apply append (map (lambda (w) (list-ref w 6)) wrs))))
+        (when (pair? evs) (emit-wr! (list wid hdr #f #f "" 0 evs))))))
   (define (xflush!)
     (let ((w (xmin-rev)))
-      (let split ((in (xsort xbuf)) (held '()))
-        (cond ((null? in) (set! xbuf (reverse held)))
-              ((<= (caar in) w) (emit-wr! (cdar in)) (split (cdr in) held))
-              (else (split (cdr in) (cons (car in) held)))))))
+      (let split ((in (xsort xbuf)) (deliver '()) (held '()))
+        (cond ((null? in) (emit-batch! (reverse deliver)) (set! xbuf (reverse held)))
+              ((<= (caar in) w) (split (cdr in) (cons (cdar in) deliver) held))
+              (else (split (cdr in) deliver (cons (car in) held)))))))
   ; deliver the ENTIRE buffer in rev order — safe ONLY at quiescence (no events for
   ; XQUIESCENT-TICKS, so writes have stopped and every committed event has applied +
   ; arrived). Clears the min-cur-rev gate's idle-shard stall at the workload's drain.
   (define (xflush-all!)
-    (for-each (lambda (e) (emit-wr! (cdr e))) (xsort xbuf))
+    (emit-batch! (map cdr (xsort xbuf)))
     (set! xbuf '()))
   ; one flush tick: track quiescence and flush the buffer when writes pause. The active-
   ; phase min-rev gate (xflush!) is intentionally NOT run here — it polled every shard for

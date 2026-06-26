@@ -448,8 +448,9 @@
     ; (rev-refill-inflight = the block size of an outstanding REV-GRANT request, #f
     ; when none). All inert unless global-rev? — the default single-group path never
     ; touches these. The propose-branch hook that consumes them is the next increment.
-    (define REV-BLOCK 64)                 ; revs per refill — amortizes the grant round-trip
-    (define REV-LOW   8)                   ; refill when remaining drops to this
+    (define REV-BLOCK 256)                ; revs per refill — larger block amortizes the cross-group
+                                          ; grant round-trip better under concurrent write load (cw-kp0)
+    (define REV-LOW   32)                  ; refill earlier so the lease never runs dry mid-burst
     (define rev-lease (lease-new))         ; FIFO buffer of granted (lo . hi) blocks
     (define rev-refill-inflight #f)        ; block size of an outstanding REV-GRANT, or #f
     ; authority-side low-watermark aggregator (rev-authority? only): writer-shard-num ->

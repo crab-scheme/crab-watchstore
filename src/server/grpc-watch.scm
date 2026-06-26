@@ -218,7 +218,13 @@
       (if (and range-end (> n-shards 1))
           ; ---- cross-shard prefix/range watch: register at EVERY shard with one client
           ; wid, buffer all replay, then deliver merged in global-rev order via xflush! ----
-          (let ((cw (or client-wid 1)))
+          (let ((cw (or client-wid 1))
+                ; cw-kp0: a FUTURE-ONLY watch (internal-start 0) would miss events applied
+                ; on a shard between the snapshot and that shard's (sequential) registration.
+                ; Floor the start-rev at snap-rev so each shard REPLAYS the registration
+                ; window (events > snap-rev) — correct for a future-only watch (it wants
+                ; everything after the watch point) and closes the cross-shard window gap.
+                (xstart (if (= internal-start 0) snap-rev internal-start)))
             (set! xshard? #t)
             (if progress? (set! any-progress? #t))
             (set! live-wids (cons cw live-wids))
@@ -228,7 +234,7 @@
                 (let ((p (shard-pid-i i)))
                   (when p
                     (send p (list 'watch-register (self)
-                                  (append (list (cons 'key key) (cons 'start-rev internal-start)
+                                  (append (list (cons 'key key) (cons 'start-rev xstart)
                                                 (cons 'prev-kv prev-kv?) (cons 'filters filters)
                                                 (cons 'progress-notify progress?)
                                                 (cons 'range-end range-end) (cons 'watch-id cw)))))

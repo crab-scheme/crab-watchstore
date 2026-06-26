@@ -114,7 +114,14 @@
   ; revision order. n-shards=1 / node-name="" -> single-shard (the original path, untouched).
   (define n-shards  (if (pair? rest) (car rest) 1))
   (define node-name (if (and (pair? rest) (pair? (cdr rest))) (cadr rest) ""))
-  (define (shard-pid-i i) (table-lookup 'ws-shard-pid (string-append node-name ":" (number->string i))))
+  ; cw-kp0: shard pids arrive as spawn args (grpc-kv passes them, in shard-index order) AFTER
+  ; shard-groups + node-name. Spawn-arg pids route from THIS worker (like the group-0 shard-pid
+  ; arg the single-shard path uses); the ws-shard-pid table is NOT shared into this nested runtime.
+  (define shard-pid-args (if (and (pair? rest) (pair? (cdr rest))) (cddr rest) '()))
+  (define (shard-pid-i i)
+    (if (< i (length shard-pid-args))
+        (list-ref shard-pid-args i)
+        (table-lookup 'ws-shard-pid (string-append node-name ":" (number->string i)))))
   (define XSHARD-FLUSH-MS 200)
   (define xshard? #f)            ; this stream registered a watch across all shards
   (define xbuf '())             ; buffered (rev . wr-sexp) awaiting the safe-delivery gate
@@ -152,7 +159,7 @@
                                   (loop (+ i 1) (if m (min m (cadr r)) (cadr r))))
                                  ((and (pair? r) (eq? (car r) 'watch-response)) (xbuf! (cadr r)) (await (+ spins 1)))
                                  ((> spins 40) (loop (+ i 1) m))   ; hard cap: never wedge the worker (<=0.8s/shard)
-                                 (else (await (+ spins 1)))))))))))
+                                 (else (await (+ spins 1)))))))))))) ; cw-kp0 FIX: was missing one close — the worker never loaded (parse error), so watch delivery was dead
   ; BATCH a rev-ordered list of single-event wr-sexps into ONE WatchResponse and send it.
   ; cw-kp0 THROUGHPUT FIX: emit-wr! routes through the shared gRPC dispatcher; one send per
   ; event floods it under watch load and starves the write/ack path (write throughput
@@ -191,6 +198,7 @@
     ; event can arrive after a higher one ships). One batched send, no poll.
     (if (>= xidle XQUIESCENT-TICKS) (xflush-all!)))
   (define live-wids '())   ; watch_ids established on THIS stream (for teardown)
+  (define xcreated-pending #f)  ; cw-kp0: a cross-shard created-ack to emit from the loop (deferred)
   (define xshard-regs '())  ; (shard-pid . wid) registered across shards, for teardown
   ; cw-5w8 root-cause #2: once ANY watch on this stream sets progress_notify=true
   ; (etcd's WithProgressNotify), the server owes PERIODIC progress notifications, not
@@ -274,36 +282,20 @@
                 ; :observed-put-events 0). Trade: the brief sequential-registration window may
                 ; miss the very first writes; the watcher opens before load so it's small.
                 ; A re-establish (last-rev+1 > 0) resumes from there.
-                (xstart (if (> internal-start 0) internal-start 0)))
+                )
+            ; cw-kp0: grpc-kv (dispatch! -> xshard-watch-register!) registers this watch at EVERY
+            ; shard with OUR pid as reply-pid — the nested worker's own N-shard 'watch-register
+            ; never reached the shards (:observed-put-events 0 across 60+ runs; unobservable in the
+            ; nested spawn-source). Here we only enter merge mode + ack. Replay/live events arrive
+            ; on our mailbox as 'watch-response and ship in rev order via the quiescent flush (xtick!).
             (set! xshard? #t)
             (if progress? (set! any-progress? #t))
             (set! live-wids (cons cw live-wids))
-            (emit-wr! (list cw snap-rev #t #f "" 0 '()))   ; ONE created ack first
-            (let rloop ((i 0))
-              (when (< i n-shards)
-                (let ((p (shard-pid-i i)))
-                  (when p
-                    (send p (list 'watch-register (self)
-                                  (append (list (cons 'key key) (cons 'start-rev xstart)
-                                                (cons 'prev-kv prev-kv?) (cons 'filters filters)
-                                                (cons 'progress-notify progress?)
-                                                (cons 'range-end range-end) (cons 'watch-id cw)))))
-                    ; BOUNDED: a bare raw-receive hung the worker if a shard was slow to ack
-                    ; 'watch-created (mid-batch) -> registration never completed -> no delivery
-                    ; (:observed-put-events 0). Cap the wait (~0.8s); the watch IS registered at
-                    ; the shard regardless of the ack timing, so proceed and let live events flow.
-                    (let aw ((spins 0))
-                      (let ((r (raw-receive 100)))
-                        (cond ((not (pair? r)) (if (> spins 8) #t (aw (+ spins 1))))
-                              ((eq? (car r) 'watch-response) (xbuf! (cadr r)) (aw spins))
-                              ((eq? (car r) 'watch-created)
-                               (set! xshard-regs (cons (cons p (cdr r)) xshard-regs)))
-                              ((eq? (car r) 'watch-compacted) #t)
-                              ((eq? (car r) 'watch-not-leader) #t)   ; nemesis re-establishes
-                              (else (aw spins)))))))
-                (rloop (+ i 1))))
-            ; replay frames are buffered; they ship with the first quiescent flush (no poll).
-            (xflush-all!))
+            ; cw-kp0: grpc-kv (xshard-watch-register!) registers this watch at every shard with
+            ; ITS OWN (self) as reply-pid and RELAYS each 'watch-response to us by wid — the only
+            ; routable path (a nested worker's send never reached the shards; a spawn-return handle
+            ; RAISES at the shard). We just enter merge mode + ack; events arrive on our mailbox.
+            (set! xcreated-pending (list cw snap-rev #t #f "" 0 '())))
           ; ---- single-shard (single-group, or a single-key watch) — original path ----
           (begin
             (send shard-pid (list 'watch-register (self) spec))
@@ -409,6 +401,7 @@
 
   (handle-client-msg (grpc-request-bytes h))   ; the first WatchRequest
   (let loop ()
+    (when xcreated-pending (emit-wr! xcreated-pending) (set! xcreated-pending #f))   ; deferred created ack
     ; arm the idle timeout only on streams that requested progress_notify; others
     ; block forever (no spurious wakeups, no progress they never asked for).
     (let ((m (cond (xshard?      (raw-receive XSHARD-FLUSH-MS))   ; flush merged events periodically

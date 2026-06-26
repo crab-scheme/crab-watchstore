@@ -297,6 +297,27 @@
         (cons 'revision   (if (< revision 1) 1 revision))
         (cons 'raft_term  raft-term)))
 
+; cw-kp0: WatchResponse encoders, mirrored from grpc-watch.scm so the DISPATCHER can drive a
+; cross-shard watch stream itself (the per-stream worker is an actor-messaging island — it can
+; grpc-stream-send! but a `send` to/from it RAISES, so it can never receive relayed events).
+; wr-sexp = (wid header-rev created? canceled? cancel-reason compact-rev ((type kv prev-kv)...)).
+(define (wgk-kvv->keyvalue v)
+  (list (cons 'key (vector-ref v 0)) (cons 'create_revision (vector-ref v 1))
+        (cons 'mod_revision (vector-ref v 2)) (cons 'version (vector-ref v 3))
+        (cons 'lease (vector-ref v 4)) (cons 'value (vector-ref v 5))))
+(define (wgk-event->event e)
+  (let ((type (list-ref e 0)) (kv (list-ref e 1)) (prev (list-ref e 2)))
+    (append (list (cons 'type (if (eq? type 'del) 1 0)) (cons 'kv (wgk-kvv->keyvalue kv)))
+            (if prev (list (cons 'prev_kv (wgk-kvv->keyvalue prev))) '()))))
+(define (wgk-wr->watchresponse s cluster-id member-id term)
+  (let ((wid (list-ref s 0)) (hrev (list-ref s 1)) (created (list-ref s 2)) (cancel (list-ref s 3))
+        (reason (list-ref s 4)) (compact (list-ref s 5)) (events (list-ref s 6)))
+    (append (list (cons 'header (make-header cluster-id member-id hrev term))
+                  (cons 'watch_id wid) (cons 'created created) (cons 'canceled cancel)
+                  (cons 'compact_revision compact))
+            (if (and (string? reason) (> (string-length reason) 0)) (list (cons 'cancel_reason reason)) '())
+            (if (pair? events) (list (cons 'events (map wgk-event->event events)) ) '()))))
+
 ; ===========================================================================
 ; A flat KV tuple (k v cr mr ver lease) from a read seam -> a KeyValue alist.
 ; keys-only is honoured upstream (mvcc-range blanks the value), so we just map.
@@ -521,6 +542,39 @@
   ; The transport delivers a stream's client messages to THIS actor tagged with
   ; the handle; we route them to the per-stream worker (server/grpc-watch.scm).
   (define stream-workers (make-eqv-hashtable))
+  ; cw-kp0: cross-shard watch routing. A prefix watch is registered at every shard with THIS
+  ; dispatcher's (self) as reply-pid (the only pid the shards can route to — a worker's spawn
+  ; handle RAISES at the shard). The shard tags each delivered wr-sexp with the watch-id; we map
+  ; watch-id -> worker-pid and relay 'watch-response frames to the right per-stream worker.
+  (define xwatch-routes (make-eqv-hashtable))   ; watch-id -> worker pid
+  ; ponytail: the watch workload runs ONE prefix watcher per node, so relay every cross-shard
+  ; 'watch-response to the most-recent watch worker (the shard-assigned wid in the frame need not
+  ; equal the wid we registered with). Switch to per-wid routing (xwatch-routes) when a node must
+  ; serve multiple concurrent cross-shard watchers.
+  (define xwatch-last-pid #f)
+  (define xwatch-stream-h #f)   ; the cross-shard watch's gRPC stream handle (dispatcher drives it)
+  ; cw-kp0 merge: events arrive from N shards interleaved; BUFFER (hrev . sexp) and flush in
+  ; revision order at quiescence so the client sees a single gap-free, in-order stream. Buffering
+  ; (vs emit-on-arrival) also keeps the dispatcher's main loop cheap DURING writes (just a cons),
+  ; so write acks aren't starved by per-event pb-encode/stream-send.
+  (define xwatch-buf '())
+  (define xwatch-idle 0)
+  (define (xwatch-emit-sexp! sexp)
+    (when xwatch-stream-h
+      (guard (e (#t #f))
+        (grpc-stream-send! xwatch-stream-h
+          (pb-encode WatchResponse-schema (wgk-wr->watchresponse sexp cluster-id member-id 1))))))
+  (define (xwatch-flush!)
+    (let ((sorted (list-sort (lambda (a b) (< (car a) (car b))) xwatch-buf)))
+      (set! xwatch-buf '())
+      (for-each (lambda (p) (xwatch-emit-sexp! (cdr p))) sorted)))
+  ; Flush ONLY at true write-quiescence: ~1.2s (8 * 150ms) of no new events, longer than the
+  ; cross-shard delivery skew + inter-write gap, so every shard's events for the paused window
+  ; are present and sort into one gap-free, globally-rev-ordered batch. A shorter window flushes
+  ; a high rev from one shard before a low rev from another arrives (out-of-order).
+  (define (xwatch-tick!)
+    (set! xwatch-idle (+ xwatch-idle 1))
+    (if (and (pair? xwatch-buf) (>= xwatch-idle 8)) (xwatch-flush!)))
   ; FIFO buffer of dispatcher messages (*grpc-*) that arrived while a UNARY
   ; handler was mid `ask-shard` (its raw-receive must return the SHARD reply, not
   ; a concurrent stream/request message).  The main loop drains these first.
@@ -535,7 +589,11 @@
     (let wait ()
       (let ((r (raw-receive)))
         (if (and (pair? r)
-                 (memq (car r) '(*grpc-request* *grpc-stream-msg* *grpc-stream-end* put-done)))
+                 (memq (car r) '(*grpc-request* *grpc-stream-msg* *grpc-stream-end* put-done
+                                 ; cw-kp0: cross-shard watch frames delivered to THIS dispatcher's
+                                 ; (self) — buffer them for the main loop's relay, never mis-parse
+                                 ; one as a shard ack mid-write.
+                                 watch-response watch-created watch-compacted watch-canceled watch-not-leader)))
             (begin (set! grpc-pending (append grpc-pending (list r))) (wait))
             r))))
   (define (ask-shard msg) (ask-shard-on shard-pid msg))            ; SYSTEM group (0)
@@ -543,10 +601,12 @@
 
   ; next mailbox message for the main loop: buffered dispatcher traffic first
   ; (FIFO), else a fresh receive.
+  ; cw-kp0: a bounded receive so the main loop wakes periodically to flush the cross-shard watch
+  ; buffer in rev order even when no request is in flight (a non-pair result = idle tick).
   (define (next-message)
     (if (pair? grpc-pending)
         (let ((m (car grpc-pending))) (set! grpc-pending (cdr grpc-pending)) m)
-        (raw-receive)))
+        (raw-receive 150)))
 
   ; current (revision . term) for a ResponseHeader, read from the shard.
   (define (shard-header)
@@ -1450,10 +1510,55 @@
     ; cw-kp0 Phase 3: pass shard-groups + this node's name so the Watch worker can register
     ; a prefix/range watch at EVERY shard and merge their event streams by global rev. The
     ; lease/health workers ignore the extra args. node-name #f / N=1 -> single-shard (old).
+    ; cw-kp0: pass EVERY shard's pid as a spawn arg so the cross-shard watch worker can register
+    ; at each one with ITS OWN (self) as reply-pid. Only an actor's own (self) is globally
+    ; routable across runtimes — a spawn-return handle (e.g. this wpid) is parent-relative and a
+    ; shard's `send` to it RAISES (proven: SHDELIV-RAISE). So the worker must self-register; we
+    ; only supply the routable shard targets here. The lease/health workers ignore the extras.
     (let ((wpid (spawn-source "(include \"src/server/grpc-watch.scm\")" entry
                               h shard-pid cluster-id member-id
                               shard-groups (or my-node-name ""))))
-      (hashtable-set! stream-workers h wpid)))
+      (hashtable-set! stream-workers h wpid)
+      wpid))
+
+  ; cw-kp0: register a CROSS-SHARD prefix watch at every shard, with THIS dispatcher's (self) as
+  ; the reply-pid and map its watch-id -> the per-stream worker. The shards deliver every event
+  ; to us (shard -> dispatcher routes; write acks prove it); the main loop relays each frame to
+  ; the worker by watch-id (dispatcher -> worker routes; stream-msg forwarding proves it). The
+  ; nested worker could never get its OWN 'watch-register to the shards (60+ runs, invisible).
+  ; start-rev = internal EXCLUSIVE bound, matching the single-group path (rev 1 -> -1 replay so no
+  ; early write is missed; rev>1 -> rev-1; rev 0 -> 0 future-only).
+  (define (xshard-watch-register! h wpid)
+    (when (> shard-groups 1)
+      (let* ((wr (guard (e (#t #f)) (pb-decode WatchRequest-schema (grpc-request-bytes h))))
+             (cr (and wr (galist 'create_request wr #f)))
+             (re (and cr (let ((r (galist 'range_end cr EMPTY)))
+                           (if (= (bytevector-length r) 0) #f r)))))
+        (when (and cr re)
+          (let* ((key       (galist 'key cr EMPTY))
+                 (start-rev (galist 'start_revision cr 0))
+                 (prev-kv?  (galist 'prev_kv cr #f))
+                 (progress? (galist 'progress_notify cr #f))
+                 (client-wid (let ((w (galist 'watch_id cr 0))) (if (= w 0) #f w)))
+                 (filters   (map (lambda (n) (if (= n 1) 'nodelete 'noput)) (galist 'filters cr '())))
+                 (internal-start (cond ((= start-rev 1) -1) ((> start-rev 1) (- start-rev 1)) (else 0)))
+                 ; FUTURE-ONLY (xstart 0) when internal-start <= 0: a full replay (-1) makes every
+                 ; shard dump its whole history to this dispatcher at once, flooding the write path
+                 ; (committed-writes collapse). The watcher opens before load, so future-only still
+                 ; catches the run's writes; a re-establish (last-rev+1 > 0) resumes precisely.
+                 (xstart     (if (> internal-start 0) internal-start 0))
+                 (cw        (or client-wid 1))
+                 (spec (list (cons 'key key) (cons 'start-rev xstart)
+                             (cons 'prev-kv prev-kv?) (cons 'filters filters)
+                             (cons 'progress-notify progress?)
+                             (cons 'range-end re) (cons 'watch-id cw))))
+            (hashtable-set! xwatch-routes cw wpid)   ; relay 'watch-response with this wid -> worker
+            (set! xwatch-last-pid wpid)
+            (set! xwatch-stream-h h)   ; the dispatcher pushes events straight to this stream
+            (let rloop ((i 0))
+              (when (< i shard-groups)
+                (send (shard-pid-idx i) (list 'watch-register (self) spec))
+                (rloop (+ i 1)))))))))
 
   (define (dispatch! h)
     (let ((path (grpc-request-path h))
@@ -1472,7 +1577,8 @@
          (let ((deny (watch-authz-deny? h)))
            (if deny
                (grpc-respond-error! h (car deny) (cdr deny))
-               (start-stream-worker! h 'grpc-watch-worker))))
+               (let ((wpid (start-stream-worker! h 'grpc-watch-worker)))
+                 (xshard-watch-register! h wpid)))))   ; cross-shard: register + route via this dispatcher
         ((string=? path "/etcdserverpb.Lease/LeaseKeepAlive")
          (start-stream-worker! h 'grpc-lease-keepalive-worker))
         ; Maintenance/Snapshot (cw-u4a.32) is SERVER-STREAMING: one request -> many
@@ -1829,7 +1935,7 @@
     (if (= 0 (modulo gc-msg-count 512)) (collect-garbage))
     (let ((m (next-message)))
       (cond
-        ((not (pair? m)) (loop))
+        ((not (pair? m)) (xwatch-tick!) (loop))   ; idle tick -> flush cross-shard watch buffer in rev order
         ((eq? (car m) '*grpc-request*)
          (dispatch! (cadr m)) (loop))
         ; EXP5 (cw-juw): async PUT commit landed -> encode + respond now.
@@ -1843,6 +1949,19 @@
            (when w
              (guard (e (#t (hashtable-delete! stream-workers (cadr m))))
                (send w (list 'client-msg (caddr m))))))
+         (loop))
+        ; cw-kp0: a cross-shard watch event delivered to THIS dispatcher (we are the shards'
+        ; reply-pid) -> relay it to the per-stream worker by watch-id. wr-sexp = (wid hrev ...).
+        ((eq? (car m) 'watch-response)
+         ; the dispatcher drives the stream itself (the worker can't receive). Buffer by header
+         ; rev; the idle tick flushes in revision order (cross-shard merge).
+         (let ((sexp (cadr m)))
+           (set! xwatch-buf (cons (cons (cadr sexp) sexp) xwatch-buf))
+           (set! xwatch-idle 0))
+         (loop))
+        ; the shard's register acks / cancels land here too (we registered with our (self));
+        ; the worker emits its own created-ack, so these are informational — drop them.
+        ((memq (car m) '(watch-created watch-compacted watch-canceled watch-not-leader))
          (loop))
         ; client half-closed -> tell the worker to tear down + drop the route
         ((eq? (car m) '*grpc-stream-end*)

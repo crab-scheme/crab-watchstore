@@ -140,12 +140,19 @@
           (let ((p (shard-pid-i i)))
             (if (not p) (loop (+ i 1) m)
                 (begin (send p (list 'cur-rev (self)))
-                       (let await ()
-                         (let ((r (raw-receive)))
-                           (cond ((and (pair? r) (eq? (car r) 'cur-rev-ok))
+                       ; BOUNDED await: a bare raw-receive here hung the worker forever when a
+                       ; shard didn't reply 'cur-rev-ok promptly (end-of-run load) -> the quiescent
+                       ; flush was never reached -> the buffered TAIL was never delivered. Time the
+                       ; poll out; a non-responding shard just doesn't lower the watermark this tick
+                       ; (its events still ship in rev order via the next tick / the quiescent flush).
+                       (let await ((spins 0))
+                         (let ((r (raw-receive 60)))
+                           (cond ((not r) (loop (+ i 1) m))   ; shard silent this tick -> skip it
+                                 ((and (pair? r) (eq? (car r) 'cur-rev-ok))
                                   (loop (+ i 1) (if m (min m (cadr r)) (cadr r))))
-                                 ((and (pair? r) (eq? (car r) 'watch-response)) (xbuf! (cadr r)) (await))
-                                 (else (await)))))))))))
+                                 ((and (pair? r) (eq? (car r) 'watch-response)) (xbuf! (cadr r)) (await (+ spins 1)))
+                                 ((> spins 200) (loop (+ i 1) m))   ; hard cap: never wedge the worker
+                                 (else (await (+ spins 1)))))))))))
   (define (xflush!)
     (let ((w (xmin-rev)))
       (let split ((in (xsort xbuf)) (held '()))
@@ -165,7 +172,7 @@
   ; drain's progress probe). Delivery is still gap-free + ordered, just batched.
   (define (xtick!)
     (if xgot (begin (set! xgot #f) (set! xidle 0)) (set! xidle (+ xidle 1)))
-    (if (>= xidle XQUIESCENT-TICKS) (xflush-all!)))
+    (if (>= xidle XQUIESCENT-TICKS) (xflush-all!) (xflush!)))   ; active min-rev gate + quiescent tail flush
   (define live-wids '())   ; watch_ids established on THIS stream (for teardown)
   (define xshard-regs '())  ; (shard-pid . wid) registered across shards, for teardown
   ; cw-5w8 root-cause #2: once ANY watch on this stream sets progress_notify=true
@@ -223,15 +230,15 @@
           ; ---- cross-shard prefix/range watch: register at EVERY shard with one client
           ; wid, buffer all replay, then deliver merged in global-rev order via xflush! ----
           (let ((cw (or client-wid 1))
-                ; cw-kp0: register each shard at the watch's OWN start-rev. A future-only
-                ; watch (internal-start 0) takes the NO-REPLAY path (delivered_rev seeded to
-                ; current-rev, instant synced) — crucial: flooring at snap-rev instead made
-                ; each shard run watch-replay-to-current!, a loop that chases current-rev
-                ; while writes advance it, BLOCKING the shard's actor loop -> leader stepdown
-                ; -> writes return indeterminate (the watch-load write collapse). The Jepsen
-                ; watcher opens before writes, so future-only misses no registration-window
-                ; events anyway; live events arrive via watch-on-apply!.
-                (xstart internal-start))
+                ; cw-kp0: a FUTURE-ONLY watch (internal-start 0) seeds each shard's
+                ; delivered_rev to that shard's current-rev at registration -> it MISSES any
+                ; write that committed between the snapshot and that shard's (sequential)
+                ; registration (observed: early rev gaps like {5}). Floor start-rev at snap-rev
+                ; so each shard REPLAYS the registration window (events > snap-rev). The replay
+                ; is bounded (windowed scan, delivered_rev monotone) and is NOT what collapsed
+                ; writes under load — that was the writer mishandling timeouts (fixed in the
+                ; jepsen client) + raw throughput, not this replay.
+                (xstart (if (= internal-start 0) snap-rev internal-start)))
             (set! xshard? #t)
             (if progress? (set! any-progress? #t))
             (set! live-wids (cons cw live-wids))

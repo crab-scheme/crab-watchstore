@@ -279,7 +279,13 @@
     (if (or (null? l) (= n 0)) (reverse acc)
         (loop (cdr l) (- n 1) (cons (car l) acc)))))
 (define (append-for st peer)
-  (let* ((nx (cdr (assq peer (aget st 'next))))
+  ; cw-bm5: clamp next to lastLogIndex+1. A peer's next must never exceed the leader's
+  ; log end (a follower can't hold entries the leader lacks); if a next-advance bug let it,
+  ; entry-term/entries-from ran off the end of the log and CRASHED shard-main under real
+  ; control-plane load. Clamp to the caught-up value and send a contained heartbeat; a
+  ; genuinely-behind follower self-corrects via AER reject. Never kill the store over it.
+  (let* ((raw (cdr (assq peer (aget st 'next))))
+         (nx  (min raw (+ 1 (log-len st))))
          (prev (- nx 1)))
     (list 'ae (aget st 'term) (aget st 'id) prev (entry-term st prev)
           (take-at-most (entries-from st nx) AE-MAX-ENTRIES)

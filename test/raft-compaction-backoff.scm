@@ -51,6 +51,21 @@
          (st3  (car res2)))
     (check "second rejection: b next stays at base+1 = 6" 6 (cdr (assq 'b (aget st3 'next))))))
 
+(section "base=5, peer next > log-len+1: NO crash, clamp to log-len+1 (cw-bm5 upper bound)")
+; Symmetric to the cw-u4a.39 lower-bound bug: if a next-advance bug pushes a peer's next
+; PAST the leader's log end, append-for's entry-term/entries-from indexed off the end and
+; crashed shard-main under k8s control-plane load. The fix clamps next to lastLogIndex+1.
+(let* ((st (make-raft 'a '(a b c) dummy 0))
+       (st (aset* st (list 'base 5 'base-term 1 'term 2 'role 'leader
+                           'log (list (cmd "x") (cmd "y") (cmd "z"))   ; entries 6..8, log-len=8
+                           'next (list (cons 'b 12) (cons 'c 9))        ; b next=12 > log-len+1=9 (trigger)
+                           'match (list (cons 'b 0) (cons 'c 8))
+                           'commit 8 'applied 8 'rseq 0)))
+       (ae (append-for st 'b)))     ; PRE-FIX: crashes (list-ref past end) in entry-term/entries-from
+  (check "no crash; AE prev-idx clamped to log-len = 8"        8 (list-ref ae 3))
+  (check "AE prev-term = term of last entry (2)"               2 (list-ref ae 4))
+  (check "AE carries 0 entries (caught-up heartbeat)"          0 (length (list-ref ae 5))))
+
 (section "sanity: a healthy entries-from at base+1 returns the full in-mem log")
 (let* ((st (make-raft 'a '(a b c) dummy 0))
        (st (aset* st (list 'base 5 'base-term 1 'log (list (cmd "x") (cmd "y") (cmd "z"))))))

@@ -1010,10 +1010,37 @@
   ; ---- KV/Compact ----
   ; propose ("COMPACT" rev) -> CompactionResponse{header}.  ErrCompacted (already
   ; compacted past rev) / future-rev -> OutOfRange(11) with etcd's message.
+  ; cw-kp0 Phase 4: global compaction coordinator. In multi-group mode a compaction at R
+  ; is admissible only once R <= the global low-watermark (the authority gate, so no shard
+  ; discards history a still-in-flight cross-shard op might reference); then BROADCAST
+  ; COMPACT R to every shard (each compacts its own keyspace below R). A shard whose own
+  ; current-rev is < R simply has nothing that high to drop -> err-future-rev is BENIGN in
+  ; the global view; only err-compacted (R already reclaimed) propagates.
+  (define (compact-broadcast rev)
+    (let ((adm (ask-shard-on (shard-pid-idx 0) (list 'compact-admissible rev (self)))))
+      (if (and (pair? adm) (eq? (car adm) 'compact-admissible-ok) (not (cadr adm)))
+          (cons 'err (cons GRPC-OUT-OF-RANGE
+                           "etcdserver: mvcc: required revision is a future revision"))
+          (let loop ((i 0) (err #f))
+            (if (>= i shard-groups)
+                (or err (cons 'ok (pb-encode CompactionResponse-schema
+                                             (list (cons 'header (shard-header))))))
+                (let ((ack (ask-shard-on (shard-pid-idx i)
+                             (cons (self) (list (string->utf8 "COMPACT") (int->bytes rev))))))
+                  (loop (+ i 1)
+                        (or err
+                            (cond ((and (pair? ack) (eq? (car ack) 'ok))           #f)
+                                  ((and (pair? ack) (eq? (car ack) 'err-future-rev)) #f)  ; benign
+                                  ((and (pair? ack) (eq? (car ack) 'err-compacted))
+                                   (cons 'err (cons GRPC-OUT-OF-RANGE ETCD-ERR-COMPACTED)))
+                                  ((eq? ack 'tryagain)
+                                   (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: not leader")))
+                                  (else #f))))))))))   ; tolerate stragglers
   (define (handle-compact bytes)
     (let* ((cr  (pb-decode CompactionRequest-schema bytes))
-           (rev (galist 'revision cr 0))
-           (ack (shard-write (list (string->utf8 "COMPACT") (int->bytes rev)))))
+           (rev (galist 'revision cr 0)))
+     (if (> shard-groups 1) (compact-broadcast rev)
+      (let ((ack (shard-write (list (string->utf8 "COMPACT") (int->bytes rev)))))
       (cond
         ((and (pair? ack) (eq? (car ack) 'ok))
          (cons 'ok (pb-encode CompactionResponse-schema
@@ -1025,7 +1052,7 @@
                           "etcdserver: mvcc: required revision is a future revision")))
         ((eq? ack 'tryagain)      (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: not leader")))
         ((eq? ack 'indeterminate) (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: leader changed")))
-        (else (cons 'err (cons GRPC-INTERNAL "compact: unexpected ack"))))))
+        (else (cons 'err (cons GRPC-INTERNAL "compact: unexpected ack"))))))))
 
   ; ---- KV/Txn (translators are top-level; see etcd-txn->internal et al.) ----
   ; cw-kp0 Phase 4: cross-shard 2PC coordinator for a Txn spanning groups. Acquire ONE

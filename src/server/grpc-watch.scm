@@ -120,7 +120,7 @@
   (define xbuf '())             ; buffered (rev . wr-sexp) awaiting the safe-delivery gate
   (define xgot #f)              ; an event arrived since the last flush tick
   (define xidle 0)             ; consecutive idle flush ticks (no new events)
-  (define XQUIESCENT-TICKS 10)  ; ~2s of no events -> writes stopped, every committed event has arrived
+  (define XQUIESCENT-TICKS 4)   ; ~0.8s of no events -> writes paused; flush held tail in rev order
   (define (xbuf! wr) (set! xbuf (cons (cons (cadr wr) wr) xbuf)) (set! xgot #t))
   ; insertion sort a (rev . wr) list ascending by rev (small lists)
   (define (xsort lst)
@@ -289,6 +289,9 @@
   ; substream on this stream to that revision). Drain any interleaved watcher
   ; frames while awaiting the shard's cur-rev so delivery order is preserved.
   (define (do-progress)
+    ; cw-kp0: a cross-shard watcher asking "am I caught up?" (the workload's drain) -> flush
+    ; the held tail in rev order before answering, so the progress reply reflects everything.
+    (if xshard? (xflush-all!))
     (send shard-pid (list 'cur-rev (self)))
     (let await ()
       (let ((r (raw-receive)))

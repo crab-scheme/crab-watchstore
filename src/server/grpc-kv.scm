@@ -1447,8 +1447,12 @@
   ; sendable scalars/pid — a bytevector spawn ARG would render as a #vu8(...)
   ; literal the spawn-source bootstrap reader rejects.
   (define (start-stream-worker! h entry)
+    ; cw-kp0 Phase 3: pass shard-groups + this node's name so the Watch worker can register
+    ; a prefix/range watch at EVERY shard and merge their event streams by global rev. The
+    ; lease/health workers ignore the extra args. node-name #f / N=1 -> single-shard (old).
     (let ((wpid (spawn-source "(include \"src/server/grpc-watch.scm\")" entry
-                              h shard-pid cluster-id member-id)))
+                              h shard-pid cluster-id member-id
+                              shard-groups (or my-node-name ""))))
       (hashtable-set! stream-workers h wpid)))
 
   (define (dispatch! h)

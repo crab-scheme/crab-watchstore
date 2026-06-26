@@ -118,7 +118,10 @@
   (define XSHARD-FLUSH-MS 200)
   (define xshard? #f)            ; this stream registered a watch across all shards
   (define xbuf '())             ; buffered (rev . wr-sexp) awaiting the safe-delivery gate
-  (define (xbuf! wr) (set! xbuf (cons (cons (cadr wr) wr) xbuf)))
+  (define xgot #f)              ; an event arrived since the last flush tick
+  (define xidle 0)             ; consecutive idle flush ticks (no new events)
+  (define XQUIESCENT-TICKS 10)  ; ~2s of no events -> writes stopped, every committed event has arrived
+  (define (xbuf! wr) (set! xbuf (cons (cons (cadr wr) wr) xbuf)) (set! xgot #t))
   ; insertion sort a (rev . wr) list ascending by rev (small lists)
   (define (xsort lst)
     (let ins ((in lst) (out '()))
@@ -149,6 +152,16 @@
         (cond ((null? in) (set! xbuf (reverse held)))
               ((<= (caar in) w) (emit-wr! (cdar in)) (split (cdr in) held))
               (else (split (cdr in) (cons (car in) held)))))))
+  ; deliver the ENTIRE buffer in rev order — safe ONLY at quiescence (no events for
+  ; XQUIESCENT-TICKS, so writes have stopped and every committed event has applied +
+  ; arrived). Clears the min-cur-rev gate's idle-shard stall at the workload's drain.
+  (define (xflush-all!)
+    (for-each (lambda (e) (emit-wr! (cdr e))) (xsort xbuf))
+    (set! xbuf '()))
+  ; one flush tick: gate normally; if the stream has gone quiescent, flush everything.
+  (define (xtick!)
+    (if xgot (begin (set! xgot #f) (set! xidle 0)) (set! xidle (+ xidle 1)))
+    (if (>= xidle XQUIESCENT-TICKS) (xflush-all!) (xflush!)))
   (define live-wids '())   ; watch_ids established on THIS stream (for teardown)
   (define xshard-regs '())  ; (shard-pid . wid) registered across shards, for teardown
   ; cw-5w8 root-cause #2: once ANY watch on this stream sets progress_notify=true
@@ -338,7 +351,7 @@
                    (any-progress? (raw-receive PROGRESS-INTERVAL-MS))
                    (else (raw-receive)))))
       (cond
-        ((eq? m '*timeout*) (if xshard? (xflush!) (do-progress)) (loop))   ; merge-flush or progress
+        ((eq? m '*timeout*) (if xshard? (xtick!) (do-progress)) (loop))   ; merge-flush or progress
         ((not (pair? m)) (loop))
         ((eq? (car m) 'client-msg)     (handle-client-msg (cadr m)) (loop))
         ((eq? (car m) 'watch-response) (if xshard? (xbuf! (cadr m)) (emit-wr! (cadr m))) (loop))

@@ -198,6 +198,7 @@
 (define META-CURRENT-REV (meta-key "current-rev"))
 (define META-COMPACT-REV (meta-key "compact-rev"))
 (define META-LEASE-ID-SEQ (meta-key "lease-id-seq"))   ; lease auto-id counter (cw-u4a.17)
+(define META-GLOBAL-REV   (meta-key "global-rev"))     ; cw-kp0: rev-authority's granted high (separate from current-rev)
 
 ; ---------------------------------------------------------------------------
 ; KeyValue record (self-describing, length-prefixed; ADR §4)
@@ -303,6 +304,15 @@
 (define (mvcc-set-current-rev! ctx main)
   (set-shard-ctx-crev! ctx main)
   (kv-put! ctx META-CURRENT-REV (u64->bytes main)))
+
+; cw-kp0 phase 2: the global revision authority's counter (highest revision GRANTED
+; across all shard groups). Separate from current-rev — granting does not commit a
+; write, it reserves revisions. Only the designated authority shard maintains it.
+(define (mvcc-global-rev ctx)
+  (let ((b (kv-get ctx META-GLOBAL-REV)))
+    (if (and b (>= (bytevector-length b) 8)) (bytes->u64 b 0) 0)))
+(define (mvcc-set-global-rev! ctx v)
+  (kv-put! ctx META-GLOBAL-REV (u64->bytes v)))
 
 ; compact revision (read floor); 0 if never compacted.  (Written by .8.)
 (define (mvcc-compact-rev ctx)
@@ -815,7 +825,14 @@
     ; longer be served historically.  start-rev = 0 (current/future) never trips it.
     (if (and (> start-rev 0) (< start-rev compact-rev))
         (cons 'err-compacted compact-rev)
-        (let ((rows (kv-scan ctx (mvcc-byte NS-REV))))   ; ascending = revision order
+        ; cw-kp0 PERF: scan ONLY the (start-rev, cur-rev] revision WINDOW, not the whole
+        ; NS-REV namespace. watch-on-apply! runs this per apply; a full scan made it
+        ; O(store-size) per write -> O(N^2) under watch load -> writes time out. The NS-REV
+        ; key is NS-REV || u64be(main) || u64be(sub); [rev16(start+1,0), rev16(cur+1,0)) is
+        ; exactly main in (start-rev, cur-rev], ascending = revision order.
+        (let ((rows (kv-scan-range ctx
+                      (bytevector-append (mvcc-byte NS-REV) (rev->16 (+ start-rev 1) 0))
+                      (bytevector-append (mvcc-byte NS-REV) (rev->16 (+ cur-rev 1) 0)))))
           (let loop ((rs rows) (out '()))
             (if (null? rs)
                 (reverse out)
@@ -1077,11 +1094,128 @@
 
 (define (cmd-op cmd) (utf8->string (car cmd)))
 
+; cw-kp0 Phase 4 cross-shard 2PC: per-shard prepared-txn stage, txnid -> (rev . ops).
+; Built deterministically by applying TXN-PREPARE on every replica (it rides the Raft
+; log), drained by TXN-COMMIT/ABORT. ponytail: lives outside ctx so a snapshot taken
+; between PREPARE and COMMIT won't carry it — acceptable for the short prepare→commit
+; window (the coordinator re-drives on a leader change); move into ctx if snapshots
+; ever land mid-txn in practice.
+(define txn-stage (make-eqv-hashtable))
+
+; cw-kp0 Phase 4 ISOLATION: a prepared txn holds its keys until commit/abort. A new
+; PREPARE whose keys overlap ANY other in-flight staged txn's written keys conflicts
+; (votes no) — without this, two concurrent txns on the same key both pass their guards
+; against the pre-commit state and both commit => lost update (Elle :G0/:G-single-item).
+; No-wait (conflict => abort+retry, never block) so no deadlock. The stage is small
+; (only in-flight prepared txns), so a linear scan is fine.
+; stage entry = #(rev rkeys wkeys ops): rkeys = guard/read keys, wkeys = written keys,
+; ops = the ops to apply on commit. Conflict (serializability) is rw/wr/ww — a shared key
+; where at least one side WRITES it; two pure reads (rr) of the same key do NOT conflict.
+(define (any-key-member? ks pool)
+  (cond ((null? ks) #f) ((member (car ks) pool) #t) (else (any-key-member? (cdr ks) pool))))
+(define (txn-stage-conflict? txnid my-rkeys my-wkeys)
+  (let loop ((ids (vector->list (hashtable-keys txn-stage))))
+    (cond ((null? ids) #f)
+          ((= (car ids) txnid) (loop (cdr ids)))
+          (else (let ((stg (hashtable-ref txn-stage (car ids) #f)))
+                  (if (and stg
+                           (let ((o-rkeys (vector-ref stg 1)) (o-wkeys (vector-ref stg 2)))
+                             (or (any-key-member? my-wkeys o-rkeys)   ; my write vs their read
+                                 (any-key-member? my-wkeys o-wkeys)   ; ww
+                                 (any-key-member? my-rkeys o-wkeys)))) ; my read vs their write
+                      #t (loop (cdr ids))))))))
+
 (define (mvcc-apply ctx cmd)
   (let* ((prev-rev (mvcc-current-rev ctx))
          (main     (+ prev-rev 1))
          (op       (cmd-op cmd)))
     (cond
+      ((string=? op "REV-GRANT")
+       ; cw-kp0 phase 2: the rev-authority hands out a contiguous block of N global
+       ; revisions. Advances the SEPARATE global-rev counter (NOT current-rev — a
+       ; grant reserves revisions, it does not commit a write) and returns the
+       ; block's low revision; hi = lo+N-1. Per-batch grants sized to the batch are
+       ; hole-free (ADR 0006). Only the authority shard ever applies this command.
+       (let* ((n  (let ((x (bytes->int (list-ref cmd 1)))) (if (and x (> x 0)) x 1)))
+              (g  (mvcc-global-rev ctx))
+              (lo (+ g 1)))
+         (mvcc-set-global-rev! ctx (+ g n))
+         (cons "REV-GRANT" lo)))
+      ((string=? op "PUT-AT")
+       ; cw-kp0 phase 2b.4: apply a PUT at an EXPLICIT revision carried in the entry
+       ; (the global rev the leader granted at propose time, ADR 0006). All replicas
+       ; apply at the same embedded rev => deterministic. current-rev is set TO that
+       ; rev (not prev+1). In global-rev mode every write is a PUT-AT, so current-rev
+       ; tracks the granted global sequence. Reply shape matches PUT ("PUT" . rev).
+       ; ("PUT-AT" revStr K V [leaseStr])
+       (let* ((at    (bytes->int (list-ref cmd 1)))
+              (K     (list-ref cmd 2))
+              (V     (list-ref cmd 3))
+              (lease (if (>= (length cmd) 5)
+                         (let ((l (bytes->int (list-ref cmd 4)))) (if l l 0))
+                         0)))
+         (if (and (not (= lease 0)) (not (mvcc-lease-exists? ctx lease)))
+             (cons 'err-lease-not-found lease)
+             (begin
+               (mvcc-put! ctx K V lease at 0)
+               (mvcc-set-current-rev! ctx at)
+               (cons "PUT" at)))))
+      ((string=? op "PUT-GLOBAL")
+       ; cw-kp0: the AUTHORITY's own data PUT. Draw the next GLOBAL rev from the authority's
+       ; counter at APPLY time (deterministic — every replica has the same mvcc-global-rev),
+       ; so shard-0 keys share the ONE global rev space and never collide with a writer's
+       ; granted global rev. The authority is the sole advancer of this counter (grants +
+       ; its own writes interleave monotonically). ("PUT-GLOBAL" K V [leaseStr])
+       (let* ((at    (+ (mvcc-global-rev ctx) 1))
+              (K     (list-ref cmd 1))
+              (V     (list-ref cmd 2))
+              (lease (if (>= (length cmd) 4)
+                         (let ((l (bytes->int (list-ref cmd 3)))) (if l l 0))
+                         0)))
+         (if (and (not (= lease 0)) (not (mvcc-lease-exists? ctx lease)))
+             (cons 'err-lease-not-found lease)
+             (begin
+               (mvcc-set-global-rev! ctx at)
+               (mvcc-put! ctx K V lease at 0)
+               (mvcc-set-current-rev! ctx at)
+               (cons "PUT" at)))))
+      ((string=? op "TXN-PREPARE")
+       ; cw-kp0 Phase 4 cross-shard 2PC, participant side: check THIS shard's guards and,
+       ; if all hold, STAGE this shard's ops under txnid at the txn's global rev (not yet
+       ; visible). Deterministic on every replica. Reply (list "TXN-PREPARE" txnid bool).
+       ; ("TXN-PREPARE" txnidBytes revBytes subtxnBytes) — subtxn = (make-txn guards ops ()).
+       (let* ((txnid  (bytes->int (list-ref cmd 1)))
+              (rev    (bytes->int (list-ref cmd 2)))
+              (sub    (txn-decode (list-ref cmd 3)))
+              (rkeys  (map cmp-key (txn-compares sub)))
+              (wkeys  (append (map (lambda (o) (vector-ref o 1)) (txn-success sub))
+                              (map (lambda (o) (vector-ref o 1)) (txn-failure sub))))
+              ; vote yes only if no in-flight txn conflicts (rw/wr/ww) AND my guards hold
+              (ok     (and (not (txn-stage-conflict? txnid rkeys wkeys))
+                           (compares-all-true? ctx (txn-compares sub)))))
+         (if ok (hashtable-set! txn-stage txnid (vector rev rkeys wkeys (txn-success sub))))
+         (list "TXN-PREPARE" txnid ok)))
+      ((string=? op "TXN-COMMIT")
+       ; apply the staged ops at the txn's global rev (deterministic), make them visible,
+       ; drop the stage. Idempotent: a missing stage (already committed/never prepared
+       ; here) is a no-op. ("TXN-COMMIT" txnidBytes)
+       (let* ((txnid (bytes->int (list-ref cmd 1)))
+              (stg   (hashtable-ref txn-stage txnid #f)))
+         (if stg
+             (let ((rev (vector-ref stg 0)))
+               (let loop ((ops (vector-ref stg 3)) (sub 0))
+                 (when (pair? ops)
+                   (op-eval-apply ctx (car ops) rev sub)
+                   (loop (cdr ops) (+ sub 1))))
+               (mvcc-set-current-rev! ctx rev)
+               (hashtable-delete! txn-stage txnid)))
+         (list "TXN-COMMIT" txnid)))
+      ((string=? op "TXN-ABORT")
+       ; drop the stage (guards failed on some participant, or coordinator gave up).
+       ; Idempotent. ("TXN-ABORT" txnidBytes)
+       (let ((txnid (bytes->int (list-ref cmd 1))))
+         (hashtable-delete! txn-stage txnid)
+         (list "TXN-ABORT" txnid)))
       ((string=? op "PUT")
        (let* ((K     (list-ref cmd 1))
               (V     (list-ref cmd 2))

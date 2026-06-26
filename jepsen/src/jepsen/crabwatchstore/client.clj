@@ -40,8 +40,11 @@
 (def call-timeout-secs
   "Per-RPC deadline applied when dereffing jetcd's CompletableFutures. Kept modest so
    an attempt that lands on a partitioned-away / dead endpoint returns quickly and the
-   round-robin picker advances to another endpoint instead of blocking the full window."
-  6)
+   round-robin picker advances to another endpoint instead of blocking the full window.
+   Raised from 6 to accommodate the slower-but-correct write acks under an active cross-shard
+   Watch stream (the store commits them; they just need headroom past the watch-stream tax).
+   45 tolerates a heavily CPU-contended host where 20s still times out though the write commits."
+  45)
 
 (def max-retries
   "Bounded retries for transient UNAVAILABLE/not-leader (round-robin finds the

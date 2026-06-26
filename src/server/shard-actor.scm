@@ -45,6 +45,7 @@
                               ; shard applies AUTH-* (mvcc-apply) + serves the auth read seams.
 (include "src/watch.scm")     ; Watch backend: registry + replay->live dispatch (cw-u4a.13)
 (include "src/raft.scm")
+(include "src/rev-lease-consumer.scm")  ; cw-kp0: writer-side revision lease + PUT->PUT-AT rewrite (global-rev mode)
 
 (define (raft-applied st) (aget st 'applied))
 
@@ -84,6 +85,18 @@
          ; the original all-voters genesis.
          (genesis-learners (if (and (>= (length rest) 6) (list? (list-ref rest 5)))
                                (list-ref rest 5) '()))
+         ; 7 (cw-e9a) leader-node: pin leadership to THIS named voter (not just a
+         ; region). #f = no node pin (use leader-region / shard-rotated stagger).
+         (leader-node (if (and (>= (length rest) 7) (symbol? (list-ref rest 6)))
+                          (list-ref rest 6) #f))
+         ; 8 (cw-kp0) global-rev?: when #t this group participates in the synthetic
+         ; global revision allocator — shard "0" is the rev-authority (holds the
+         ; replicated global-rev counter, ADR 0006), others request grants from it.
+         ; Default #f = today's per-shard revision (single-group semantics intact);
+         ; the rest of the wiring (grant request at propose, watermark gate) gates
+         ; on this flag, so OFF is byte-identical to the current path.
+         (global-rev? (if (>= (length rest) 8) (and (list-ref rest 7) #t) #f))
+         (rev-authority? (and global-rev? (string=? shard-key "0")))
          ; cw-gx4: this group's cs-net channel — one Raft group → one channel so
          ; groups don't serialize on Messages. SHARD-CHANNELS = {1,3,4,5}
          ; (Consensus/Workflow/Bulk/Observability); Control=0 + Messages=2 are
@@ -137,10 +150,18 @@
          ; Staggered election timeout, ROTATED by shard so leadership spreads:
          ; for shard S the voter at index S has the shortest timeout and tends to
          ; win it. Deterministic => no split votes, predictable failover.
-         (timeout (+ election-base (* (modulo (- (index-of node-name voters)
+         ; cw-e9a: when leader-node is pinned, that voter gets the strictly-shortest
+         ; timeout (election-base) and every other voter is staggered strictly above
+         ; it (base + 3 + index*3, distinct per node => no split votes), so the pinned
+         ; node wins the initial election; non-voters/absent pin falls through.
+         (timeout (if (and leader-node (member leader-node voters))
+                      (if (eqv? node-name leader-node)
+                          election-base
+                          (+ election-base 3 (* (index-of node-name voters) 3)))
+                      (+ election-base (* (modulo (- (index-of node-name voters)
                                      (let ((n (string->number shard-key))) (if n n 0)))
                                   (length voters))
-                          3))))
+                          3)))))
     ; ---- MVCC state machine (cw-u4a.6, ADR 0001) ----
     ; Apply one committed Raft entry as one etcd Txn: mvcc-apply stamps the new
     ; revision, writes the KEY-CF record + REV-CF event (+ lease index) and bumps
@@ -421,6 +442,97 @@
     (define fwd-pending (make-eqv-hashtable))
     (define fwd-seq 0)
     (define fwd-ticks 0)
+    ; ---- cw-kp0 global-rev: writer-side revision lease (gated on global-rev? AND
+    ; NOT rev-authority?). The leader draws a global rev per write from this buffer
+    ; (global-rev-rewrite) and refills it from the authority before it empties
+    ; (rev-refill-inflight = the block size of an outstanding REV-GRANT request, #f
+    ; when none). All inert unless global-rev? — the default single-group path never
+    ; touches these. The propose-branch hook that consumes them is the next increment.
+    (define REV-BLOCK 256)                ; revs per refill — larger block amortizes the cross-group
+                                          ; grant round-trip better under concurrent write load (cw-kp0)
+    (define REV-LOW   32)                  ; refill earlier so the lease never runs dry mid-burst
+    (define rev-lease (lease-new))         ; FIFO buffer of granted (lo . hi) blocks
+    (define rev-refill-inflight #f)        ; block size of an outstanding REV-GRANT, or #f
+    ; authority-side low-watermark aggregator (rev-authority? only): writer-shard-num ->
+    ; lowest global rev that writer has NOT yet applied (#f = caught up to its lease).
+    ; W = min over writers-with-unapplied of (lowest-unapplied - 1), else granted-high —
+    ; an idle/caught-up writer never freezes W below high (ADR 0006).
+    (define rev-progress (make-eqv-hashtable))
+    (define gr-writer? (and global-rev? (not rev-authority?)))   ; this group draws global revs
+    ; the local rev-authority (shard "0") replica pid; a grant request to a follower
+    ; replica forwards to the authority leader via the standard fwd-write path, and the
+    ; reply returns here — so the writer just sends to its local shard-0 pid.
+    (define (gr-authority-pid)
+      (and gr-writer? (table-lookup 'ws-shard-pid (string-append (symbol->string node-name) ":0"))))
+    ; async refill: request REV-BLOCK revs if low and none in flight (never blocks).
+    (define (gr-maybe-refill!)
+      (if (and gr-writer? (not rev-refill-inflight) (lease-needs-refill? rev-lease REV-LOW))
+          (let ((ap (gr-authority-pid)))
+            (if ap
+                (begin (set! rev-refill-inflight REV-BLOCK)
+                       (send ap (cons (self) (list (string->utf8 "REV-GRANT")
+                                                   (string->utf8 (number->string REV-BLOCK))))))))))
+    (define (gr-count-puts cmds)           ; PUTs each need one global rev
+      (let loop ((cs cmds) (n 0))
+        (if (null? cs) n
+            (loop (cdr cs) (if (and (pair? (car cs)) (string=? (utf8->string (caar cs)) "PUT"))
+                               (+ n 1) n)))))
+    ; PUT -> PUT-AT <leased rev> for each cmd, drawing from rev-lease (caller guarantees
+    ; lease covers all PUTs). Non-PUT passes through. Threads + persists the lease.
+    (define (gr-rewrite-batch! cmds)
+      (map (lambda (c) (let ((r (global-rev-rewrite c rev-lease)))
+                         (set! rev-lease (cdr r)) (car r)))
+           cmds))
+    ; cw-kp0: the AUTHORITY rewrites its own data PUTs to PUT-GLOBAL so they draw the next
+    ; global rev at apply time (mvcc-apply) from the shared counter — no lease (so it never
+    ; reports a writer watermark) and no rev collision with writers. Non-PUT passes through.
+    (define (auth-rewrite-batch cmds)
+      (map (lambda (c)
+             (if (and (pair? c) (string=? (utf8->string (car c)) "PUT"))
+                 (cons (string->utf8 "PUT-GLOBAL") (cdr c))
+                 c))
+           cmds))
+    ; report this writer's low-watermark contribution to the authority (Phase 3): the
+    ; lowest global rev it may still produce but has NOT applied. Conservatively
+    ; current-rev+1 while it has unconsumed leased revs OR in-flight writes; else #f
+    ; (caught up — does not constrain W). Sent on tick; no-op unless gr-writer?.
+    (define (gr-report-progress!)
+      (if gr-writer?
+          (let ((ap (gr-authority-pid)))
+            (if ap
+                (let ((active? (or (> (lease-remaining rev-lease) 0)
+                                   (> (hashtable-size pending) 0))))
+                  (send ap (list 'rev-progress (string->number shard-key)
+                                 (if active? (+ (mvcc-current-rev ctx) 1) #f))))))))
+    ; authority-side: the current global low-watermark from the writer progress reports.
+    ; W = min over writers-with-unapplied of (lowest-unapplied - 1), else granted-high.
+    (define (gr-watermark-now)
+      (let wmark ((ks (vector->list (hashtable-keys rev-progress))) (w (mvcc-global-rev ctx)))
+        (if (null? ks) w
+            (let ((lu (hashtable-ref rev-progress (car ks) #f)))
+              (wmark (cdr ks) (if lu (min w (- lu 1)) w))))))
+    ; ensure the lease holds >= `need` revs before a batch rewrite. Normally a no-op
+    ; (refill-before-empty keeps it warm). Only when short does it request a grant and
+    ; block for the reply, requeuing any other frame to `backlog` so nothing is lost.
+    ; ponytail: blocks the loop only on a cold/burst miss; the warm lease makes it rare —
+    ; a become-leader pre-seed would remove even that.
+    (define (gr-ensure! need)
+      (if (and gr-writer? (> need 0))
+          (let wait ()
+            (if (>= (lease-remaining rev-lease) need) #t
+                (begin
+                  (if (not rev-refill-inflight)
+                      (let ((ap (gr-authority-pid)))
+                        (if ap (begin (set! rev-refill-inflight REV-BLOCK)
+                                      (send ap (cons (self) (list (string->utf8 "REV-GRANT")
+                                                                  (string->utf8 (number->string (max REV-BLOCK need))))))))))
+                  (let ((r (raw-receive)))
+                    (if (and (pair? r) (string? (car r)) (string=? (car r) "REV-GRANT"))
+                        (if rev-refill-inflight
+                            (begin (set! rev-lease (lease-add rev-lease (cdr r) rev-refill-inflight))
+                                   (set! rev-refill-inflight #f)))
+                        (set! backlog (append backlog (list r)))))
+                  (wait))))))
     (define FWD-EXPIRE-TICKS 25)              ; ~3s at the default 120ms tick
     ; ---- snapshot shipping, leader side (cw-lkq.15) ----
     ; The engine marks (snap-req) any peer that rejected AppendEntries at the
@@ -496,25 +608,38 @@
     (define XFER-EVERY 25)                  ; ticks between attempts (~3s at 120ms)
     (define xfer-ticks 0)
     (define (region-of n) (let ((hit (assv n region-map))) (and hit (cdr hit))))
+    ; cw-e9a: leader-NODE pin takes precedence — a leader that is not the pinned
+    ; node transfers straight to it (raft-transfer-leadership no-ops if the target
+    ; is down / lagging / not a voter, so a missing pin keeps leadership put).
+    ; When no node pin is set, fall back to the region pin (first caught-up voter
+    ; in leader-region).
+    (define (misplaced-leader? st)
+      (and (raft-leader? st)
+           (cond (leader-node   (not (eqv? node-name leader-node)))
+                 (leader-region (not (equal? (region-of node-name) leader-region)))
+                 (else #f))))
     (define (maybe-transfer-home! st)
-      (if (and leader-region
-               (raft-leader? st)
-               (not (equal? (region-of node-name) leader-region)))
+      (if (misplaced-leader? st)
           (begin
             (set! xfer-ticks (+ xfer-ticks 1))
             (if (>= xfer-ticks XFER-EVERY)
                 (begin
                   (set! xfer-ticks 0)
-                  (let try ((vs (aget st 'voters)))
-                    (cond
-                      ((null? vs) #f)        ; no caught-up preferred voter — stay
-                      ((and (not (eqv? (car vs) node-name))
-                            (equal? (region-of (car vs)) leader-region))
-                       (let ((r (raft-transfer-leadership st (car vs))))
-                         (if (eq? (car r) 'ok)
-                             (emit! (cadr r))
-                             (try (cdr vs)))))
-                      (else (try (cdr vs))))))))))
+                  (if leader-node
+                      ; node pin: transfer directly to the named voter
+                      (let ((r (raft-transfer-leadership st leader-node)))
+                        (if (eq? (car r) 'ok) (emit! (cadr r)) #f))
+                      ; region pin: first caught-up voter in leader-region
+                      (let try ((vs (aget st 'voters)))
+                        (cond
+                          ((null? vs) #f)        ; no caught-up preferred voter — stay
+                          ((and (not (eqv? (car vs) node-name))
+                                (equal? (region-of (car vs)) leader-region))
+                           (let ((r (raft-transfer-leadership st (car vs))))
+                             (if (eq? (car r) 'ok)
+                                 (emit! (cadr r))
+                                 (try (cdr vs)))))
+                          (else (try (cdr vs)))))))))))
     ; fsync the batch, then ack every buffered waiter from `base`.
     (define (flush-and-drain! base)
       (ctx-flush! ctx)
@@ -698,6 +823,13 @@
             ((eq? m '*timeout*)
              (flush-and-drain! flush-base)
              (loop (maybe-compact st #f) leader elapsed #f))
+            ;; cw-kp0: a global-rev refill request that bounced 'tryagain (the local
+            ;; authority replica was a follower with no known leader yet). Clear the
+            ;; in-flight flag so the next tick re-requests — otherwise the writer stalls
+            ;; forever (lease never warms -> every write bounces). gr-writer?-gated.
+            ((and gr-writer? rev-refill-inflight (eq? m 'tryagain))
+             (set! rev-refill-inflight #f)
+             (loop st leader elapsed flush-base))
             ((not (pair? m)) (loop st leader elapsed flush-base))
 
             ;; ---- Raft RPC from a peer ----
@@ -810,6 +942,8 @@
             ;; flush-and-drain! is a no-op when nothing is dirty / deferred.
             ((eq? (car m) 'tick)
              (fwd-sweep!)                      ; expire wedged forwards (cw-lkq.13)
+             (gr-report-progress!)             ; cw-kp0 Phase 3: report low-watermark to authority (no-op unless gr-writer?)
+             (if (raft-leader? st) (gr-maybe-refill!))  ; cw-kp0: pre-seed/keep the lease warm on the leader so no client op blocks on a cold cross-group grant (Jepsen-timeout fix)
              ; cw-lkq.15: long-lived server actors accumulate cyclic garbage the
              ; Rc heap can't free — sweep the (thread-local) cycle registry
              ; periodically. No-op on builds without tracing-cycle-collector.
@@ -1035,6 +1169,47 @@
             ((eq? (car m) 'cur-rev)
              (let ((conn (cadr m)))
                (send conn (list 'cur-rev-ok (mvcc-current-rev ctx) (raft-term st))))
+             (loop st leader elapsed flush-base))
+
+            ;; cw-kp0 global-rev: refill reply from the rev-authority. The grant rides the
+            ;; standard client-proposal ack path, so it arrives as ("REV-GRANT" . lo);
+            ;; enqueue the granted block [lo, lo+N) into the writer lease (N = the size of
+            ;; the outstanding request). Inert unless global-rev?; the propose-branch hook
+            ;; that requests refills + draws revs from rev-lease is the next increment.
+            ((and global-rev? (pair? m) (string? (car m)) (string=? (car m) "REV-GRANT"))
+             (if rev-refill-inflight
+                 (begin (set! rev-lease (lease-add rev-lease (cdr m) rev-refill-inflight))
+                        (set! rev-refill-inflight #f)))
+             (loop st leader elapsed flush-base))
+
+            ;; cw-kp0 Phase 3: the rev-authority's current granted global-rev high
+            ;; (META-GLOBAL-REV). A building block for the global header.revision /
+            ;; low-watermark coordinator. Harmless leader-local read (0 in default mode);
+            ;; any shard may query the authority group.
+            ((eq? (car m) 'global-high)
+             (send (cadr m) (list 'global-high-ok (mvcc-global-rev ctx)))
+             (loop st leader elapsed flush-base))
+
+            ;; cw-kp0 Phase 3: a writer reports the lowest global rev it has NOT yet
+            ;; applied (#f = caught up). The authority records it for the low-watermark.
+            ;; (rev-progress writer-shard-num lowest-unapplied|#f)
+            ((eq? (car m) 'rev-progress)
+             (if rev-authority? (hashtable-set! rev-progress (cadr m) (caddr m)))
+             (loop st leader elapsed flush-base))
+
+            ;; cw-kp0 Phase 3: the global low-watermark — the highest rev safe to surface
+            ;; as header.revision (everything <= W is applied on its owning group). W =
+            ;; min over writers-with-unapplied of (lowest-unapplied - 1), else granted-high.
+            ((eq? (car m) 'global-watermark)
+             (send (cadr m) (list 'global-watermark-ok (gr-watermark-now)))
+             (loop st leader elapsed flush-base))
+
+            ;; cw-kp0 Phase 4: global compaction admissibility. A compaction below R is
+            ;; safe only once R <= the low-watermark — never discard history a pending
+            ;; op could still reference (ADR 0006). The coordinator asks here before
+            ;; broadcasting "compact < R" to the groups. (compact-admissible R reply-pid)
+            ((eq? (car m) 'compact-admissible)
+             (send (caddr m) (list 'compact-admissible-ok (<= (cadr m) (gr-watermark-now))))
              (loop st leader elapsed flush-base))
 
             ;; ---- Auth read seams (cw-u4a.26) — pure reads over NS-AUTH on THIS
@@ -1529,19 +1704,36 @@
                           (else
                            (if (not (eq? nxt '*timeout*))
                                (set! backlog (append backlog (list nxt))))
-                           (let ((batch (reverse acc)) (base-idx (log-len st)))
-                             ; register each waiter at its prospective log index
-                             (let reg ((bs batch) (i 1))
-                               (when (pair? bs)
-                                 (hashtable-set! pending (+ base-idx i) (caar bs))
-                                 (reg (cdr bs) (+ i 1))))
-                             (prof-tick! n)
-                             (let* ((r (raft-propose-batch st (map cdr batch)))
-                                    (st1 (car r)) (outs1 (cdr r)))
-                               (emit! outs1)              ; ONE AE round for the whole batch
-                               (rtt-mark-emit!)
-                               (let ((st2 (maybe-commit st1))) ; solo commits now; cluster waits for AERs
-                                 (if (> (raft-applied st2) old) (persist-applied! st2))
-                                 ; this branch only runs on the leader -> #t
-                                 (let ((nb (settle! #t old flush-base)))  ; defer ack (durable) or ack now
-                                   (loop (maybe-compact st2 nb) node-name elapsed nb))))))))))))))))))))
+                           (let* ((batch    (reverse acc)) (base-idx (log-len st))
+                                  (raw-cmds (map cdr batch))
+                                  (need     (if gr-writer? (gr-count-puts raw-cmds) 0)))
+                             ; cw-kp0: a global-rev writer group draws `need` leased global
+                             ; revisions for this batch's PUTs, then rewrites PUT -> PUT-AT <rev>.
+                             ; If the lease can't cover it, async-refill + BOUNCE the batch
+                             ; ('tryagain — the client retries once the grant lands), and NEVER
+                             ; block the actor loop on the cross-group grant round-trip (the
+                             ; liveness fix). No-op / byte-identical to default unless gr-writer?.
+                             (if (and gr-writer? (> need 0) (< (lease-remaining rev-lease) need))
+                                 (begin
+                                   (gr-maybe-refill!)
+                                   (for-each (lambda (bc) (ack-waiter! (car bc) 'tryagain)) batch)
+                                   (loop st node-name elapsed flush-base))
+                                 (begin
+                                   ; register each waiter at its prospective log index
+                                   (let reg ((bs batch) (i 1))
+                                     (when (pair? bs)
+                                       (hashtable-set! pending (+ base-idx i) (caar bs))
+                                       (reg (cdr bs) (+ i 1))))
+                                   (prof-tick! n)
+                                   (let* ((r (raft-propose-batch
+                                               st (cond (gr-writer?    (gr-rewrite-batch! raw-cmds))
+                                                        (rev-authority? (auth-rewrite-batch raw-cmds))  ; PUT -> PUT-GLOBAL
+                                                        (else raw-cmds))))
+                                          (st1 (car r)) (outs1 (cdr r)))
+                                     (emit! outs1)            ; ONE AE round for the whole batch
+                                     (rtt-mark-emit!)
+                                     (gr-maybe-refill!)       ; cw-kp0: keep the lease warm
+                                     (let ((st2 (maybe-commit st1)))
+                                       (if (> (raft-applied st2) old) (persist-applied! st2))
+                                       (let ((nb (settle! #t old flush-base)))
+                                         (loop (maybe-compact st2 nb) node-name elapsed nb))))))))))))))))))))))

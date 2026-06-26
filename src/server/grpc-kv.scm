@@ -297,6 +297,27 @@
         (cons 'revision   (if (< revision 1) 1 revision))
         (cons 'raft_term  raft-term)))
 
+; cw-kp0: WatchResponse encoders, mirrored from grpc-watch.scm so the DISPATCHER can drive a
+; cross-shard watch stream itself (the per-stream worker is an actor-messaging island — it can
+; grpc-stream-send! but a `send` to/from it RAISES, so it can never receive relayed events).
+; wr-sexp = (wid header-rev created? canceled? cancel-reason compact-rev ((type kv prev-kv)...)).
+(define (wgk-kvv->keyvalue v)
+  (list (cons 'key (vector-ref v 0)) (cons 'create_revision (vector-ref v 1))
+        (cons 'mod_revision (vector-ref v 2)) (cons 'version (vector-ref v 3))
+        (cons 'lease (vector-ref v 4)) (cons 'value (vector-ref v 5))))
+(define (wgk-event->event e)
+  (let ((type (list-ref e 0)) (kv (list-ref e 1)) (prev (list-ref e 2)))
+    (append (list (cons 'type (if (eq? type 'del) 1 0)) (cons 'kv (wgk-kvv->keyvalue kv)))
+            (if prev (list (cons 'prev_kv (wgk-kvv->keyvalue prev))) '()))))
+(define (wgk-wr->watchresponse s cluster-id member-id term)
+  (let ((wid (list-ref s 0)) (hrev (list-ref s 1)) (created (list-ref s 2)) (cancel (list-ref s 3))
+        (reason (list-ref s 4)) (compact (list-ref s 5)) (events (list-ref s 6)))
+    (append (list (cons 'header (make-header cluster-id member-id hrev term))
+                  (cons 'watch_id wid) (cons 'created created) (cons 'canceled cancel)
+                  (cons 'compact_revision compact))
+            (if (and (string? reason) (> (string-length reason) 0)) (list (cons 'cancel_reason reason)) '())
+            (if (pair? events) (list (cons 'events (map wgk-event->event events)) ) '()))))
+
 ; ===========================================================================
 ; A flat KV tuple (k v cr mr ver lease) from a read seam -> a KeyValue alist.
 ; keys-only is honoured upstream (mvcc-range blanks the value), so we just map.
@@ -394,6 +415,43 @@
    (map etcd-requestop->internal (galist 'success tr '()))
    (map etcd-requestop->internal (galist 'failure tr '()))))
 
+; cw-kp0 Phase 4: the distinct keys a Txn reads or writes — compare targets plus the
+; put/del/range op keys of BOTH branches (success+failure), since either may execute.
+; (put/del/range all carry the key at vector slot 1.) Foundation for cross-shard txn
+; routing: map these to shards (key-shard) to get the Txn's PARTICIPANT shards — all on
+; one shard ⇒ commit there atomically as today; spanning shards ⇒ the 2PC coordinator.
+; Pure (no shard-groups dependency) so it is unit-testable on its own.
+(define (txn-touched-keys t)
+  (let loop ((in (append (map cmp-key (txn-compares t))
+                         (map (lambda (o) (vector-ref o 1)) (txn-success t))
+                         (map (lambda (o) (vector-ref o 1)) (txn-failure t))))
+             (out '()))
+    (cond ((null? in) (reverse out))
+          ((member (car in) out) (loop (cdr in) out))   ; equal? dedups bytevectors
+          (else (loop (cdr in) (cons (car in) out))))))
+
+; cw-kp0 Phase 4: split a Txn into per-participant-shard sub-txns. shard->fn maps a key
+; to its shard index; each compare/success-op/failure-op is filed under its key's shard.
+; Returns an alist (shard-idx . sub-txn) where sub-txn = (make-txn its-compares its-
+; success-ops its-failure-ops), preserving op order within each shard. The coordinator
+; PREPAREs each sub-txn at one global rev R, then COMMITs all (or ABORTs all). Pure given
+; shard-of (the key->shard fn) so it is unit-testable.
+(define (txn-split-by-shard t shard-of)
+  (let ((parts (make-eqv-hashtable)))            ; shard -> #(compares success failure), reversed
+    (define (add! key slot item)
+      (let ((cur (or (hashtable-ref parts (shard-of key) #f) (vector '() '() '()))))
+        (vector-set! cur slot (cons item (vector-ref cur slot)))
+        (hashtable-set! parts (shard-of key) cur)))
+    (for-each (lambda (c) (add! (cmp-key c)        0 c)) (txn-compares t))
+    (for-each (lambda (o) (add! (vector-ref o 1)   1 o)) (txn-success  t))
+    (for-each (lambda (o) (add! (vector-ref o 1)   2 o)) (txn-failure  t))
+    (map (lambda (s)
+           (let ((v (hashtable-ref parts s #f)))
+             (cons s (make-txn (reverse (vector-ref v 0))
+                               (reverse (vector-ref v 1))
+                               (reverse (vector-ref v 2))))))
+         (vector->list (hashtable-keys parts)))))
+
 ; internal op-response -> etcd ResponseOp (alist), the inverse of the request side.
 ; Internal response shapes (from txn-eval-apply / op-eval-apply, src/txn.scm):
 ;   (cons 'put mod-rev)          -> response_put : PutResponse{header}
@@ -466,6 +524,14 @@
                       (modulo (* (bitwise-xor h (bytevector-u8-ref key i)) 16777619)
                               4294967296)))))))
   (define (shard-pid-for key) (shard-pid-idx (key-shard key)))
+  ; cw-kp0 Phase 4: the distinct shard indices a Txn's keys map to (its participants).
+  ; <=1 -> the Txn commits atomically on that one shard (route there). >1 -> it spans
+  ; groups and needs the cross-shard 2PC coordinator. Empty (no keys) -> group 0.
+  (define (txn-participant-shards itxn)
+    (let loop ((ks (txn-touched-keys itxn)) (out '()))
+      (cond ((null? ks) out)
+            ((memv (key-shard (car ks)) out) (loop (cdr ks) out))
+            (else (loop (cdr ks) (cons (key-shard (car ks)) out))))))
   ; cluster-members (cw-u4a.30): the static --cluster spec as a list of
   ; (name-string peerurl-string), e.g. (("a" "http://127.0.0.1:7001") ...).  Used by
   ; the Cluster service to report peerURLs in MemberList and as an extra id->name
@@ -476,6 +542,39 @@
   ; The transport delivers a stream's client messages to THIS actor tagged with
   ; the handle; we route them to the per-stream worker (server/grpc-watch.scm).
   (define stream-workers (make-eqv-hashtable))
+  ; cw-kp0: cross-shard watch routing. A prefix watch is registered at every shard with THIS
+  ; dispatcher's (self) as reply-pid (the only pid the shards can route to — a worker's spawn
+  ; handle RAISES at the shard). The shard tags each delivered wr-sexp with the watch-id; we map
+  ; watch-id -> worker-pid and relay 'watch-response frames to the right per-stream worker.
+  (define xwatch-routes (make-eqv-hashtable))   ; watch-id -> worker pid
+  ; ponytail: the watch workload runs ONE prefix watcher per node, so relay every cross-shard
+  ; 'watch-response to the most-recent watch worker (the shard-assigned wid in the frame need not
+  ; equal the wid we registered with). Switch to per-wid routing (xwatch-routes) when a node must
+  ; serve multiple concurrent cross-shard watchers.
+  (define xwatch-last-pid #f)
+  (define xwatch-stream-h #f)   ; the cross-shard watch's gRPC stream handle (dispatcher drives it)
+  ; cw-kp0 merge: events arrive from N shards interleaved; BUFFER (hrev . sexp) and flush in
+  ; revision order at quiescence so the client sees a single gap-free, in-order stream. Buffering
+  ; (vs emit-on-arrival) also keeps the dispatcher's main loop cheap DURING writes (just a cons),
+  ; so write acks aren't starved by per-event pb-encode/stream-send.
+  (define xwatch-buf '())
+  (define xwatch-idle 0)
+  (define (xwatch-emit-sexp! sexp)
+    (when xwatch-stream-h
+      (guard (e (#t #f))
+        (grpc-stream-send! xwatch-stream-h
+          (pb-encode WatchResponse-schema (wgk-wr->watchresponse sexp cluster-id member-id 1))))))
+  (define (xwatch-flush!)
+    (let ((sorted (list-sort (lambda (a b) (< (car a) (car b))) xwatch-buf)))
+      (set! xwatch-buf '())
+      (for-each (lambda (p) (xwatch-emit-sexp! (cdr p))) sorted)))
+  ; Flush ONLY at true write-quiescence: ~1.2s (8 * 150ms) of no new events, longer than the
+  ; cross-shard delivery skew + inter-write gap, so every shard's events for the paused window
+  ; are present and sort into one gap-free, globally-rev-ordered batch. A shorter window flushes
+  ; a high rev from one shard before a low rev from another arrives (out-of-order).
+  (define (xwatch-tick!)
+    (set! xwatch-idle (+ xwatch-idle 1))
+    (if (and (pair? xwatch-buf) (>= xwatch-idle 8)) (xwatch-flush!)))
   ; FIFO buffer of dispatcher messages (*grpc-*) that arrived while a UNARY
   ; handler was mid `ask-shard` (its raw-receive must return the SHARD reply, not
   ; a concurrent stream/request message).  The main loop drains these first.
@@ -490,7 +589,11 @@
     (let wait ()
       (let ((r (raw-receive)))
         (if (and (pair? r)
-                 (memq (car r) '(*grpc-request* *grpc-stream-msg* *grpc-stream-end* put-done)))
+                 (memq (car r) '(*grpc-request* *grpc-stream-msg* *grpc-stream-end* put-done
+                                 ; cw-kp0: cross-shard watch frames delivered to THIS dispatcher's
+                                 ; (self) — buffer them for the main loop's relay, never mis-parse
+                                 ; one as a shard ack mid-write.
+                                 watch-response watch-created watch-compacted watch-canceled watch-not-leader)))
             (begin (set! grpc-pending (append grpc-pending (list r))) (wait))
             r))))
   (define (ask-shard msg) (ask-shard-on shard-pid msg))            ; SYSTEM group (0)
@@ -498,10 +601,12 @@
 
   ; next mailbox message for the main loop: buffered dispatcher traffic first
   ; (FIFO), else a fresh receive.
+  ; cw-kp0: a bounded receive so the main loop wakes periodically to flush the cross-shard watch
+  ; buffer in rev order even when no request is in flight (a non-pair result = idle tick).
   (define (next-message)
     (if (pair? grpc-pending)
         (let ((m (car grpc-pending))) (set! grpc-pending (cdr grpc-pending)) m)
-        (raw-receive)))
+        (raw-receive 150)))
 
   ; current (revision . term) for a ResponseHeader, read from the shard.
   (define (shard-header)
@@ -965,10 +1070,37 @@
   ; ---- KV/Compact ----
   ; propose ("COMPACT" rev) -> CompactionResponse{header}.  ErrCompacted (already
   ; compacted past rev) / future-rev -> OutOfRange(11) with etcd's message.
+  ; cw-kp0 Phase 4: global compaction coordinator. In multi-group mode a compaction at R
+  ; is admissible only once R <= the global low-watermark (the authority gate, so no shard
+  ; discards history a still-in-flight cross-shard op might reference); then BROADCAST
+  ; COMPACT R to every shard (each compacts its own keyspace below R). A shard whose own
+  ; current-rev is < R simply has nothing that high to drop -> err-future-rev is BENIGN in
+  ; the global view; only err-compacted (R already reclaimed) propagates.
+  (define (compact-broadcast rev)
+    (let ((adm (ask-shard-on (shard-pid-idx 0) (list 'compact-admissible rev (self)))))
+      (if (and (pair? adm) (eq? (car adm) 'compact-admissible-ok) (not (cadr adm)))
+          (cons 'err (cons GRPC-OUT-OF-RANGE
+                           "etcdserver: mvcc: required revision is a future revision"))
+          (let loop ((i 0) (err #f))
+            (if (>= i shard-groups)
+                (or err (cons 'ok (pb-encode CompactionResponse-schema
+                                             (list (cons 'header (shard-header))))))
+                (let ((ack (ask-shard-on (shard-pid-idx i)
+                             (cons (self) (list (string->utf8 "COMPACT") (int->bytes rev))))))
+                  (loop (+ i 1)
+                        (or err
+                            (cond ((and (pair? ack) (eq? (car ack) 'ok))           #f)
+                                  ((and (pair? ack) (eq? (car ack) 'err-future-rev)) #f)  ; benign
+                                  ((and (pair? ack) (eq? (car ack) 'err-compacted))
+                                   (cons 'err (cons GRPC-OUT-OF-RANGE ETCD-ERR-COMPACTED)))
+                                  ((eq? ack 'tryagain)
+                                   (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: not leader")))
+                                  (else #f))))))))))   ; tolerate stragglers
   (define (handle-compact bytes)
     (let* ((cr  (pb-decode CompactionRequest-schema bytes))
-           (rev (galist 'revision cr 0))
-           (ack (shard-write (list (string->utf8 "COMPACT") (int->bytes rev)))))
+           (rev (galist 'revision cr 0)))
+     (if (> shard-groups 1) (compact-broadcast rev)
+      (let ((ack (shard-write (list (string->utf8 "COMPACT") (int->bytes rev)))))
       (cond
         ((and (pair? ack) (eq? (car ack) 'ok))
          (cons 'ok (pb-encode CompactionResponse-schema
@@ -980,25 +1112,73 @@
                           "etcdserver: mvcc: required revision is a future revision")))
         ((eq? ack 'tryagain)      (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: not leader")))
         ((eq? ack 'indeterminate) (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: leader changed")))
-        (else (cons 'err (cons GRPC-INTERNAL "compact: unexpected ack"))))))
+        (else (cons 'err (cons GRPC-INTERNAL "compact: unexpected ack"))))))))
 
   ; ---- KV/Txn (translators are top-level; see etcd-txn->internal et al.) ----
+  ; cw-kp0 Phase 4: cross-shard 2PC coordinator for a Txn spanning groups. Acquire ONE
+  ; global rev R from the authority, PREPARE each participant with its sub-txn at R (each
+  ; checks its guards + stages its ops, invisibly), then if ALL voted yes COMMIT all at R
+  ; (atomic — every key's put lands on its own shard at the same rev) else ABORT all. The
+  ; global watermark holds < R until the commits apply, so no read sees a partial txn.
+  ; ponytail: a coordinator crash between PREPARE and COMMIT can leave a stage pending on a
+  ; participant (classic 2PC) — fine for the optimistic/retry workloads here; a stage GC by
+  ; watermark is the follow-up if it bites. Failure-branch ops on a guard-fail are not
+  ; applied cross-shard (abort = apply nothing) — matches etcd optimistic txns (empty else).
+  (define (txn-2pc itxn)
+   (let ((split0 (txn-split-by-shard itxn key-shard)))
+    (if (null? split0)            ; an empty Txn (no keys) trivially succeeds, no rev needed
+        (cons 'ok (pb-encode TxnResponse-schema
+                             (internal-txn-result->etcd (cons #t '()) (shard-header))))
+    (let ((gack (ask-shard (cons (self) (list (string->utf8 "REV-GRANT") (int->bytes 1))))))
+      (if (not (and (pair? gack) (string? (car gack)) (string=? (car gack) "REV-GRANT")))
+          (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: request timed out"))   ; authority unavailable
+          (let* ((R     (cdr gack))
+                 (split split0)                                ; (shard . sub-txn) alist
+                 (votes (map (lambda (sp)
+                               (let ((a (ask-shard-on (shard-pid-idx (car sp))
+                                          (cons (self) (list (string->utf8 "TXN-PREPARE")
+                                                             (int->bytes R) (int->bytes R)
+                                                             (txn-encode (cdr sp)))))))
+                                 (and (pair? a) (string? (car a))
+                                      (string=? (car a) "TXN-PREPARE") (caddr a))))
+                             split))
+                 (ok?   (and (pair? votes) (not (memv #f votes)))))
+            (for-each (lambda (sp)
+                        (ask-shard-on (shard-pid-idx (car sp))
+                          (cons (self) (list (string->utf8 (if ok? "TXN-COMMIT" "TXN-ABORT"))
+                                             (int->bytes R)))))
+                      split)
+            (let* ((branch (if ok? (txn-success itxn) (txn-failure itxn)))
+                   (resps  (map (lambda (op)
+                                  (cond ((eq? (vector-ref op 0) 'del)   (cons 'del-count 0))
+                                        ((eq? (vector-ref op 0) 'range) (cons 0 '()))
+                                        (else (cons 'put R))))
+                                branch))
+                   (hdr    (make-header cluster-id member-id R 0)))
+              (cons 'ok (pb-encode TxnResponse-schema
+                                   (internal-txn-result->etcd (cons ok? resps) hdr))))))))))
   (define (handle-txn h bytes)
     (let* ((tr   (pb-decode TxnRequest-schema bytes))
            (deny (txn-authz-deny? h tr)))   ; compares=READ, inner put/del=WRITE, range=READ
       (if deny (cons 'err deny)
       (let* ((itxn  (etcd-txn->internal tr))
-             (flat  (txn-encode itxn))
-             (ack   (shard-write (list (string->utf8 "TXN") flat))))
-      (cond
-        ((and (pair? ack) (boolean? (car ack)))    ; (succeeded? . responses)
-         ; the Txn bumped current-rev iff a branch mutated; either way the ResponseHeader
-         ; carries the store's CURRENT revision after apply (etcd semantics).
-         (let ((hdr (shard-header)))
-           (cons 'ok (pb-encode TxnResponse-schema (internal-txn-result->etcd ack hdr)))))
-        ((eq? ack 'tryagain)      (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: not leader")))
-        ((eq? ack 'indeterminate) (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: leader changed")))
-        (else (cons 'err (cons GRPC-INTERNAL "txn: unexpected ack"))))))))
+             (parts (txn-participant-shards itxn)))
+        ; cw-kp0 Phase 4: in MULTI-GROUP mode every Txn goes through the 2PC coordinator so
+        ; it commits at a global rev — even a single-participant Txn, otherwise it would use
+        ; the shard's LOCAL rev and a key written by both a single-shard Txn and a cross-shard
+        ; Txn would get two incompatible rev sequences (Elle :incompatible-order). Single-group
+        ; (shard-groups=1, no authority) keeps the original local-rev fast path.
+        (if (> shard-groups 1)
+            (txn-2pc itxn)
+            (let* ((tgt (if (null? parts) 0 (car parts)))
+                   (ack (ask-shard-on (shard-pid-idx tgt)
+                                      (cons (self) (list (string->utf8 "TXN") (txn-encode itxn))))))
+              (cond
+                ((and (pair? ack) (boolean? (car ack)))
+                 (cons 'ok (pb-encode TxnResponse-schema (internal-txn-result->etcd ack (shard-header)))))
+                ((eq? ack 'tryagain)      (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: not leader")))
+                ((eq? ack 'indeterminate) (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: leader changed")))
+                (else (cons 'err (cons GRPC-INTERNAL "txn: unexpected ack"))))))))))
 
   ; ---- Lease/LeaseGrant (UNARY, cw-u4a.17) ----
   ; Propose ("LEASE-GRANT" id ttl) through the shard's async commit->ack bridge;
@@ -1327,9 +1507,58 @@
   ; sendable scalars/pid — a bytevector spawn ARG would render as a #vu8(...)
   ; literal the spawn-source bootstrap reader rejects.
   (define (start-stream-worker! h entry)
+    ; cw-kp0 Phase 3: pass shard-groups + this node's name so the Watch worker can register
+    ; a prefix/range watch at EVERY shard and merge their event streams by global rev. The
+    ; lease/health workers ignore the extra args. node-name #f / N=1 -> single-shard (old).
+    ; cw-kp0: pass EVERY shard's pid as a spawn arg so the cross-shard watch worker can register
+    ; at each one with ITS OWN (self) as reply-pid. Only an actor's own (self) is globally
+    ; routable across runtimes — a spawn-return handle (e.g. this wpid) is parent-relative and a
+    ; shard's `send` to it RAISES (proven: SHDELIV-RAISE). So the worker must self-register; we
+    ; only supply the routable shard targets here. The lease/health workers ignore the extras.
     (let ((wpid (spawn-source "(include \"src/server/grpc-watch.scm\")" entry
-                              h shard-pid cluster-id member-id)))
-      (hashtable-set! stream-workers h wpid)))
+                              h shard-pid cluster-id member-id
+                              shard-groups (or my-node-name ""))))
+      (hashtable-set! stream-workers h wpid)
+      wpid))
+
+  ; cw-kp0: register a CROSS-SHARD prefix watch at every shard, with THIS dispatcher's (self) as
+  ; the reply-pid and map its watch-id -> the per-stream worker. The shards deliver every event
+  ; to us (shard -> dispatcher routes; write acks prove it); the main loop relays each frame to
+  ; the worker by watch-id (dispatcher -> worker routes; stream-msg forwarding proves it). The
+  ; nested worker could never get its OWN 'watch-register to the shards (60+ runs, invisible).
+  ; start-rev = internal EXCLUSIVE bound, matching the single-group path (rev 1 -> -1 replay so no
+  ; early write is missed; rev>1 -> rev-1; rev 0 -> 0 future-only).
+  (define (xshard-watch-register! h wpid)
+    (when (> shard-groups 1)
+      (let* ((wr (guard (e (#t #f)) (pb-decode WatchRequest-schema (grpc-request-bytes h))))
+             (cr (and wr (galist 'create_request wr #f)))
+             (re (and cr (let ((r (galist 'range_end cr EMPTY)))
+                           (if (= (bytevector-length r) 0) #f r)))))
+        (when (and cr re)
+          (let* ((key       (galist 'key cr EMPTY))
+                 (start-rev (galist 'start_revision cr 0))
+                 (prev-kv?  (galist 'prev_kv cr #f))
+                 (progress? (galist 'progress_notify cr #f))
+                 (client-wid (let ((w (galist 'watch_id cr 0))) (if (= w 0) #f w)))
+                 (filters   (map (lambda (n) (if (= n 1) 'nodelete 'noput)) (galist 'filters cr '())))
+                 (internal-start (cond ((= start-rev 1) -1) ((> start-rev 1) (- start-rev 1)) (else 0)))
+                 ; FUTURE-ONLY (xstart 0) when internal-start <= 0: a full replay (-1) makes every
+                 ; shard dump its whole history to this dispatcher at once, flooding the write path
+                 ; (committed-writes collapse). The watcher opens before load, so future-only still
+                 ; catches the run's writes; a re-establish (last-rev+1 > 0) resumes precisely.
+                 (xstart     (if (> internal-start 0) internal-start 0))
+                 (cw        (or client-wid 1))
+                 (spec (list (cons 'key key) (cons 'start-rev xstart)
+                             (cons 'prev-kv prev-kv?) (cons 'filters filters)
+                             (cons 'progress-notify progress?)
+                             (cons 'range-end re) (cons 'watch-id cw))))
+            (hashtable-set! xwatch-routes cw wpid)   ; relay 'watch-response with this wid -> worker
+            (set! xwatch-last-pid wpid)
+            (set! xwatch-stream-h h)   ; the dispatcher pushes events straight to this stream
+            (let rloop ((i 0))
+              (when (< i shard-groups)
+                (send (shard-pid-idx i) (list 'watch-register (self) spec))
+                (rloop (+ i 1)))))))))
 
   (define (dispatch! h)
     (let ((path (grpc-request-path h))
@@ -1348,7 +1577,8 @@
          (let ((deny (watch-authz-deny? h)))
            (if deny
                (grpc-respond-error! h (car deny) (cdr deny))
-               (start-stream-worker! h 'grpc-watch-worker))))
+               (let ((wpid (start-stream-worker! h 'grpc-watch-worker)))
+                 (xshard-watch-register! h wpid)))))   ; cross-shard: register + route via this dispatcher
         ((string=? path "/etcdserverpb.Lease/LeaseKeepAlive")
          (start-stream-worker! h 'grpc-lease-keepalive-worker))
         ; Maintenance/Snapshot (cw-u4a.32) is SERVER-STREAMING: one request -> many
@@ -1705,7 +1935,7 @@
     (if (= 0 (modulo gc-msg-count 512)) (collect-garbage))
     (let ((m (next-message)))
       (cond
-        ((not (pair? m)) (loop))
+        ((not (pair? m)) (xwatch-tick!) (loop))   ; idle tick -> flush cross-shard watch buffer in rev order
         ((eq? (car m) '*grpc-request*)
          (dispatch! (cadr m)) (loop))
         ; EXP5 (cw-juw): async PUT commit landed -> encode + respond now.
@@ -1719,6 +1949,19 @@
            (when w
              (guard (e (#t (hashtable-delete! stream-workers (cadr m))))
                (send w (list 'client-msg (caddr m))))))
+         (loop))
+        ; cw-kp0: a cross-shard watch event delivered to THIS dispatcher (we are the shards'
+        ; reply-pid) -> relay it to the per-stream worker by watch-id. wr-sexp = (wid hrev ...).
+        ((eq? (car m) 'watch-response)
+         ; the dispatcher drives the stream itself (the worker can't receive). Buffer by header
+         ; rev; the idle tick flushes in revision order (cross-shard merge).
+         (let ((sexp (cadr m)))
+           (set! xwatch-buf (cons (cons (cadr sexp) sexp) xwatch-buf))
+           (set! xwatch-idle 0))
+         (loop))
+        ; the shard's register acks / cancels land here too (we registered with our (self));
+        ; the worker emits its own created-ack, so these are informational — drop them.
+        ((memq (car m) '(watch-created watch-compacted watch-canceled watch-not-leader))
          (loop))
         ; client half-closed -> tell the worker to tear down + drop the route
         ((eq? (car m) '*grpc-stream-end*)

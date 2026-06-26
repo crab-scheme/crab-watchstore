@@ -78,6 +78,9 @@
 (define dbbase  (arg-after "--db" "/tmp/cws-node"))
 (define durable (string=? (arg-after "--durable" "no") "yes"))
 (define cluster-spec (arg-after "--cluster" "a:127.0.0.1:7001:6001"))
+; cw-kp0: enable the synthetic global revision allocator across shard groups
+; (shard "0" = rev-authority). Default off = today's per-shard revision semantics.
+(define global-rev (string=? (arg-after "--global-rev" "no") "yes"))
 
 ; ---- dynamic-membership join (cw-u4a.29) ----
 ; `--join yes` brings this node up as a NON-VOTER that dials every existing member, then
@@ -169,6 +172,10 @@
         (else (mesh (+ tries 1)))))
 (display "node ") (display me) (display ": mesh up (")
 (display (node-peer-count (symbol->string me))) (display " peers)") (newline)
+(if global-rev
+    (begin (display "node ") (display me)
+           (display ": global-rev allocator ENABLED (cw-kp0; shard 0 = rev-authority)")
+           (newline)))
 
 ; ---- single shard "0": one replica, voters = all nodes ----
 ; Dedicated thread — blocking RocksDB fsync must not freeze a shared green
@@ -232,6 +239,15 @@
 ; comes from the cluster spec's 5th field / --locality (cw-lkq.7).
 (define leader-region (arg-after "--leader-region" #f))
 (define region-map (map (lambda (n) (cons (car n) (list-ref n 4))) nodes))
+; --leader-node NODE (cw-e9a): pin leadership to a SPECIFIC node, not just a
+; region. The named voter gets the strictly-shortest election timeout (wins the
+; initial election) and any other leader transfers (TimeoutNow) to it once it is
+; a caught-up voter — so a single-endpoint client (e.g. k0s external etcd
+; pinned to one member) always reaches the leader. Down/lagging => harmless
+; no-op (leadership stays put). Supersedes --leader-region when both are set.
+; symbol, to match the symbol node-ids in `voters` / raft state (NOT a string —
+; eqv?/member/raft-transfer-leadership all compare against interned symbols).
+(define leader-node (let ((s (arg-after "--leader-node" #f))) (and s (string->symbol s))))
 ; --serializable-max-lag N (cw-lkq.6): refuse SERIALIZABLE reads when this
 ; replica is more than N entries behind the leader's commit (commit - applied
 ; > N) — the freshness gate for learner/follower read replicas. 0 = no gate
@@ -244,7 +260,8 @@
  (lambda (sk)
    (spawn-source-dedicated "(include \"src/server/shard-actor.scm\")" 'shard-main
                  sk shard-voters me (string-append dbbase "-shard" sk) durable apply-shards
-                 election-ticks leader-region region-map serializable-max-lag shard-learners))
+                 election-ticks leader-region region-map serializable-max-lag shard-learners
+                 leader-node global-rev))
  shard-key-list)
 
 (define dial-addrs (map raft-addr dial-peers))

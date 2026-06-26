@@ -33,6 +33,16 @@ data:
         sans:
           - k0s-api
           - k0s-api.cws-geo.svc
+        # cw-5w8: over the high-latency multi-region store the revision rate
+        # (KWOK heartbeats + lease churn) outruns the apiserver's default 5m
+        # etcd compaction window, so its etcd watches break with "required
+        # revision has been compacted" and the KCM informer caches never sync
+        # (controllers stall). Disable apiserver-driven compaction (=0) so the
+        # store retains full history and watches stay valid. Larger watch caches
+        # so re-watches resolve from cache, not a compacted etcd revision.
+        extraArgs:
+          etcd-compaction-interval: "0"
+          watch-cache-sizes: "nodes#1000,pods#5000,leases#2000"
       # Relax leaderelection for a deliberately high-latency (WAN/AZ) + noisy-host
       # store: a transient multi-second op stall must not drop KCM/scheduler
       # leadership (standard practice for WAN-stretched etcd).
@@ -44,6 +54,11 @@ data:
           node-monitor-grace-period: 300s
           kube-api-qps: "200"
           kube-api-burst: "400"
+          # The garbage-collector & resourcequota controllers LIST every resource
+          # type at startup; over the slow WAN store that stalls cache-sync before
+          # the deployment/replicaset controllers ever start. Disable them for the
+          # sim (no real GC/quota needed) so pods actually get created.
+          controllers: "*,-garbagecollector,-resourcequota"
       scheduler:
         extraArgs:
           leader-elect-lease-duration: 300s

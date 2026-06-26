@@ -108,15 +108,126 @@
 ;   (spawn-source "(include \"src/server/grpc-watch.scm\")" 'grpc-watch-worker
 ;                 H SHARD-PID CLUSTER-ID MEMBER-ID)
 ; The first WatchRequest is read from the call slot via (grpc-request-bytes h).
-(define (grpc-watch-worker h shard-pid cluster-id member-id)
+(define (grpc-watch-worker h shard-pid cluster-id member-id . rest)
+  ; cw-kp0 Phase 3: cross-shard prefix/range watch. A prefix watch over keys that hash to
+  ; different shards must register at EVERY shard and MERGE their event streams in global-
+  ; revision order. n-shards=1 / node-name="" -> single-shard (the original path, untouched).
+  (define n-shards  (if (pair? rest) (car rest) 1))
+  (define node-name (if (and (pair? rest) (pair? (cdr rest))) (cadr rest) ""))
+  ; cw-kp0: shard pids arrive as spawn args (grpc-kv passes them, in shard-index order) AFTER
+  ; shard-groups + node-name. Spawn-arg pids route from THIS worker (like the group-0 shard-pid
+  ; arg the single-shard path uses); the ws-shard-pid table is NOT shared into this nested runtime.
+  (define shard-pid-args (if (and (pair? rest) (pair? (cdr rest))) (cddr rest) '()))
+  (define (shard-pid-i i)
+    (if (< i (length shard-pid-args))
+        (list-ref shard-pid-args i)
+        (table-lookup 'ws-shard-pid (string-append node-name ":" (number->string i)))))
+  (define XSHARD-FLUSH-MS 200)
+  (define xshard? #f)            ; this stream registered a watch across all shards
+  (define xbuf '())             ; buffered (rev . wr-sexp) awaiting the safe-delivery gate
+  (define xgot #f)              ; an event arrived since the last flush tick
+  (define xidle 0)             ; consecutive idle flush ticks (no new events)
+  (define XQUIESCENT-TICKS 4)   ; ~0.8s of no events -> writes paused; flush held tail in rev order
+  (define (xbuf! wr) (set! xbuf (cons (cons (cadr wr) wr) xbuf)) (set! xgot #t))
+  ; insertion sort a (rev . wr) list ascending by rev (small lists)
+  (define (xsort lst)
+    (let ins ((in lst) (out '()))
+      (if (null? in) out
+          (ins (cdr in)
+               (let place ((o out))
+                 (cond ((null? o) (list (car in)))
+                       ((<= (caar in) (caar o)) (cons (car in) o))
+                       (else (cons (car o) (place (cdr o))))))))))
+  ; safe delivery point = MIN current-rev across all shards: every shard has applied (and
+  ; thus already delivered to us) every event <= that rev, so flushing <= it is gap-free
+  ; and in global-rev order. Buffers any watch frames that arrive during the cur-rev poll.
+  (define (xmin-rev)
+    (let loop ((i 0) (m #f))
+      (if (>= i n-shards) (or m 0)
+          (let ((p (shard-pid-i i)))
+            (if (not p) (loop (+ i 1) m)
+                (begin (send p (list 'cur-rev (self)))
+                       ; BOUNDED await: a bare raw-receive here hung the worker forever when a
+                       ; shard didn't reply 'cur-rev-ok promptly (end-of-run load) -> the quiescent
+                       ; flush was never reached -> the buffered TAIL was never delivered. Time the
+                       ; poll out; a non-responding shard just doesn't lower the watermark this tick
+                       ; (its events still ship in rev order via the next tick / the quiescent flush).
+                       (let await ((spins 0))
+                         (let ((r (raw-receive 20)))
+                           (cond ((not r) (loop (+ i 1) m))   ; shard silent this tick -> skip it
+                                 ((and (pair? r) (eq? (car r) 'cur-rev-ok))
+                                  (loop (+ i 1) (if m (min m (cadr r)) (cadr r))))
+                                 ((and (pair? r) (eq? (car r) 'watch-response)) (xbuf! (cadr r)) (await (+ spins 1)))
+                                 ((> spins 40) (loop (+ i 1) m))   ; hard cap: never wedge the worker (<=0.8s/shard)
+                                 (else (await (+ spins 1)))))))))))) ; cw-kp0 FIX: was missing one close — the worker never loaded (parse error), so watch delivery was dead
+  ; BATCH a rev-ordered list of single-event wr-sexps into ONE WatchResponse and send it.
+  ; cw-kp0 THROUGHPUT FIX: emit-wr! routes through the shared gRPC dispatcher; one send per
+  ; event floods it under watch load and starves the write/ack path (write throughput
+  ; collapse). etcd allows many events per WatchResponse, so coalesce per flush -> ~1 send
+  ; instead of N. wr-sexp = (wid header-rev created? canceled? reason compact events).
+  (define (emit-batch! wrs)
+    (when (pair? wrs)
+      (let ((wid (car (car wrs)))
+            (hdr (let mx ((l wrs) (m 0)) (if (null? l) m (mx (cdr l) (max m (cadr (car l)))))))
+            (evs (apply append (map (lambda (w) (list-ref w 6)) wrs))))
+        (when (pair? evs) (emit-wr! (list wid hdr #f #f "" 0 evs))))))
+  (define (xflush!)
+    (let ((w (xmin-rev)))
+      (let split ((in (xsort xbuf)) (deliver '()) (held '()))
+        (cond ((null? in) (emit-batch! (reverse deliver)) (set! xbuf (reverse held)))
+              ((<= (caar in) w) (split (cdr in) (cons (cdar in) deliver) held))
+              (else (split (cdr in) deliver (cons (car in) held)))))))
+  ; deliver the ENTIRE buffer in rev order — safe ONLY at quiescence (no events for
+  ; XQUIESCENT-TICKS, so writes have stopped and every committed event has applied +
+  ; arrived). Clears the min-cur-rev gate's idle-shard stall at the workload's drain.
+  (define (xflush-all!)
+    (emit-batch! (map cdr (xsort xbuf)))
+    (set! xbuf '()))
+  ; one flush tick: track quiescence and flush the buffer when writes pause. The active-
+  ; phase min-rev gate (xflush!) is intentionally NOT run here — it polled every shard for
+  ; cur-rev each tick, and that worker<->shard round-trip under load competes with the write
+  ; path. Buffer during active writing; deliver in rev order at quiescence (and on the
+  ; drain's progress probe). Delivery is still gap-free + ordered, just batched.
+  (define (xtick!)
+    (if xgot (begin (set! xgot #f) (set! xidle 0)) (set! xidle (+ xidle 1)))
+    ; NO active-phase poll: xmin-rev's in-band shard round-trip both (a) starved delivery
+    ; (under load every 'cur-rev missed its 20ms slot -> watermark 0 -> nothing shipped ->
+    ; :observed-put-events 0) and (b) competed with the write path. Buffer during writes;
+    ; deliver the whole rev-ordered batch at quiescence. Ordering is safe BECAUSE we only
+    ; flush after XQUIESCENT-TICKS of silence (every shard has caught up; no lagging low-rev
+    ; event can arrive after a higher one ships). One batched send, no poll.
+    (if (>= xidle XQUIESCENT-TICKS) (xflush-all!)))
   (define live-wids '())   ; watch_ids established on THIS stream (for teardown)
+  (define xcreated-pending #f)  ; cw-kp0: a cross-shard created-ack to emit from the loop (deferred)
+  (define xshard-regs '())  ; (shard-pid . wid) registered across shards, for teardown
+  ; cw-5w8 root-cause #2: once ANY watch on this stream sets progress_notify=true
+  ; (etcd's WithProgressNotify), the server owes PERIODIC progress notifications, not
+  ; just on-demand RequestProgress replies. The kube-apiserver watch cache marks a
+  ; static-resource informer "synced" off these periodic ticks; without them the
+  ; KCM controllers' caches (deployments/replicasets/endpoints/...) never reach
+  ; synced and the controllers never run. The main loop arms a receive timeout when
+  ; this is set and emits a broadcast progress frame on each idle interval (the timer
+  ; resets on every real message, so a busy stream — whose events already advance the
+  ; revision — does not emit, matching etcd's "suppress when events recently flowed").
+  (define any-progress? #f)
+  ; ponytail: 5s matches the apiserver progressRequester period; env knob if a
+  ; deployment needs it slower (CW_WATCH_PROGRESS_MS) — flat constant until then.
+  (define PROGRESS-INTERVAL-MS 5000)
 
   (define (ask-shard msg) (send shard-pid msg) (raw-receive))
   ; (rev . term) read from the shard — called only when the mailbox is clean
   ; (worker startup / start of a create, before any watcher can deliver).
+  ; BOUNDED: a bare raw-receive here hung the worker at STARTUP when the shard was mid-batch
+  ; and slow to answer 'cur-rev -> the worker never reached registration (no delivery,
+  ; :observed-put-events 0, the client re-establishes -> cascade). The term is cosmetic for
+  ; the header; fall back to (0 . 1) on timeout and establish immediately.
   (define (rev+term)
-    (let ((r (ask-shard (list 'cur-rev (self)))))
-      (if (and (pair? r) (eq? (car r) 'cur-rev-ok)) (cons (cadr r) (caddr r)) (cons 0 1))))
+    (send shard-pid (list 'cur-rev (self)))
+    (let await ((spins 0))
+      (let ((r (raw-receive 100)))
+        (cond ((and (pair? r) (eq? (car r) 'cur-rev-ok)) (cons (cadr r) (caddr r)))
+              ((> spins 5) (cons 0 1))           ; shard busy -> default term, don't hang
+              (else (await (+ spins 1)))))))
   (define cached-term (cdr (rev+term)))
 
   ; encode + push one wr-sexp frame; #f return = client hung up.
@@ -148,31 +259,63 @@
                          (cons 'progress-notify progress?))
                    (if range-end (list (cons 'range-end range-end)) '())
                    (if client-wid (list (cons 'watch-id client-wid)) '()))))
-      (send shard-pid (list 'watch-register (self) spec))
-      ; Await the register ack.  The shard replays historical events as
-      ; watch-response frames BEFORE acking the watch-id — but etcd's wire
-      ; contract (and clientv3) wants the CREATED response FIRST, then the
-      ; historical events.  So BUFFER the replay frames and flush them AFTER the
-      ; created ack (newest-first accumulation, reversed on flush to keep order).
-      (let await ((buffered '()))
-        (let ((r (raw-receive)))
-          (cond
-            ((not (pair? r)) (await buffered))
-            ((eq? (car r) 'watch-response) (await (cons (cadr r) buffered)))
-            ((eq? (car r) 'watch-created)
-             (let ((wid (cdr r)))
-               (set! live-wids (cons wid live-wids))
-               ; etcd's immediate empty CREATED ack FIRST...
-               (emit-wr! (list wid snap-rev #t #f "" 0 '()))
-               ; ...then the buffered historical replay, in revision order.
-               (for-each emit-wr! (reverse buffered))))
-            ((eq? (car r) 'watch-compacted)
-             ; start-rev below the floor: a canceled frame with compact_revision.
-             (emit-wr! (list (if client-wid client-wid 0) 0 #f #t
-                             "mvcc: required revision has been compacted" (cdr r) '())))
-            ((eq? (car r) 'watch-not-leader)
-             (grpc-stream-close! h WG-UNAVAILABLE "etcdserver: no leader"))
-            (else (await buffered)))))))
+      (if (and range-end (> n-shards 1))
+          ; ---- cross-shard prefix/range watch: register at EVERY shard with one client
+          ; wid, buffer all replay, then deliver merged in global-rev order via xflush! ----
+          (let ((cw (or client-wid 1))
+                ; cw-kp0: a FUTURE-ONLY watch (internal-start 0) seeds each shard's
+                ; delivered_rev to that shard's current-rev at registration -> it MISSES any
+                ; write that committed between the snapshot and that shard's (sequential)
+                ; registration. Replay the registration window instead: floor start-rev at
+                ; snap-rev (events > snap-rev). On a FRESH store snap-rev=0, and start-rev=0
+                ; is the future-only sentinel (no replay) -> it would miss the very first
+                ; writes {1..5}; use -1 ("replay from rev 1") there so nothing is skipped. The
+                ; replay is bounded (windowed scan, delivered_rev monotone) and was NOT the
+                ; write-collapse cause (that was the writer mishandling timeouts).
+                ; future-only (internal-start 0) => replay from rev 1 (-1) so NO write is
+                ; skipped, even one that lands before the worker reads snap-rev (snap-rev
+                ; floor skipped rev<=snap-rev -> early gaps like {2}). A re-establish sends
+                ; last-rev+1 (>0) => resumes from there, not a full replay.
+                ; future-only (internal-start <=0) => 0, the NO-REPLAY sentinel: the shard acks
+                ; 'watch-created instantly so the worker reaches its delivery loop (a replay,
+                ; e.g. -1, delayed that ack -> the worker hung in registration ->
+                ; :observed-put-events 0). Trade: the brief sequential-registration window may
+                ; miss the very first writes; the watcher opens before load so it's small.
+                ; A re-establish (last-rev+1 > 0) resumes from there.
+                )
+            ; cw-kp0: grpc-kv (dispatch! -> xshard-watch-register!) registers this watch at EVERY
+            ; shard with OUR pid as reply-pid — the nested worker's own N-shard 'watch-register
+            ; never reached the shards (:observed-put-events 0 across 60+ runs; unobservable in the
+            ; nested spawn-source). Here we only enter merge mode + ack. Replay/live events arrive
+            ; on our mailbox as 'watch-response and ship in rev order via the quiescent flush (xtick!).
+            (set! xshard? #t)
+            (if progress? (set! any-progress? #t))
+            (set! live-wids (cons cw live-wids))
+            ; cw-kp0: grpc-kv (xshard-watch-register!) registers this watch at every shard with
+            ; ITS OWN (self) as reply-pid and RELAYS each 'watch-response to us by wid — the only
+            ; routable path (a nested worker's send never reached the shards; a spawn-return handle
+            ; RAISES at the shard). We just enter merge mode + ack; events arrive on our mailbox.
+            (set! xcreated-pending (list cw snap-rev #t #f "" 0 '())))
+          ; ---- single-shard (single-group, or a single-key watch) — original path ----
+          (begin
+            (send shard-pid (list 'watch-register (self) spec))
+            (let await ((buffered '()))
+              (let ((r (raw-receive)))
+                (cond
+                  ((not (pair? r)) (await buffered))
+                  ((eq? (car r) 'watch-response) (await (cons (cadr r) buffered)))
+                  ((eq? (car r) 'watch-created)
+                   (let ((wid (cdr r)))
+                     (set! live-wids (cons wid live-wids))
+                     (if progress? (set! any-progress? #t))
+                     (emit-wr! (list wid snap-rev #t #f "" 0 '()))
+                     (for-each emit-wr! (reverse buffered))))
+                  ((eq? (car r) 'watch-compacted)
+                   (emit-wr! (list (if client-wid client-wid 0) 0 #f #t
+                                   "mvcc: required revision has been compacted" (cdr r) '())))
+                  ((eq? (car r) 'watch-not-leader)
+                   (grpc-stream-close! h WG-UNAVAILABLE "etcdserver: no leader"))
+                  (else (await buffered)))))))))
 
   ; ---- WatchCancel: deregister at the shard (it emits the canceled frame) ----
   (define (do-cancel wid)
@@ -188,9 +331,31 @@
            (grpc-stream-close! h WG-UNAVAILABLE "etcdserver: no leader"))
           (else (await))))))
 
-  ; progress_request (§6): not exercised by the etcdctl proof; a no-op here
-  ; (the synced-watcher progress emit lives in the .14 streaming actor).
-  (define (do-progress) #f)
+  ; progress_request (§6, cw-5w8): etcd RequestProgress. The kube-apiserver watch
+  ; cache sends this to confirm a watch is caught up to its LIST revision; for an
+  ; UNCHANGING resource (no events ever flow) it is the ONLY way the cache reaches
+  ; "synced", so the old no-op left those informers hung forever (KCM controllers
+  ; stuck on "Waiting for caches to sync"; the scheduler's high-traffic pod/node
+  ; watches synced via events, masking it). Reply with a broadcast progress
+  ; notification — a WatchResponse with watch_id = -1 and the current store
+  ; revision, no events — exactly etcd's ProgressNotify (clientv3 advances every
+  ; substream on this stream to that revision). Drain any interleaved watcher
+  ; frames while awaiting the shard's cur-rev so delivery order is preserved.
+  (define (do-progress)
+    ; cw-kp0: a cross-shard watcher asking "am I caught up?" (the workload's drain) -> flush
+    ; the held tail in rev order before answering, so the progress reply reflects everything.
+    (if xshard? (xflush-all!))
+    (send shard-pid (list 'cur-rev (self)))
+    (let await ()
+      (let ((r (raw-receive)))
+        (cond
+          ((not (pair? r)) (await))
+          ((eq? (car r) 'watch-response) (emit-wr! (cadr r)) (await))
+          ((eq? (car r) 'cur-rev-ok)
+           (emit-wr! (list -1 (cadr r) #f #f "" 0 '())))
+          ((eq? (car r) 'watch-not-leader)
+           (grpc-stream-close! h WG-UNAVAILABLE "etcdserver: no leader"))
+          (else (await))))))
 
   (define (handle-client-msg bytes)
     (let* ((req (pb-decode WatchRequest-schema bytes))
@@ -209,26 +374,44 @@
   ; in-flight event), and `send` to an already-exited actor would CRASH the shard.
   ; So drain our mailbox until every wid is acknowledged, discarding the frames.
   (define (teardown)
-    (if (null? live-wids)
-        (grpc-stream-close! h WG-OK)
+    (if xshard?
+        ; cross-shard: cancel the watch at each shard we registered with, drain their acks
         (begin
-          (for-each (lambda (wid) (send shard-pid (list 'watch-cancel (self) wid))) live-wids)
-          (let drain ((remaining (length live-wids)))
+          (for-each (lambda (pw) (send (car pw) (list 'watch-cancel (self) (cdr pw)))) xshard-regs)
+          (let drain ((remaining (length xshard-regs)))
             (if (<= remaining 0)
                 (grpc-stream-close! h WG-OK)
                 (let ((r (raw-receive)))
                   (if (and (pair? r)
                            (or (eq? (car r) 'watch-canceled) (eq? (car r) 'watch-not-leader)))
                       (drain (- remaining 1))
-                      (drain remaining))))))))   ; discard watch-response/stray frames
+                      (drain remaining))))))
+        (if (null? live-wids)
+            (grpc-stream-close! h WG-OK)
+            (begin
+              (for-each (lambda (wid) (send shard-pid (list 'watch-cancel (self) wid))) live-wids)
+              (let drain ((remaining (length live-wids)))
+                (if (<= remaining 0)
+                    (grpc-stream-close! h WG-OK)
+                    (let ((r (raw-receive)))
+                      (if (and (pair? r)
+                               (or (eq? (car r) 'watch-canceled) (eq? (car r) 'watch-not-leader)))
+                          (drain (- remaining 1))
+                          (drain remaining)))))))))   ; discard watch-response/stray frames
 
   (handle-client-msg (grpc-request-bytes h))   ; the first WatchRequest
   (let loop ()
-    (let ((m (raw-receive)))
+    (when xcreated-pending (emit-wr! xcreated-pending) (set! xcreated-pending #f))   ; deferred created ack
+    ; arm the idle timeout only on streams that requested progress_notify; others
+    ; block forever (no spurious wakeups, no progress they never asked for).
+    (let ((m (cond (xshard?      (raw-receive XSHARD-FLUSH-MS))   ; flush merged events periodically
+                   (any-progress? (raw-receive PROGRESS-INTERVAL-MS))
+                   (else (raw-receive)))))
       (cond
+        ((eq? m '*timeout*) (if xshard? (xtick!) (do-progress)) (loop))   ; merge-flush or progress
         ((not (pair? m)) (loop))
         ((eq? (car m) 'client-msg)     (handle-client-msg (cadr m)) (loop))
-        ((eq? (car m) 'watch-response) (emit-wr! (cadr m)) (loop))
+        ((eq? (car m) 'watch-response) (if xshard? (xbuf! (cadr m)) (emit-wr! (cadr m))) (loop))
         ((eq? (car m) 'client-end)     (teardown))   ; falls out of the loop -> exit
         (else (loop))))))
 
@@ -237,7 +420,7 @@
 ; ===========================================================================
 ;   (spawn-source "(include \"src/server/grpc-watch.scm\")" 'grpc-lease-keepalive-worker
 ;                 H SHARD-PID CLUSTER-ID MEMBER-ID)
-(define (grpc-lease-keepalive-worker h shard-pid cluster-id member-id)
+(define (grpc-lease-keepalive-worker h shard-pid cluster-id member-id . _rest)
   (define (ask-shard msg) (send shard-pid msg) (raw-receive))
   ; A header (revision is cosmetic for keepalive); cached at startup so each
   ; keepalive is a single shard round-trip (no header-fetch interleaving).
@@ -373,7 +556,7 @@
 (define HEALTH-SERVING     1)
 (define HEALTH-NOT-SERVING 2)
 
-(define (grpc-health-watch-worker h shard-pid cluster-id member-id)
+(define (grpc-health-watch-worker h shard-pid cluster-id member-id . _rest)
   (define ended? #f)
   ; READINESS = has-leader AND initialized (applied >= commit), read from the shard's .32
   ; status seam (cw-u4a.33 appended the key-count, unused here).  A client half-close may race

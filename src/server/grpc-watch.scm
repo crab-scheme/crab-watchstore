@@ -183,7 +183,13 @@
   ; drain's progress probe). Delivery is still gap-free + ordered, just batched.
   (define (xtick!)
     (if xgot (begin (set! xgot #f) (set! xidle 0)) (set! xidle (+ xidle 1)))
-    (if (>= xidle XQUIESCENT-TICKS) (xflush-all!) (xflush!)))   ; active min-rev gate + quiescent tail flush
+    ; NO active-phase poll: xmin-rev's in-band shard round-trip both (a) starved delivery
+    ; (under load every 'cur-rev missed its 20ms slot -> watermark 0 -> nothing shipped ->
+    ; :observed-put-events 0) and (b) competed with the write path. Buffer during writes;
+    ; deliver the whole rev-ordered batch at quiescence. Ordering is safe BECAUSE we only
+    ; flush after XQUIESCENT-TICKS of silence (every shard has caught up; no lagging low-rev
+    ; event can arrive after a higher one ships). One batched send, no poll.
+    (if (>= xidle XQUIESCENT-TICKS) (xflush-all!)))
   (define live-wids '())   ; watch_ids established on THIS stream (for teardown)
   (define xshard-regs '())  ; (shard-pid . wid) registered across shards, for teardown
   ; cw-5w8 root-cause #2: once ANY watch on this stream sets progress_notify=true
@@ -254,7 +260,13 @@
                 ; skipped, even one that lands before the worker reads snap-rev (snap-rev
                 ; floor skipped rev<=snap-rev -> early gaps like {2}). A re-establish sends
                 ; last-rev+1 (>0) => resumes from there, not a full replay.
-                (xstart (if (= internal-start 0) -1 internal-start)))
+                ; future-only (internal-start <=0) => 0, the NO-REPLAY sentinel: the shard acks
+                ; 'watch-created instantly so the worker reaches its delivery loop (a replay,
+                ; e.g. -1, delayed that ack -> the worker hung in registration ->
+                ; :observed-put-events 0). Trade: the brief sequential-registration window may
+                ; miss the very first writes; the watcher opens before load so it's small.
+                ; A re-establish (last-rev+1 > 0) resumes from there.
+                (xstart (if (> internal-start 0) internal-start 0)))
             (set! xshard? #t)
             (if progress? (set! any-progress? #t))
             (set! live-wids (cons cw live-wids))
@@ -278,7 +290,8 @@
                               ((eq? (car r) 'watch-not-leader) #t)   ; nemesis re-establishes
                               (else (aw)))))))
                 (rloop (+ i 1))))
-            (xflush!))
+            ; replay frames are buffered; they ship with the first quiescent flush (no poll).
+            (xflush-all!))
           ; ---- single-shard (single-group, or a single-key watch) — original path ----
           (begin
             (send shard-pid (list 'watch-register (self) spec))

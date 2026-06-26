@@ -209,9 +209,17 @@
   (define (ask-shard msg) (send shard-pid msg) (raw-receive))
   ; (rev . term) read from the shard — called only when the mailbox is clean
   ; (worker startup / start of a create, before any watcher can deliver).
+  ; BOUNDED: a bare raw-receive here hung the worker at STARTUP when the shard was mid-batch
+  ; and slow to answer 'cur-rev -> the worker never reached registration (no delivery,
+  ; :observed-put-events 0, the client re-establishes -> cascade). The term is cosmetic for
+  ; the header; fall back to (0 . 1) on timeout and establish immediately.
   (define (rev+term)
-    (let ((r (ask-shard (list 'cur-rev (self)))))
-      (if (and (pair? r) (eq? (car r) 'cur-rev-ok)) (cons (cadr r) (caddr r)) (cons 0 1))))
+    (send shard-pid (list 'cur-rev (self)))
+    (let await ((spins 0))
+      (let ((r (raw-receive 100)))
+        (cond ((and (pair? r) (eq? (car r) 'cur-rev-ok)) (cons (cadr r) (caddr r)))
+              ((> spins 5) (cons 0 1))           ; shard busy -> default term, don't hang
+              (else (await (+ spins 1)))))))
   (define cached-term (cdr (rev+term)))
 
   ; encode + push one wr-sexp frame; #f return = client hung up.
@@ -280,15 +288,19 @@
                                                 (cons 'prev-kv prev-kv?) (cons 'filters filters)
                                                 (cons 'progress-notify progress?)
                                                 (cons 'range-end range-end) (cons 'watch-id cw)))))
-                    (let aw ()
-                      (let ((r (raw-receive)))
-                        (cond ((not (pair? r)) (aw))
-                              ((eq? (car r) 'watch-response) (xbuf! (cadr r)) (aw))
+                    ; BOUNDED: a bare raw-receive hung the worker if a shard was slow to ack
+                    ; 'watch-created (mid-batch) -> registration never completed -> no delivery
+                    ; (:observed-put-events 0). Cap the wait (~0.8s); the watch IS registered at
+                    ; the shard regardless of the ack timing, so proceed and let live events flow.
+                    (let aw ((spins 0))
+                      (let ((r (raw-receive 100)))
+                        (cond ((not (pair? r)) (if (> spins 8) #t (aw (+ spins 1))))
+                              ((eq? (car r) 'watch-response) (xbuf! (cadr r)) (aw spins))
                               ((eq? (car r) 'watch-created)
                                (set! xshard-regs (cons (cons p (cdr r)) xshard-regs)))
                               ((eq? (car r) 'watch-compacted) #t)
                               ((eq? (car r) 'watch-not-leader) #t)   ; nemesis re-establishes
-                              (else (aw)))))))
+                              (else (aw spins)))))))
                 (rloop (+ i 1))))
             ; replay frames are buffered; they ship with the first quiescent flush (no poll).
             (xflush-all!))

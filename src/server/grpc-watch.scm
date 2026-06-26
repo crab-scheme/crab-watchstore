@@ -146,12 +146,12 @@
                        ; poll out; a non-responding shard just doesn't lower the watermark this tick
                        ; (its events still ship in rev order via the next tick / the quiescent flush).
                        (let await ((spins 0))
-                         (let ((r (raw-receive 60)))
+                         (let ((r (raw-receive 20)))
                            (cond ((not r) (loop (+ i 1) m))   ; shard silent this tick -> skip it
                                  ((and (pair? r) (eq? (car r) 'cur-rev-ok))
                                   (loop (+ i 1) (if m (min m (cadr r)) (cadr r))))
                                  ((and (pair? r) (eq? (car r) 'watch-response)) (xbuf! (cadr r)) (await (+ spins 1)))
-                                 ((> spins 200) (loop (+ i 1) m))   ; hard cap: never wedge the worker
+                                 ((> spins 40) (loop (+ i 1) m))   ; hard cap: never wedge the worker (<=0.8s/shard)
                                  (else (await (+ spins 1)))))))))))
   (define (xflush!)
     (let ((w (xmin-rev)))
@@ -233,12 +233,17 @@
                 ; cw-kp0: a FUTURE-ONLY watch (internal-start 0) seeds each shard's
                 ; delivered_rev to that shard's current-rev at registration -> it MISSES any
                 ; write that committed between the snapshot and that shard's (sequential)
-                ; registration (observed: early rev gaps like {5}). Floor start-rev at snap-rev
-                ; so each shard REPLAYS the registration window (events > snap-rev). The replay
-                ; is bounded (windowed scan, delivered_rev monotone) and is NOT what collapsed
-                ; writes under load — that was the writer mishandling timeouts (fixed in the
-                ; jepsen client) + raw throughput, not this replay.
-                (xstart (if (= internal-start 0) snap-rev internal-start)))
+                ; registration. Replay the registration window instead: floor start-rev at
+                ; snap-rev (events > snap-rev). On a FRESH store snap-rev=0, and start-rev=0
+                ; is the future-only sentinel (no replay) -> it would miss the very first
+                ; writes {1..5}; use -1 ("replay from rev 1") there so nothing is skipped. The
+                ; replay is bounded (windowed scan, delivered_rev monotone) and was NOT the
+                ; write-collapse cause (that was the writer mishandling timeouts).
+                ; future-only (internal-start 0) => replay from rev 1 (-1) so NO write is
+                ; skipped, even one that lands before the worker reads snap-rev (snap-rev
+                ; floor skipped rev<=snap-rev -> early gaps like {2}). A re-establish sends
+                ; last-rev+1 (>0) => resumes from there, not a full replay.
+                (xstart (if (= internal-start 0) -1 internal-start)))
             (set! xshard? #t)
             (if progress? (set! any-progress? #t))
             (set! live-wids (cons cw live-wids))

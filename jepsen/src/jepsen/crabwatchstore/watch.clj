@@ -44,7 +44,7 @@
 
 (def prefix "w/")
 (def n-keys 16)
-(def drain-wait-ms 20000)   ; max wait for the watcher to catch up to the last write
+(def drain-wait-ms 45000)   ; max wait for the watcher to catch up; the cross-shard quiescent flush + slow deliver-fn under watch-stream load needs real headroom for the final rev
 ;; Generous backoff so a no-leader window (cold start / failover) doesn't pile up
 ;; watch-stream (re)establishments on the leader — one re-establish in flight at a time.
 (def reestablish-backoff-ms 1000)

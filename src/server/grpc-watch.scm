@@ -158,10 +158,14 @@
   (define (xflush-all!)
     (for-each (lambda (e) (emit-wr! (cdr e))) (xsort xbuf))
     (set! xbuf '()))
-  ; one flush tick: gate normally; if the stream has gone quiescent, flush everything.
+  ; one flush tick: track quiescence and flush the buffer when writes pause. The active-
+  ; phase min-rev gate (xflush!) is intentionally NOT run here — it polled every shard for
+  ; cur-rev each tick, and that worker<->shard round-trip under load competes with the write
+  ; path. Buffer during active writing; deliver in rev order at quiescence (and on the
+  ; drain's progress probe). Delivery is still gap-free + ordered, just batched.
   (define (xtick!)
     (if xgot (begin (set! xgot #f) (set! xidle 0)) (set! xidle (+ xidle 1)))
-    (if (>= xidle XQUIESCENT-TICKS) (xflush-all!) (xflush!)))
+    (if (>= xidle XQUIESCENT-TICKS) (xflush-all!)))
   (define live-wids '())   ; watch_ids established on THIS stream (for teardown)
   (define xshard-regs '())  ; (shard-pid . wid) registered across shards, for teardown
   ; cw-5w8 root-cause #2: once ANY watch on this stream sets progress_notify=true

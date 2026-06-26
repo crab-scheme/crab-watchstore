@@ -111,6 +111,16 @@
             (loop (cons nx acc))
             (begin (store-iter-close it) (reverse acc)))))))
 
+; half-open range scan [start, end) — bounds the scan to exactly the needed rows
+; (e.g. a watch revision window) instead of a full-namespace prefix scan.
+(define (kv-scan-range ctx start end)
+  (let ((it (store-iter-range (shard-ctx-handle ctx) (shard-ctx-cf ctx) start end)))
+    (let loop ((acc '()))
+      (let ((nx (store-iter-next it)))
+        (if nx
+            (loop (cons nx acc))
+            (begin (store-iter-close it) (reverse acc)))))))
+
 (define (kv-scan-count ctx prefix)
   (let ((it (store-iter (shard-ctx-handle ctx) (shard-ctx-cf ctx) prefix)))
     (let loop ((n 0))

@@ -825,7 +825,14 @@
     ; longer be served historically.  start-rev = 0 (current/future) never trips it.
     (if (and (> start-rev 0) (< start-rev compact-rev))
         (cons 'err-compacted compact-rev)
-        (let ((rows (kv-scan ctx (mvcc-byte NS-REV))))   ; ascending = revision order
+        ; cw-kp0 PERF: scan ONLY the (start-rev, cur-rev] revision WINDOW, not the whole
+        ; NS-REV namespace. watch-on-apply! runs this per apply; a full scan made it
+        ; O(store-size) per write -> O(N^2) under watch load -> writes time out. The NS-REV
+        ; key is NS-REV || u64be(main) || u64be(sub); [rev16(start+1,0), rev16(cur+1,0)) is
+        ; exactly main in (start-rev, cur-rev], ascending = revision order.
+        (let ((rows (kv-scan-range ctx
+                      (bytevector-append (mvcc-byte NS-REV) (rev->16 (+ start-rev 1) 0))
+                      (bytevector-append (mvcc-byte NS-REV) (rev->16 (+ cur-rev 1) 0)))))
           (let loop ((rs rows) (out '()))
             (if (null? rs)
                 (reverse out)

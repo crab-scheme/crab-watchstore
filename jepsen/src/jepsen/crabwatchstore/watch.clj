@@ -115,10 +115,21 @@
   (invoke! [this test op]
     (case (:f op)
       :write
-      (let [[k v] (:value op)
-            rev   (cw/kv-put-rev (:kv this) (str prefix k) (str v))]
-        (swap! (:max-write-rev state) max rev)
-        (assoc op :type :ok :value [k v rev]))
+      ;; A client-side timeout is INDETERMINATE (the put may or may not have applied) -> model
+      ;; it as :info, the truthful jepsen classification, rather than letting it propagate as
+      ;; an unhandled exception (which the strict UnhandledExceptions checker fails the run on).
+      ;; Common when the watcher's stream load slows write acks below the call timeout.
+      (try
+        (let [[k v] (:value op)
+              rev   (cw/kv-put-rev (:kv this) (str prefix k) (str v))]
+          (swap! (:max-write-rev state) max rev)
+          (assoc op :type :ok :value [k v rev]))
+        (catch java.util.concurrent.TimeoutException _
+          (assoc op :type :info, :error :timeout))
+        (catch java.util.concurrent.ExecutionException e
+          (if (instance? java.util.concurrent.TimeoutException (.getCause e))
+            (assoc op :type :info, :error :timeout)
+            (throw e))))
 
       :drain
       ;; Wait (bounded) for the watcher to catch up to the highest committed write,

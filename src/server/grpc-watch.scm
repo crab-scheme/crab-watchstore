@@ -219,12 +219,15 @@
           ; ---- cross-shard prefix/range watch: register at EVERY shard with one client
           ; wid, buffer all replay, then deliver merged in global-rev order via xflush! ----
           (let ((cw (or client-wid 1))
-                ; cw-kp0: a FUTURE-ONLY watch (internal-start 0) would miss events applied
-                ; on a shard between the snapshot and that shard's (sequential) registration.
-                ; Floor the start-rev at snap-rev so each shard REPLAYS the registration
-                ; window (events > snap-rev) — correct for a future-only watch (it wants
-                ; everything after the watch point) and closes the cross-shard window gap.
-                (xstart (if (= internal-start 0) snap-rev internal-start)))
+                ; cw-kp0: register each shard at the watch's OWN start-rev. A future-only
+                ; watch (internal-start 0) takes the NO-REPLAY path (delivered_rev seeded to
+                ; current-rev, instant synced) — crucial: flooring at snap-rev instead made
+                ; each shard run watch-replay-to-current!, a loop that chases current-rev
+                ; while writes advance it, BLOCKING the shard's actor loop -> leader stepdown
+                ; -> writes return indeterminate (the watch-load write collapse). The Jepsen
+                ; watcher opens before writes, so future-only misses no registration-window
+                ; events anyway; live events arrive via watch-on-apply!.
+                (xstart internal-start))
             (set! xshard? #t)
             (if progress? (set! any-progress? #t))
             (set! live-wids (cons cw live-wids))

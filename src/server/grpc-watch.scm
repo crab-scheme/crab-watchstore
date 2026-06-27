@@ -228,10 +228,17 @@
         (cond ((and (pair? r) (eq? (car r) 'cur-rev-ok)) (cons (cadr r) (caddr r)))
               ((> spins 5) (cons 0 1))           ; shard busy -> default term, don't hang
               (else (await (+ spins 1)))))))
-  (define cached-term (cdr (rev+term)))
+  (define init-rt (rev+term))
+  (define cached-term (cdr init-rt))
+  ; cw-l5h: best-known GLOBAL rev for progress frames, so do-progress never has to BLOCK on a
+  ; shard cur-rev round-trip (which stalls under write saturation). Advanced by every emitted
+  ; frame's header rev (events carry the live rev) and by async 'cur-rev-ok replies (main loop).
+  (define last-rev (car init-rt))
 
   ; encode + push one wr-sexp frame; #f return = client hung up.
   (define (emit-wr! wr-sexp)
+    (let ((hrev (cadr wr-sexp)))                ; cw-l5h: track the high-water global rev
+      (if (> hrev last-rev) (set! last-rev hrev)))
     (grpc-stream-send! h (pb-encode WatchResponse-schema
                                     (wg-wr->watchresponse wr-sexp cluster-id member-id cached-term))))
 
@@ -350,17 +357,14 @@
     ; cw-kp0: a cross-shard watcher asking "am I caught up?" (the workload's drain) -> flush
     ; the held tail in rev order before answering, so the progress reply reflects everything.
     (if xshard? (xflush-all!))
+    ; cw-l5h: NON-BLOCKING. The old code blocked on the shard's cur-rev reply; under write
+    ; saturation that reply queues behind the write backlog, stalling the worker so progress
+    ; frames stopped flowing and the kube-apiserver etcd3 rev tracking stuck at "current: 1"
+    ; -> consistency 503 -> no nodes. Fire the query (its 'cur-rev-ok updates last-rev back in
+    ; the main loop) and emit a progress frame NOW at the best-known global rev — it advances
+    ; steadily from events + async replies and never stalls the stream.
     (send shard-pid (list 'cur-rev (self)))
-    (let await ()
-      (let ((r (raw-receive)))
-        (cond
-          ((not (pair? r)) (await))
-          ((eq? (car r) 'watch-response) (emit-wr! (cadr r)) (await))
-          ((eq? (car r) 'cur-rev-ok)
-           (emit-wr! (list -1 (cadr r) #f #f "" 0 '())))
-          ((eq? (car r) 'watch-not-leader)
-           (grpc-stream-close! h WG-UNAVAILABLE "etcdserver: no leader"))
-          (else (await))))))
+    (emit-wr! (list -1 last-rev #f #f "" 0 '())))
 
   (define (handle-client-msg bytes)
     (let* ((req (pb-decode WatchRequest-schema bytes))
@@ -417,6 +421,7 @@
         ((not (pair? m)) (loop))
         ((eq? (car m) 'client-msg)     (handle-client-msg (cadr m)) (loop))
         ((eq? (car m) 'watch-response) (if xshard? (xbuf! (cadr m)) (emit-wr! (cadr m))) (loop))
+        ((eq? (car m) 'cur-rev-ok)     (if (> (cadr m) last-rev) (set! last-rev (cadr m))) (loop))  ; cw-l5h: async global-rev update from do-progress's fire-and-forget query
         ((eq? (car m) 'client-end)     (teardown))   ; falls out of the loop -> exit
         (else (loop))))))
 

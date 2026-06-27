@@ -364,7 +364,14 @@
     ; the main loop) and emit a progress frame NOW at the best-known global rev — it advances
     ; steadily from events + async replies and never stalls the stream.
     (send shard-pid (list 'cur-rev (self)))
-    (emit-wr! (list -1 last-rev #f #f "" 0 '())))
+    ; cw-l5h: emit progress PER live watch_id, not a single watch_id=-1 stream broadcast.
+    ; k8s opens watches with WithProgressNotify and advances each per-resource watchCache's
+    ; resourceVersion from progress frames carrying ITS OWN watch_id; the -1 broadcast left the
+    ; cacher stuck at "current: 1" (diagnostic confirmed we send the CORRECT rev, just on wid -1).
+    ; Fall back to -1 only when no specific watch is live (the stream-level drain probe).
+    (if (pair? live-wids)
+        (for-each (lambda (wid) (emit-wr! (list wid last-rev #f #f "" 0 '()))) live-wids)
+        (emit-wr! (list -1 last-rev #f #f "" 0 '()))))
 
   (define (handle-client-msg bytes)
     (let* ((req (pb-decode WatchRequest-schema bytes))

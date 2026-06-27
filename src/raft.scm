@@ -609,8 +609,14 @@
       ; Any AER (success OR rejection) proves this peer reached us this window —
       ; record it for CheckQuorum (raft-checkquorum counts `heard` + self).
       (succ
-       (let* ((st1 (aset* st (list 'match (aset (aget st 'match) from midx)
-                                   'next (aset (aget st 'next) from (+ midx 1))
+       ; cw-bm5 SOURCE fix: clamp the acked match to lastLogIndex. A follower cannot have
+       ; replicated entries the leader lacks, so midx > log-len is a stale/racey AER; left
+       ; unclamped it corrupts BOTH match (-> maybe-commit advances commit past the log) AND
+       ; next (-> append-for indexes off the end -> shard crash). The iter-1 append-for clamp
+       ; is the downstream guard; this keeps the stored match/next sane at the source.
+       (let* ((m   (min midx (log-len st)))
+              (st1 (aset* st (list 'match (aset (aget st 'match) from m)
+                                   'next (aset (aget st 'next) from (+ m 1))
                                    'heard (add-mem from (aget st 'heard)))))
               (st2 (maybe-commit st1)))
          ; maybe-commit auto-appends Cnew when a joint config commits — replicate it

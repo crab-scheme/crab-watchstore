@@ -72,4 +72,17 @@
   (check "entries-from base+1 (6) = 3 entries" 3 (length (entries-from st 6)))
   (check "entries-from len+1 (9) = 0 entries"  0 (length (entries-from st 9))))
 
+(section "on-aer success: midx > log-len clamped at the SOURCE (cw-bm5) — match/next stay sane")
+(let* ((st (make-raft 'a '(a b c) dummy 0))
+       (st (aset* st (list 'base 5 'base-term 1 'term 2 'role 'leader
+                           'log (list (cmd "x") (cmd "y") (cmd "z"))   ; log-len = 8
+                           'next (list (cons 'b 9) (cons 'c 9))
+                           'match (list (cons 'b 0) (cons 'c 8))
+                           'commit 8 'applied 8 'rseq 0)))
+       (res (on-aer st 'b (list 'aer 2 #t 20)))    ; b acks midx=20 (> log-len) — PRE-FIX corrupts match/next
+       (st2 (car res)))
+  (check "match[b] clamped to log-len = 8 (not 20)"   8 (cdr (assq 'b (aget st2 'match))))
+  (check "next[b] clamped to log-len+1 = 9 (not 21)"  9 (cdr (assq 'b (aget st2 'next))))
+  (check "commit not advanced past the log"           8 (aget st2 'commit)))
+
 (done!)

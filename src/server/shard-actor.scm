@@ -1333,7 +1333,13 @@
                           (res (watch-register! watch-reg ctx spec deliver-fn)))
                      (if (and (pair? res) (eq? (car res) 'compacted))
                          (send reply-pid (cons 'watch-compacted (cdr res)))
-                         (send reply-pid (cons 'watch-created res)))))   ; res = watch-id
+                         ; cw-l5h: carry the ACCURATE current-rev (read here, where the shard
+                         ; is the sole writer of current-rev) so the worker's created-ack uses
+                         ; it. The worker's own pre-register 'cur-rev query times out to rev 0
+                         ; when the shard mailbox is backed up under write load, which left the
+                         ; kube-apiserver watch-cache stuck at "current: 1" -> consistency-check
+                         ; failures -> 503 -> no nodes register. res = watch-id.
+                         (send reply-pid (list 'watch-created res (mvcc-current-rev ctx))))))
                (loop st leader elapsed flush-base)))
 
             ;; ---- Watch cancel: (watch-cancel REPLY-PID WATCH-ID) ----  (cw-u4a.14)

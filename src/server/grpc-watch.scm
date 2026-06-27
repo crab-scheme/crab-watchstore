@@ -305,10 +305,15 @@
                   ((not (pair? r)) (await buffered))
                   ((eq? (car r) 'watch-response) (await (cons (cadr r) buffered)))
                   ((eq? (car r) 'watch-created)
-                   (let ((wid (cdr r)))
+                   ; cw-l5h: shape is now (watch-created WID CUR-REV). Use the shard's accurate
+                   ; current-rev for the created-ack header, NOT the pre-register snap-rev — that
+                   ; came from rev+term, which falls back to 0 when the shard mailbox is backed up
+                   ; under write load, leaving the apiserver watch-cache stuck at "current: 1".
+                   (let ((wid (cadr r))
+                         (crev (caddr r)))
                      (set! live-wids (cons wid live-wids))
                      (if progress? (set! any-progress? #t))
-                     (emit-wr! (list wid snap-rev #t #f "" 0 '()))
+                     (emit-wr! (list wid crev #t #f "" 0 '()))
                      (for-each emit-wr! (reverse buffered))))
                   ((eq? (car r) 'watch-compacted)
                    (emit-wr! (list (if client-wid client-wid 0) 0 #f #t

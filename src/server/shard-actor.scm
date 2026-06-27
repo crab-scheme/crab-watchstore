@@ -962,7 +962,7 @@
              ; apiserver re-lists forever, "current" stuck at the watch-creation rev. Pushing
              ; from the shard (which holds the rev) avoids each watch worker round-tripping the
              ; shard for cur-rev under load (that latency made the apiserver re-list pre-sync).
-             (if (and (> (reg-count watch-reg) 0) (= 0 (modulo fwd-ticks 4)))
+             (if (> (reg-count watch-reg) 0)
                  (watch-progress-all! watch-reg ctx))
              (cond
                ((raft-leader? st)

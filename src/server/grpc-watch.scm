@@ -357,16 +357,14 @@
     ; cw-kp0: a cross-shard watcher asking "am I caught up?" (the workload's drain) -> flush
     ; the held tail in rev order before answering, so the progress reply reflects everything.
     (if xshard? (xflush-all!))
-    ; cw-l5h: NON-BLOCKING. The old code blocked on the shard's cur-rev reply; under write
-    ; saturation that reply queues behind the write backlog, stalling the worker so progress
-    ; frames stopped flowing and the kube-apiserver etcd3 rev tracking stuck at "current: 1"
-    ; -> consistency 503 -> no nodes. Fire the query (its 'cur-rev-ok updates last-rev back in
-    ; the main loop) and emit a progress frame NOW at the best-known global rev — it advances
-    ; steadily from events + async replies and never stalls the stream.
-    ; cw-l5h: only REQUEST the current rev here. The progress frame is emitted when 'cur-rev-ok
-    ; arrives (main loop), so it carries the EXACT current rev — non-blocking AND not lagging.
-    ; (Emitting last-rev here left the watchCache trailing the store -> "current: N < requested".)
-    (send shard-pid (list 'cur-rev (self))))
+    ; cw-l5h: respond to RequestProgress IMMEDIATELY at the best-known rev — kept fresh within one
+    ; tick by the shard's periodic push (watch-progress-all!), whose emitted progress advances
+    ; last-rev. The old cur-rev round-trip lagged under load, so the apiserver re-listed before it
+    ; synced (the re-list churn). Also fire a cur-rev to refresh last-rev (main loop) for next time.
+    (send shard-pid (list 'cur-rev (self)))
+    (if (pair? live-wids)
+        (for-each (lambda (wid) (emit-wr! (list wid last-rev #f #f "" 0 '()))) live-wids)
+        (emit-wr! (list -1 last-rev #f #f "" 0 '()))))
 
   (define (handle-client-msg bytes)
     (let* ((req (pb-decode WatchRequest-schema bytes))

@@ -363,15 +363,10 @@
     ; -> consistency 503 -> no nodes. Fire the query (its 'cur-rev-ok updates last-rev back in
     ; the main loop) and emit a progress frame NOW at the best-known global rev — it advances
     ; steadily from events + async replies and never stalls the stream.
-    (send shard-pid (list 'cur-rev (self)))
-    ; cw-l5h: emit progress PER live watch_id, not a single watch_id=-1 stream broadcast.
-    ; k8s opens watches with WithProgressNotify and advances each per-resource watchCache's
-    ; resourceVersion from progress frames carrying ITS OWN watch_id; the -1 broadcast left the
-    ; cacher stuck at "current: 1" (diagnostic confirmed we send the CORRECT rev, just on wid -1).
-    ; Fall back to -1 only when no specific watch is live (the stream-level drain probe).
-    (if (pair? live-wids)
-        (for-each (lambda (wid) (emit-wr! (list wid last-rev #f #f "" 0 '()))) live-wids)
-        (emit-wr! (list -1 last-rev #f #f "" 0 '()))))
+    ; cw-l5h: only REQUEST the current rev here. The progress frame is emitted when 'cur-rev-ok
+    ; arrives (main loop), so it carries the EXACT current rev — non-blocking AND not lagging.
+    ; (Emitting last-rev here left the watchCache trailing the store -> "current: N < requested".)
+    (send shard-pid (list 'cur-rev (self))))
 
   (define (handle-client-msg bytes)
     (let* ((req (pb-decode WatchRequest-schema bytes))
@@ -428,7 +423,13 @@
         ((not (pair? m)) (loop))
         ((eq? (car m) 'client-msg)     (handle-client-msg (cadr m)) (loop))
         ((eq? (car m) 'watch-response) (if xshard? (xbuf! (cadr m)) (emit-wr! (cadr m))) (loop))
-        ((eq? (car m) 'cur-rev-ok)     (if (> (cadr m) last-rev) (set! last-rev (cadr m))) (loop))  ; cw-l5h: async global-rev update from do-progress's fire-and-forget query
+        ((eq? (car m) 'cur-rev-ok)     ; cw-l5h: do-progress's reply -> emit per-wid progress at the EXACT current rev
+         (let ((rev (cadr m)))
+           (if (> rev last-rev) (set! last-rev rev))
+           (if (pair? live-wids)
+               (for-each (lambda (wid) (emit-wr! (list wid rev #f #f "" 0 '()))) live-wids)
+               (emit-wr! (list -1 rev #f #f "" 0 '()))))
+         (loop))
         ((eq? (car m) 'client-end)     (teardown))   ; falls out of the loop -> exit
         (else (loop))))))
 

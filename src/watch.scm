@@ -388,6 +388,24 @@
           (chunk rest)))))
 
 ; ===========================================================================
+; watch-progress-all! — periodic ProgressNotify (cw-l5h)
+; ===========================================================================
+; Deliver a progress frame (current rev, NO events) to every SYNCED watcher. Idle-resource
+; watches receive no events, so this is the only way their kube-apiserver watchCache reaches
+; the current rev and marks "synced" — without it the apiserver re-lists forever and "current"
+; stays stuck at the watch-creation rev (the 19-iteration blocker). etcd does exactly this.
+; PUSHED from the shard (which holds the rev) on its tick, so no watch worker has to round-trip
+; the shard for cur-rev under load — that round-trip latency was making the apiserver re-list
+; before it could sync. Empty-events response does NOT advance delivered_rev (safe, idempotent).
+(define (watch-progress-all! reg ctx)
+  (let ((rev (mvcc-current-rev ctx)))
+    (for-each
+     (lambda (w)
+       (if (w-synced? w)
+           ((w-deliver-fn w) (events-response (w-watch-id w) rev '()))))
+     (reg-watchers reg))))
+
+; ===========================================================================
 ; watch-on-apply! — the LIVE dispatch off mvcc-apply (ADR 0002 §3 LIVE, §4)
 ; ===========================================================================
 ;

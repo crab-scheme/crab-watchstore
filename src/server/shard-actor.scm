@@ -956,6 +956,14 @@
              ; periodically. No-op on builds without tracing-cycle-collector.
              (if (= 0 (modulo fwd-ticks 16)) (collect-garbage))
              (flush-and-drain! flush-base)
+             ; cw-l5h: PUSH periodic progress (current rev) to every synced watcher ~every 4
+             ; ticks. Idle-resource watches get no events, so this is the only way their kube-
+             ; apiserver watchCache reaches the current rev + marks "synced" — without it the
+             ; apiserver re-lists forever, "current" stuck at the watch-creation rev. Pushing
+             ; from the shard (which holds the rev) avoids each watch worker round-tripping the
+             ; shard for cur-rev under load (that latency made the apiserver re-list pre-sync).
+             (if (and (> (reg-count watch-reg) 0) (= 0 (modulo fwd-ticks 4)))
+                 (watch-progress-all! watch-reg ctx))
              (cond
                ((raft-leader? st)
                 ; CheckQuorum: if we lost quorum contact this window, step down —

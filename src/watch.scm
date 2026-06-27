@@ -177,16 +177,80 @@
 ; server-assigned ids.  Single-threaded ownership (the shard actor) is what makes
 ; the §3 seam race-free; this code adds NO locks.
 (define-record-type watch-registry
-  (make-watch-registry-record table next-id)
+  (make-watch-registry-record table next-id kidx wide)
   watch-registry?
   (table   reg-table)
-  (next-id reg-next-id set-reg-next-id!))
+  (next-id reg-next-id set-reg-next-id!)
+  (kidx    reg-kidx)      ; cw-l5h: index key-string -> list of watch-ids (prefix+single-key watches)
+  (wide    reg-wide))     ; cw-l5h: watch-id -> #t for all-keys / arbitrary-range watches (always scanned)
 
 (define (make-watch-registry)
-  (make-watch-registry-record (make-eqv-hashtable) 0))
+  (make-watch-registry-record (make-eqv-hashtable) 0
+                              (make-eqv-hashtable)    ; cw-l5h: int-hash -> collision bucket alist
+                              (make-eqv-hashtable)))
 
 (define (reg-count reg) (hashtable-size (reg-table reg)))
 (define (reg-get   reg id) (hashtable-ref (reg-table reg) id #f))
+
+; cw-l5h: watch-on-apply! used to scan EVERY watcher per write — O(total watchers) per
+; apply. At k8s scale (thousands of informer watches) that made each write O(W) and
+; collapsed throughput (~21 w/s -> shard saturation -> watch-cache never syncs -> 503 ->
+; no nodes). Index prefix+single-key watchers by their key so an event routes only to the
+; watchers whose range can cover it. k8s watches are ~all /registry/<resource>/ prefixes
+; and single keys; all-keys / arbitrary ranges go in `wide` (always considered). The
+; candidate set is a strict SUPERSET of real matches; watch-dispatch-live!'s range-in-range?
+; still filters precisely, so delivery semantics are unchanged.
+; djb2 hash of a string -> bounded fixnum (custom-equiv hashtables panic on the VM tier, so
+; we key an eqv-hashtable by this int and keep per-bucket (key-string . ids) collision cells).
+(define (reg-str-hash s)
+  (let ((n (string-length s)))
+    (let loop ((i 0) (h 5381))
+      (if (= i n) h
+          (loop (+ i 1) (modulo (+ (* h 33) (char->integer (string-ref s i))) 1073741824))))))
+(define (reg-bucket-find bucket ks)    ; (ks . ids) cell with car string=? ks, or #f
+  (cond ((null? bucket) #f)
+        ((string=? (caar bucket) ks) (car bucket))
+        (else (reg-bucket-find (cdr bucket) ks))))
+(define (reg-kidx-update! kidx ks f)   ; f : ids-list -> ids-list (rebuild bucket, no set-cdr!)
+  (let* ((h (reg-str-hash ks)) (bucket (hashtable-ref kidx h '()))
+         (without (filter (lambda (c) (not (string=? (car c) ks))) bucket))
+         (cell (reg-bucket-find bucket ks))
+         (new-ids (f (if cell (cdr cell) '()))))
+    (hashtable-set! kidx h (if (pair? new-ids) (cons (cons ks new-ids) without) without))))
+(define (reg-index-key w)              ; index STRING if prefix/single-key, else #f (-> wide)
+  (guard (e (#t #f))                   ; a non-UTF8 key falls to wide (always scanned) — safe
+    (let ((k (w-key w)) (re (w-range-end w)))
+      (cond ((or (not k) (= (bytevector-length k) 0)) #f)                        ; all-keys
+            ((or (not re) (= (bytevector-length re) 0)) (utf8->string k))         ; single-key
+            ((bytevector=? re (prefix-range-end k)) (utf8->string k))             ; prefix
+            (else #f)))))                                                         ; arbitrary
+(define (reg-index-add! reg id w)
+  (let ((ik (reg-index-key w)))
+    (if ik (reg-kidx-update! (reg-kidx reg) ik (lambda (l) (cons id l)))
+           (hashtable-set! (reg-wide reg) id #t))))
+(define (reg-index-del! reg id w)
+  (let ((ik (reg-index-key w)))
+    (if ik (reg-kidx-update! (reg-kidx reg) ik (lambda (l) (remv id l)))
+           (hashtable-delete! (reg-wide reg) id))))
+; candidate watcher records whose range may cover any of `events` (deduped union of the
+; wide set + every key-index entry that is a prefix of some event key). Falls back to a
+; full scan if an event key isn't UTF8 (non-k8s) — correctness over speed.
+(define (reg-candidates reg events)
+  (guard (e (#t (reg-watchers reg)))
+    (let ((seen (make-eqv-hashtable)))
+      (hashtable-walk (reg-wide reg) (lambda (id _) (hashtable-set! seen id #t)))
+      (for-each
+       (lambda (ev)
+         (let* ((s (utf8->string (ev-key ev))) (n (string-length s)))
+           (let loop ((i 1))
+             (when (<= i n)
+               (let* ((ks (substring s 0 i))
+                      (bucket (hashtable-ref (reg-kidx reg) (reg-str-hash ks) '()))
+                      (cell (reg-bucket-find bucket ks)))
+                 (if cell (for-each (lambda (id) (hashtable-set! seen id #t)) (cdr cell))))
+               (loop (+ i 1))))))
+       events)
+      (map (lambda (id) (reg-get reg id)) (vector->list (hashtable-keys seen))))))
 
 ; allocate the next server-assigned watch_id (used iff the spec supplies none)
 (define (reg-alloc-id! reg)
@@ -248,6 +312,7 @@
                                        #f)))        ; unsynced
          ; (2) REGISTER-BEFORE-REPLAY — into the registry FIRST.
          (hashtable-set! (reg-table reg) id w)
+         (reg-index-add! reg id w)         ; cw-l5h: key-range index for O(matching) dispatch
          ; (3)+(4) replay + catch-up to current, then promote.
          ; start-rev = 0 is the FUTURE-ONLY sentinel (§1/§3): NO historical replay —
          ; jump delivered_rev straight to current-rev and go synced.  Registration
@@ -350,9 +415,9 @@
             'compacted        ; can't happen for pre-rev that just advanced; defensive
             (for-each
              (lambda (w)
-               (if (w-synced? w)
+               (if (and w (w-synced? w))
                    (watch-dispatch-live! ctx w all-events post-rev)))
-             (reg-watchers reg)))))
+             (reg-candidates reg all-events)))))   ; cw-l5h: only watchers covering these events, not ALL W
   (if #f #f))   ; -> unspecified
 
 ; For one synced watcher, walk the applied events in order and deliver each that is
@@ -394,6 +459,7 @@
         (let ((reason   (if (pair? opts) (car opts) "watch canceled"))
               (compact  (if (and (pair? opts) (pair? (cdr opts))) (cadr opts) 0)))
           (hashtable-delete! (reg-table reg) watch-id)
+          (reg-index-del! reg watch-id w)         ; cw-l5h: keep the key-range index consistent
           ((w-deliver-fn w) (canceled-response watch-id 0 reason compact))
           #t)
         #f)))

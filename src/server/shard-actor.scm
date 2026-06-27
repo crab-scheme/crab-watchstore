@@ -250,7 +250,14 @@
               (set! acc (cons (stamp-put! cmd) acc))     ; parallel path: stamp now, materialize on flush
           (let ((pre (mvcc-current-rev ctx)))
             (flush-materializations!)                    ; serial ops read live state: batch must land first
-            (set! acc (cons (mvcc-apply ctx cmd) acc))    ; MVCC write; client waiter gets the result
+            (let ((res (mvcc-apply ctx cmd)))             ; MVCC write; client waiter gets the result
+              ; cw-l5h: tag a single-group TXN's result with its commit rev so the ASYNC Txn
+              ; path builds the TxnResponse header with no blocking cur-rev round-trip. Only
+              ; "TXN" — multi-group 2PC uses "TXN-PREPARE", PUT/AUTH/LEASE etc. are unaffected.
+              (set! acc (cons (if (string=? (cmd-op cmd) "TXN")
+                                  (cons 'txnr (cons (mvcc-current-rev ctx) res))
+                                  res)
+                              acc)))
             (watch-on-apply! watch-reg ctx pre (mvcc-current-rev ctx))
             ; Watch backend (cw-u4a.14, ADR 0002 §5 mid-stream ErrCompacted): a
             ; COMPACT applied here GC's REV-CF events <= compact-rev, so any watcher

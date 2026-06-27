@@ -720,6 +720,10 @@
     (set! inflight (- inflight 1))
     (let ((h (cadr m)) (payload (caddr m)))
       (cond
+        ((and (pair? payload) (eq? (car payload) 'txnr))   ; cw-l5h: async Txn result tagged (txnr rev . result)
+         (grpc-respond! h (pb-encode TxnResponse-schema
+                                     (internal-txn-result->etcd (cddr payload)
+                                                                (make-header cluster-id member-id (cadr payload) (wterm!))))))
         ((and (pair? payload) (string? (car payload)) (string=? (car payload) "PUT"))
          (grpc-respond! h (etcd-pb-encode-put-resp cluster-id member-id (cdr payload) (wterm!) #f)))
         ((and (pair? payload) (eq? (car payload) 'err-lease-not-found))
@@ -1170,15 +1174,17 @@
         ; (shard-groups=1, no authority) keeps the original local-rev fast path.
         (if (> shard-groups 1)
             (txn-2pc itxn)
-            (let* ((tgt (if (null? parts) 0 (car parts)))
-                   (ack (ask-shard-on (shard-pid-idx tgt)
-                                      (cons (self) (list (string->utf8 "TXN") (txn-encode itxn))))))
-              (cond
-                ((and (pair? ack) (boolean? (car ack)))
-                 (cons 'ok (pb-encode TxnResponse-schema (internal-txn-result->etcd ack (shard-header)))))
-                ((eq? ack 'tryagain)      (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: not leader")))
-                ((eq? ack 'indeterminate) (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: leader changed")))
-                (else (cons 'err (cons GRPC-INTERNAL "txn: unexpected ack"))))))))))
+            ; cw-l5h: ASYNC Txn submission (mirrors EXP5 handle-put). The blocking ask-shard-on
+            ; serialized each worker per Txn -> avgbatch=1 -> ~21 w/s on EBS, starving the kube-
+            ; apiserver. Submit tagged with the call handle + return 'async; concurrent k8s Txns
+            ; now fill the shard mailbox and BATCH into shared group-commit rounds (amortizing the
+            ; fsync). apply-fn tags the commit rev; respond-put-done! encodes the TxnResponse.
+            (let ((tgt (if (null? parts) 0 (car parts))))
+              (drain-until-room!)
+              (set! inflight (+ inflight 1))
+              (send (shard-pid-idx tgt) (cons (list 'async (self) h)
+                                              (list (string->utf8 "TXN") (txn-encode itxn))))
+              'async))))))
 
   ; ---- Lease/LeaseGrant (UNARY, cw-u4a.17) ----
   ; Propose ("LEASE-GRANT" id ttl) through the shard's async commit->ack bridge;

@@ -17,3 +17,7 @@ snapshots/
 
 # Compiled Go test programs (rebuilt via `go run`; never the prebuilt binary)
 test/clientv3-compat/clientv3compat
+
+# terraform plan artifacts
+tfplan
+*.tfplan

@@ -27,13 +27,18 @@ locals {
   bucket     = "cws-smoke-${local.account}-${var.artifact_bucket_region}"
   east_names = [for i in range(var.east_store_count) : "n${i + 1}"]
   west_names = [for i in range(var.west_store_count) : "n${var.east_store_count + i + 1}"]
-  # name:ip:raftport:clientport for every store node (host MUST be a numeric IP — grpc-serve
-  # binds a numeric SocketAddr and does not resolve names; see jepsen db.clj/node-ip).
-  store_specs = concat(
-    [for i, n in local.east_names : "${n}:${aws_eip.east_store[i].public_ip}:7000:2379"],
-    [for i, n in local.west_names : "${n}:${aws_eip.west_store[i].public_ip}:7000:2379"],
+  # name:host:raftport:clientport. host = the NODE NAME (a hostname), NOT the EIP: a non-numeric
+  # host makes grpc-serve bind 0.0.0.0 (node-cluster.scm:355) — required on AWS, where an EIP is
+  # 1:1 NAT'd and is NOT a local interface (binding it fails). Peers resolve the name via /etc/hosts
+  # (hosts_block below) -> the peer's public EIP -> NAT -> the 0.0.0.0 listener.
+  cluster_spec = join(",", [for n in concat(local.east_names, local.west_names) : "${n}:${n}:7000:2379"])
+  # "<public-eip> <name>" for every node; cloud-init rewrites the node's OWN line to 127.0.0.1
+  # (avoid EIP hairpin) and appends the rest to /etc/hosts.
+  host_lines = concat(
+    [for i, n in local.east_names : "${aws_eip.east_store[i].public_ip} ${n}"],
+    [for i, n in local.west_names : "${aws_eip.west_store[i].public_ip} ${n}"],
   )
-  cluster_spec    = join(",", local.store_specs)
+  hosts_block     = join("\n", local.host_lines)
   store_eip_cidrs = [for e in concat(aws_eip.east_store, aws_eip.west_store) : "${e.public_ip}/32"]
   all_node_cidrs  = concat(local.store_eip_cidrs, ["${aws_eip.apiserver.public_ip}/32"])
 }
@@ -208,9 +213,12 @@ resource "aws_instance" "east_store" {
   subnet_id              = data.aws_subnets.east.ids[0]
   vpc_security_group_ids = [aws_security_group.store_east.id]
   iam_instance_profile   = aws_iam_instance_profile.node.name
+  # re-run cloud-init when the bootstrap template changes (recreate the instance)
+  user_data_replace_on_change = true
   user_data = templatefile("${path.module}/cloud-init-store.sh.tftpl", {
     node_name    = local.east_names[count.index]
     cluster_spec = local.cluster_spec
+    hosts_block  = local.hosts_block
     bucket       = local.bucket
   })
   tags = { Name = "cws-${local.east_names[count.index]}" }
@@ -224,9 +232,12 @@ resource "aws_instance" "west_store" {
   subnet_id              = data.aws_subnets.west.ids[0]
   vpc_security_group_ids = [aws_security_group.store_west.id]
   iam_instance_profile   = aws_iam_instance_profile.node.name
+  # re-run cloud-init when the bootstrap template changes (recreate the instance)
+  user_data_replace_on_change = true
   user_data = templatefile("${path.module}/cloud-init-store.sh.tftpl", {
     node_name    = local.west_names[count.index]
     cluster_spec = local.cluster_spec
+    hosts_block  = local.hosts_block
     bucket       = local.bucket
   })
   tags = { Name = "cws-${local.west_names[count.index]}" }

@@ -4,10 +4,10 @@
 set -uo pipefail
 
 TFDIR="$(cd "$(dirname "$0")/terraform" && pwd)"
-KEY="$(terraform -chdir="$TFDIR" output -raw ssh_key)"
+KEY="$TFDIR/cws-smoke.pem"
 API_IP="$(terraform -chdir="$TFDIR" output -raw apiserver_ip)"
 K8S_VER="${K8S_VER:-v1.31.4}"
-SSH="ssh -i $KEY -o StrictHostKeyChecking=no ubuntu@$API_IP"
+SSH="ssh -i $KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR ubuntu@$API_IP"
 KC="sudo docker run --rm --network host -v /etc/cws-k8s/certs:/certs:ro registry.k8s.io/kubectl:${K8S_VER} kubectl --kubeconfig /certs/admin.kubeconfig"
 
 step() { echo ""; echo "=== $1 ==="; }

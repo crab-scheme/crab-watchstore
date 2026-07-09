@@ -188,6 +188,13 @@
   ; cur-rev each tick, and that worker<->shard round-trip under load competes with the write
   ; path. Buffer during active writing; deliver in rev order at quiescence (and on the
   ; drain's progress probe). Delivery is still gap-free + ordered, just batched.
+  ; cw-xq9 round 4: true once this stream has reached REAL quiescence (every shard caught
+  ; up, nothing lagging) at least once -- NOT just "xflush-all! was called" (do-progress
+  ; also calls xflush-all! unconditionally on every RequestProgress, which only drains
+  ; whatever happens to be buffered AT THAT INSTANT and proves nothing about catch-up).
+  ; Gates progress replies below (mirrors real etcd's progressIfSync, which sends nothing
+  ; at all while any watcher on the stream is unsynced).
+  (define xsynced-once? #f)
   (define (xtick!)
     (if xgot (begin (set! xgot #f) (set! xidle 0)) (set! xidle (+ xidle 1)))
     ; NO active-phase poll: xmin-rev's in-band shard round-trip both (a) starved delivery
@@ -196,7 +203,7 @@
     ; deliver the whole rev-ordered batch at quiescence. Ordering is safe BECAUSE we only
     ; flush after XQUIESCENT-TICKS of silence (every shard has caught up; no lagging low-rev
     ; event can arrive after a higher one ships). One batched send, no poll.
-    (if (>= xidle XQUIESCENT-TICKS) (xflush-all!)))
+    (if (>= xidle XQUIESCENT-TICKS) (begin (xflush-all!) (set! xsynced-once? #t))))
   (define live-wids '())   ; watch_ids established on THIS stream (for teardown)
   (define xcreated-pending #f)  ; cw-kp0: a cross-shard created-ack to emit from the loop (deferred)
   (define xshard-regs '())  ; (shard-pid . wid) registered across shards, for teardown
@@ -405,6 +412,22 @@
   ; progress notify addressed to it and stayed frozen forever (matches "current: 2"
   ; -- exactly one bookmark ever consumed, then nothing). Always send a single
   ; broadcast (-1) frame, never per-wid.
+  ; cw-xq9 round 4: real etcd's progressIfSync (server/storage/mvcc/watchable_store.go)
+  ; sends NOTHING AT ALL -- not even a stale/best-effort frame -- if any watcher on the
+  ; stream is unsynced ("for _, w := range watchers { if _, ok := s.synced.watchers[w];
+  ; !ok { return false } }"). A progress bookmark at revision R is a promise that every
+  ; event <= R has already been delivered; during a bootstrap catch-up window (a
+  ; cross-shard watch's replay hasn't reached quiescence yet) we cannot honor that
+  ; promise, and a bookmark that OVERTAKES undelivered events would let a k8s watch
+  ; cache latch a revision below events it hasn't seen yet -- exactly the kind of
+  ; regression k8s 1.36's ConsistentListFromCache treats as authoritative and can get
+  ; permanently stuck on (observed live: caches frozen at rev 2 through a fresh-store
+  ; bootstrap write burst). Single-shard watches are always synced by the time their
+  ; created-ack is processed (watch-register! replays+promotes synchronously before
+  ; acking, and this actor's mailbox is processed sequentially, so no progress_request
+  ; can race in before that completes) -- the real risk is cross-shard (xshard?), whose
+  ; replay/catch-up is asynchronous; gate on xsynced-once?.
+  (define (stream-synced?) (or (not xshard?) xsynced-once?))
   (define (do-progress)
     (define (reply! rev)
       (if (> rev last-rev) (set! last-rev rev))
@@ -412,17 +435,25 @@
     ; cw-kp0: a cross-shard watcher asking "am I caught up?" (the workload's drain) -> flush
     ; the held tail in rev order before answering, so the progress reply reflects everything.
     (if xshard? (xflush-all!))
-    (send shard-pid (list 'cur-rev (self)))
-    (let await ((spins 0) (buffered '()))
-      (let ((r (raw-receive 20)))
-        (cond
-          ((and (pair? r) (eq? (car r) 'cur-rev-ok))
-           (for-each emit-wr! (reverse buffered))
-           (reply! (cadr r)))
-          ((and (pair? r) (eq? (car r) 'watch-response))
-           (if xshard? (xbuf! (cadr r)) (await (+ spins 1) (cons (cadr r) buffered))))
-          ((> spins 40) (for-each emit-wr! (reverse buffered)) (reply! last-rev))  ; hard cap: never wedge the worker
-          (else (await (+ spins 1) buffered))))))
+    (if (stream-synced?)
+        (begin
+          (send shard-pid (list 'cur-rev (self)))
+          (let await ((spins 0) (buffered '()))
+            (let ((r (raw-receive 20)))
+              (cond
+                ((and (pair? r) (eq? (car r) 'cur-rev-ok))
+                 (for-each emit-wr! (reverse buffered))
+                 (reply! (cadr r)))
+                ((and (pair? r) (eq? (car r) 'watch-response))
+                 (if xshard? (xbuf! (cadr r)) (await (+ spins 1) (cons (cadr r) buffered))))
+                ; hard cap: never wedge the worker. cw-xq9 round 4: emit NOTHING here (not a
+                ; stale-last-rev reply) -- a timed-out fresh-rev fetch means we genuinely don't
+                ; know the current revision right now; a silent skip is spec-conformant (etcd
+                ; itself sends nothing when it can't honor the progress promise) and a future
+                ; periodic tick / RequestProgress will get a real answer instead of latching a
+                ; possibly-stale one.
+                ((> spins 40) (for-each emit-wr! (reverse buffered)))
+                (else (await (+ spins 1) buffered)))))))) ; unsynced: no reply at all (matches etcd's progressIfSync == false)
 
   (define (handle-client-msg bytes)
     (let* ((req (pb-decode WatchRequest-schema bytes))

@@ -9,7 +9,7 @@ set -euo pipefail
 TFDIR="$(cd "$(dirname "$0")/terraform" && pwd)"
 KEY="$TFDIR/cws-smoke.pem"
 API_IP="$(terraform -chdir="$TFDIR" output -raw apiserver_ip)"
-ETCD="$(terraform -chdir="$TFDIR" output -raw etcd_endpoint)"
+ETCD="${ETCD:-$(terraform -chdir="$TFDIR" output -raw etcd_endpoint)}"
 K8S_VER="${K8S_VER:-v1.31.4}"
 SSH="ssh -i $KEY -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 ubuntu@$API_IP"
 

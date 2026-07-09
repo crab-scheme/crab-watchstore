@@ -79,6 +79,14 @@
               (begin
                 (set! new-coord (string->symbol (utf8->string (cadr cmd))))
                 (set! acc (cons 'move-leader-ok acc)))
+          (if (and (pair? cmd) (string=? (cmd-op cmd) "LEASE-KA"))
+              ; replicated keepalive (leaderless leases): every replica bumps its
+              ; local deadline clock at this log position; only the coordinator's
+              ; lease-tick! ever acts on expiry, so per-node clock skew is benign.
+              (let* ((id (bytes->int (cadr cmd)))
+                     (ttl (mvcc-lease-meta-get ctx id)))
+                (if ttl (hashtable-set! lease-deadlines id (+ (current-second) ttl)))
+                (set! acc (cons (list 'keepalive-ok id (if ttl ttl 0)) acc)))
           (let ((pre (mvcc-current-rev ctx)))
             (let ((res (mvcc-apply ctx cmd)))
               (set! acc (cons (if (string=? (cmd-op cmd) "TXN")
@@ -88,7 +96,7 @@
             (watch-on-apply! watch-reg ctx pre (mvcc-current-rev ctx))
             (if (and (> (reg-count watch-reg) 0)
                      (pair? cmd) (string=? (cmd-op cmd) "COMPACT"))
-                (watch-check-compaction! watch-reg ctx)))))
+                (watch-check-compaction! watch-reg ctx))))))
       (+ sm 1))
 
     (define (gsend to msg) (node-send-ch (symbol->string node-name) to my-channel msg))
@@ -431,63 +439,54 @@
                  (send reply-pid (cons 'watch-canceled (if ok wid #f))))
                (loop st)))
 
-            ;; ---- leases: replicated grant/revoke, coordinator-owned deadlines ----
+            ;; ---- leases: fully leaderless (any node serves; found on the k3s run —
+            ;; real etcd serves Lease RPCs on ANY member, and a kube control plane
+            ;; whose LeaseGrants bounce 4/5 of the time never converges).
+            ;; grant/revoke were always replicated cmds — the coordinator gate was
+            ;; unnecessary. keepalive replicates as LEASE-KA so EVERY node's deadline
+            ;; clock advances; only the coordinator's lease-tick! enforces expiry.
             ((eq? (car m) 'lease-grant)
              (let ((reply-pid (cadr m)) (ttl (caddr m)) (id (cadddr m)))
-               (if (not (qp-coord? st))
-                   (begin (send reply-pid (cons 'lease-not-leader (qp-coord st)))
-                          (loop st))
-                   (loop (propose-client! st
-                           (list (cons reply-pid
-                                       (list (string->utf8 "LEASE-GRANT")
-                                             (int->bytes id) (int->bytes ttl)))))))))
+               (loop (propose-client! st
+                       (list (cons reply-pid
+                                   (list (string->utf8 "LEASE-GRANT")
+                                         (int->bytes id) (int->bytes ttl))))))))
             ((eq? (car m) 'lease-revoke)
              (let ((reply-pid (cadr m)) (id (caddr m)))
-               (if (not (qp-coord? st))
-                   (begin (send reply-pid (cons 'lease-not-leader (qp-coord st)))
-                          (loop st))
-                   (begin
-                     (hashtable-delete! lease-deadlines id)
-                     (hashtable-set! lease-revoking id #t)
-                     (loop (propose-client! st
-                             (list (cons reply-pid
-                                         (list (string->utf8 "LEASE-REVOKE")
-                                               (int->bytes id))))))))))
+               (hashtable-delete! lease-deadlines id)
+               (hashtable-set! lease-revoking id #t)
+               (loop (propose-client! st
+                       (list (cons reply-pid
+                                   (list (string->utf8 "LEASE-REVOKE")
+                                         (int->bytes id))))))))
             ((eq? (car m) 'lease-keepalive)
              (let ((reply-pid (cadr m)) (id (caddr m)))
-               (if (not (qp-coord? st))
-                   (send reply-pid (cons 'lease-not-leader (qp-coord st)))
-                   (let ((ttl (mvcc-lease-meta-get ctx id)))
-                     (if ttl
-                         (begin
-                           (hashtable-set! lease-deadlines id (+ (current-second) ttl))
-                           (send reply-pid (list 'keepalive-ok id ttl)))
-                         (send reply-pid (list 'keepalive-ok id 0)))))
-               (loop st)))
+               (if (mvcc-lease-meta-get ctx id)
+                   (loop (propose-client! st
+                           (list (cons reply-pid
+                                       (list (string->utf8 "LEASE-KA")
+                                             (int->bytes id))))))
+                   (begin (send reply-pid (list 'keepalive-ok id 0))
+                          (loop st)))))
             ((eq? (car m) 'lease-ttl)
              (let ((reply-pid (cadr m)) (id (caddr m)) (with-keys? (cadddr m)))
-               (if (not (qp-coord? st))
-                   (send reply-pid (cons 'lease-not-leader (qp-coord st)))
-                   (let ((ttl (mvcc-lease-meta-get ctx id)))
-                     ; a TTL query can land before the first tick seeds this
-                     ; lease's deadline — seed the full window now (same value
-                     ; the tick would set).
-                     (if (and ttl (not (hashtable-contains? lease-deadlines id))
-                              (not (hashtable-contains? lease-revoking id)))
-                         (hashtable-set! lease-deadlines id (+ (current-second) ttl)))
-                     (let* ((deadline (hashtable-ref lease-deadlines id #f))
-                            (now (current-second))
-                            (remaining (if (and ttl deadline)
-                                           (max 0 (exact (ceiling (- deadline now))))
-                                           -1))
-                            (keys (if with-keys? (mvcc-lease-keys ctx id) '())))
-                       (send reply-pid (list 'lease-ttl-ok id (if ttl ttl 0) remaining keys)))))
+               (let ((ttl (mvcc-lease-meta-get ctx id)))
+                 ; a TTL query can land before anything seeds this lease's local
+                 ; deadline — seed the full window now (same value a KA would set).
+                 (if (and ttl (not (hashtable-contains? lease-deadlines id))
+                          (not (hashtable-contains? lease-revoking id)))
+                     (hashtable-set! lease-deadlines id (+ (current-second) ttl)))
+                 (let* ((deadline (hashtable-ref lease-deadlines id #f))
+                        (now (current-second))
+                        (remaining (if (and ttl deadline)
+                                       (max 0 (exact (ceiling (- deadline now))))
+                                       -1))
+                        (keys (if with-keys? (mvcc-lease-keys ctx id) '())))
+                   (send reply-pid (list 'lease-ttl-ok id (if ttl ttl 0) remaining keys))))
                (loop st)))
             ((eq? (car m) 'lease-leases)
              (let ((reply-pid (cadr m)))
-               (if (not (qp-coord? st))
-                   (send reply-pid (cons 'lease-not-leader (qp-coord st)))
-                   (send reply-pid (list 'lease-leases-ok (mvcc-all-lease-ids ctx))))
+               (send reply-pid (list 'lease-leases-ok (mvcc-all-lease-ids ctx)))
                (loop st)))
 
             ;; ---- unsupported on quepaxa groups (raft-only features) ----

@@ -135,7 +135,33 @@ no election machinery at all. The soak found and we fixed two restart holes:
 rejoin blindness (idle anti-entropy fetch + ranged fetch replies) and bid
 collision (persisted boot epoch in bids).
 
-Remaining (tracked): cw-7e5's real-AWS 2-region leg (instances currently
-stopped; start-instances was permission-gated), Q10 bandit tuning (cw-fbb,
-stretch), Q11 membership parity (cw-2w6, deferred; quepaxa groups refuse
-member-* mutations).
+Remaining (tracked): Q10 bandit tuning (cw-fbb, stretch), Q11 membership
+parity (cw-2w6, deferred; quepaxa groups refuse member-* mutations).
+
+## Real-AWS 2-region A/B (2026-07-09) — cw-7e5 leg completed
+
+5-node cluster (n1–n3 us-east-2, n4–n5 us-west-2, real ~50–70ms inter-region
+RTT), single shard group, load driven from a co-located east client
+(`deploy/aws-apiserver-smoke/ab-engine.sh`), 60s write load, leader/coordinator
+(n1) SIGKILLed at t=20s and dead 10s (systemd restart).
+
+| metric                      | raft         | quepaxa      |
+|-----------------------------|--------------|--------------|
+| acked writes (60s w/ kill)  | 827          | **879**      |
+| failed writes               | 99           | **2**        |
+| lost acked writes           | 0            | 0            |
+| write-blackout window       | **~15.1s**   | **~10.0s** (= exactly the dead window) |
+| term churn                  | 1 → 2        | 1 → 1 (no terms) |
+| steady-state median / p99   | 52 / 55 ms   | 52 / 55 ms   |
+| hashkv convergence          | 5/5          | 5/5          |
+
+QuePaxa's only 2 failures were the client's own 5s timeouts against the dead
+n1 endpoint; every write routed to a surviving node committed throughout the
+kill window (hedged proposal path). Raft returned 99 straight failures for
+~15s (10s dead + election + client re-routing). Latency parity at steady
+state confirms the 1-RTT coordinator fast path on real WAN.
+
+Bonus find: the run exposed a pre-existing main bug — the origin-side
+`fwd-reply` relay raw-`send`ed to async waiters, so follower-forwarded writes
+via the async gRPC path hung forever (cw-1c3, fixed on this branch; masked in
+docker/local runs whose loads wrote leader-first).

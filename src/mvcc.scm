@@ -585,19 +585,30 @@
       (bv<? a b)
       (< a b)))
 
-; insertion sort (small result sets, avoids any stdlib sort dependency)
+; merge sort (apiserver LISTs run 500+ items; insertion sort was O(n^2) in the
+; interpreter's hot read path)
 (define (isort lst less?)
-  (define (insert x sorted)
-    (cond ((null? sorted) (list x))
-          ((less? x (car sorted)) (cons x sorted))
-          (else (cons (car sorted) (insert x (cdr sorted))))))
-  (let loop ((in lst) (out '()))
-    (if (null? in) out
-        (loop (cdr in) (insert (car in) out)))))
+  (define (merge a b)
+    (cond ((null? a) b)
+          ((null? b) a)
+          ((less? (car b) (car a)) (cons (car b) (merge a (cdr b))))
+          (else (cons (car a) (merge (cdr a) b)))))
+  (define (split lst)
+    (let loop ((slow lst) (fast lst) (acc '()))
+      (if (or (null? fast) (null? (cdr fast)))
+          (cons (reverse acc) slow)
+          (loop (cdr slow) (cddr fast) (cons (car slow) acc)))))
+  (if (or (null? lst) (null? (cdr lst)))
+      lst
+      (let ((halves (split lst)))
+        (merge (isort (car halves) less?) (isort (cdr halves) less?)))))
 
+; etcd's Range contract: results are KEY-ASCENDING even with sort NONE (the
+; on-disk KEY-CF layout is length-prefixed, so raw scan order is length-major —
+; k8s apiserver pagination/digest checks broke on this; found on the k3s run).
 (define (range-sort items order target)
   (if (eq? order 'none)
-      items
+      (isort items (lambda (a b) (bv<? (car a) (car b))))
       (let* ((key-fn (lambda (item) (range-sort-key item target)))
              (asc?   (lambda (a b) (sort-key<? (key-fn a) (key-fn b))))
              (sorted (isort items asc?)))

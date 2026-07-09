@@ -514,7 +514,7 @@
   (let ((rem (modulo (bytevector-length bv) 512)))
     (if (= rem 0) bv (bytevector-append bv (make-bytevector (- 512 rem) 0)))))
 
-(define (grpc-snapshot-worker h shard-pid cluster-id member-id)
+(define (grpc-snapshot-worker h shard-pid cluster-id member-id . ignored)  ; extra spawn args (shard-groups, node-name) unused here
   ; ask-shard tolerant of a racing client half-close: a server-streaming call's
   ; ('*grpc-stream-end* h) may arrive while we await the shard reply, so loop until
   ; we see one of OUR shard reply tags (discarding any client-end — we close the

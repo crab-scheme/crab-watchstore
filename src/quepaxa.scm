@@ -144,6 +144,9 @@
 (define (qp-sm st)      (qp-nget st 'sm))
 (define (qp-coord st)   (qp-nget st 'coord))
 (define (qp-coord? st)  (eqv? (qp-nget st 'id) (qp-nget st 'coord)))
+; replicated coordinator reassignment (applied identically on every replica).
+; Safe with the strict unanimous-F fast path even during the handoff window.
+(define (qp-set-coord st id) (qp-nset st 'coord id))
 (define (qp-decided-val st slot) (qp-sget (qp-nget st 'decided) slot))
 (define (qp-base st)      (qp-nget st 'base))
 (define (qp-snap-need st) (qp-nget st 'snap-need))

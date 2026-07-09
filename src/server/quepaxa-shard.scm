@@ -69,9 +69,16 @@
     (define SNAP-CHUNK-ROWS 200)
     (define PROPOSE-BATCH-CAP 64)
 
+    (define new-coord #f)                    ; set by a QP-COORD apply; post! adopts
     (define (apply-cmd! sm cmd)
       (if (null? cmd)
           (set! acc (cons #f acc))
+          (if (and (pair? cmd) (string=? (cmd-op cmd) "QP-COORD"))
+              ; replicated coordinator transfer: no MVCC write, no rev bump —
+              ; every replica flips its coordinator at the same log position.
+              (begin
+                (set! new-coord (string->symbol (utf8->string (cadr cmd))))
+                (set! acc (cons 'move-leader-ok acc)))
           (let ((pre (mvcc-current-rev ctx)))
             (let ((res (mvcc-apply ctx cmd)))
               (set! acc (cons (if (string=? (cmd-op cmd) "TXN")
@@ -81,7 +88,7 @@
             (watch-on-apply! watch-reg ctx pre (mvcc-current-rev ctx))
             (if (and (> (reg-count watch-reg) 0)
                      (pair? cmd) (string=? (cmd-op cmd) "COMPACT"))
-                (watch-check-compaction! watch-reg ctx))))
+                (watch-check-compaction! watch-reg ctx)))))
       (+ sm 1))
 
     (define (gsend to msg) (node-send-ch (symbol->string node-name) to my-channel msg))
@@ -200,6 +207,8 @@
     (define (post! st old-applied)
       (if (> (qp-applied st) old-applied)
           (ctx-save-applied! ctx (qp-applied st) 0))
+      (if new-coord
+          (begin (set! st (qp-set-coord st new-coord)) (set! new-coord #f)))
       (if (ctx-dirty? ctx) (ctx-flush! ctx))     ; durable BEFORE any ack
       (let* ((st (drain-writes! st))
              (st (drain-reads! st))
@@ -310,11 +319,13 @@
                                     #f))))
              (loop st))
             ((eq? (car m) 'cur-rev)
-             (send (cadr m) (list 'cur-rev-ok (mvcc-current-rev ctx) 0))
+             (send (cadr m) (list 'cur-rev-ok (mvcc-current-rev ctx) 1))
              (loop st))
             ((eq? (car m) 'status)
              (let ((dig (mvcc-digest-at ctx 0)))
-               (send (cadr m) (list 'status-ok (mvcc-current-rev ctx) 0
+               ; term is a raft concept; report the constant 1 (etcdctl and the
+               ; maintenance proof assert raftTerm > 0). QuePaxa has no terms.
+               (send (cadr m) (list 'status-ok (mvcc-current-rev ctx) 1
                                     (qp-commit st) (qp-applied st) (cadr dig)
                                     (qp-coord st) (caddr dig))))
              (loop st))
@@ -446,6 +457,12 @@
                (if (not (qp-coord? st))
                    (send reply-pid (cons 'lease-not-leader (qp-coord st)))
                    (let ((ttl (mvcc-lease-meta-get ctx id)))
+                     ; a TTL query can land before the first tick seeds this
+                     ; lease's deadline — seed the full window now (same value
+                     ; the tick would set).
+                     (if (and ttl (not (hashtable-contains? lease-deadlines id))
+                              (not (hashtable-contains? lease-revoking id)))
+                         (hashtable-set! lease-deadlines id (+ (current-second) ttl)))
                      (let* ((deadline (hashtable-ref lease-deadlines id #f))
                             (now (current-second))
                             (remaining (if (and ttl deadline)
@@ -468,9 +485,23 @@
             ((eq? (car m) 'member-list)
              (send (cadr m) (list 'member-list voters '()))
              (loop st))
+            ;; ---- MoveLeader = replicated coordinator transfer ----
             ((eq? (car m) 'move-leader)
-             (send (cadr m) (cons 'move-leader-err 'unsupported-quepaxa))
-             (loop st))
+             (let ((reply-pid (cadr m)) (target (caddr m)))
+               (cond
+                 ((not (memv target voters))
+                  (send reply-pid (cons 'move-leader-err 'not-voter))
+                  (loop st))
+                 ((eqv? target (qp-coord st))
+                  (send reply-pid (if (eqv? target node-name)
+                                      (cons 'move-leader-err 'self)
+                                      'move-leader-ok))
+                  (loop st))
+                 (else
+                  (loop (propose-client! st
+                          (list (cons reply-pid
+                                      (list (string->utf8 "QP-COORD")
+                                            (string->utf8 (symbol->string target)))))))))))
 
             ;; ---- snapshot install (pulled; same ws-snap frames) ----
             ((eq? (car m) 'snap-install)

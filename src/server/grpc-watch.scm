@@ -390,12 +390,25 @@
   ; worker) for a REAL cur-rev round-trip before answering, buffering any interleaved
   ; watch-response frames so delivery order is preserved (mirrors rev+term / xmin-rev's
   ; existing bounded-await pattern).
+  ; cw-xq9 round 3: real etcd's RequestProgress handler (server/etcdserver/api/v3rpc/
+  ; watch.go's ProgressRequest case) calls watchStream.RequestProgressAll(), which
+  ; sends watchableStore.progressAll() -> progressIfSync(watchers, InvalidWatchID) --
+  ; i.e. etcd emits EXACTLY ONE WatchResponse per stream with watch_id = -1 ("Progress
+  ; notifications can have WatchID -1 if they announce on behalf of multiple
+  ; watchers" -- sendLoop's own comment). The etcd client fans that ONE broadcast
+  ; frame out to every substream sharing the grpc stream itself; the server never
+  ; addresses individual watch_ids for a progress reply. The old per-wid loop here
+  ; sent one frame PER live watch_id instead -- on a stream multiplexing several
+  ; watches (apiserver's etcd client coalesces compatible watchers onto shared grpc
+  ; streams), only the ONE substream whose watch_id happened to match a given frame
+  ; got its cache advanced; every other watcher on that same stream never saw a
+  ; progress notify addressed to it and stayed frozen forever (matches "current: 2"
+  ; -- exactly one bookmark ever consumed, then nothing). Always send a single
+  ; broadcast (-1) frame, never per-wid.
   (define (do-progress)
     (define (reply! rev)
       (if (> rev last-rev) (set! last-rev rev))
-      (if (pair? live-wids)
-          (for-each (lambda (wid) (emit-wr! (list wid last-rev #f #f "" 0 '()))) live-wids)
-          (emit-wr! (list -1 last-rev #f #f "" 0 '()))))
+      (emit-wr! (list -1 last-rev #f #f "" 0 '())))
     ; cw-kp0: a cross-shard watcher asking "am I caught up?" (the workload's drain) -> flush
     ; the held tail in rev order before answering, so the progress reply reflects everything.
     (if xshard? (xflush-all!))

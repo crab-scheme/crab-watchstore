@@ -212,12 +212,28 @@
 
     ; persist + fsync + drain acks/reads + snapshot pull + publish, after any
     ; engine transition. old-applied gates the persist/fsync work.
+    ;
+    ; ENGINE LOG COMPACTION (cw-dgp): the engine's per-slot state lives in
+    ; alists; nothing ever pruned them in normal operation, so at k8s load
+    ; every slot lookup walked an ever-growing list — CPU grew with uptime
+    ; until the shard actor pinned a core (~35-45 min) and the node starved.
+    ; Compact the engine to (applied - QP-LOG-KEEP) every QP-COMPACT-EVERY
+    ; applied slots: laggards within the window use ranged fetch, deeper
+    ; laggards take the ws-snap store-snapshot path (both already exist).
+    (define QP-LOG-KEEP 512)
+    (define QP-COMPACT-EVERY 64)
+    (define next-compact QP-COMPACT-EVERY)
     (define (post! st old-applied)
       (if (> (qp-applied st) old-applied)
           (ctx-save-applied! ctx (qp-applied st) 0))
       (if new-coord
           (begin (set! st (qp-set-coord st new-coord)) (set! new-coord #f)))
       (if (ctx-dirty? ctx) (ctx-flush! ctx))     ; durable BEFORE any ack
+      (if (>= (qp-applied st) next-compact)
+          (begin
+            (set! next-compact (+ (qp-applied st) QP-COMPACT-EVERY))
+            (if (> (- (qp-applied st) QP-LOG-KEEP) (qp-base st))
+                (set! st (qp-compact-to st (- (qp-applied st) QP-LOG-KEEP))))))
       (let* ((st (drain-writes! st))
              (st (drain-reads! st))
              (st (maybe-snap-pull! st)))

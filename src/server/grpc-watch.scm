@@ -351,20 +351,45 @@
   ; watches synced via events, masking it). Reply with a broadcast progress
   ; notification — a WatchResponse with watch_id = -1 and the current store
   ; revision, no events — exactly etcd's ProgressNotify (clientv3 advances every
-  ; substream on this stream to that revision). Drain any interleaved watcher
-  ; frames while awaiting the shard's cur-rev so delivery order is preserved.
+  ; substream on this stream to that revision).
+  ;
+  ; cw-xq9: real etcd's RequestProgress contract is FRESH-AT-REQUEST — the returned
+  ; revision reflects what the server has applied AT THE TIME IT RECEIVED the request,
+  ; not some earlier cached value. k8s 1.36's consistent-reads-from-cache path
+  ; (apiserver/pkg/storage/cacher) blocks on exactly this via waitUntilFreshAndBlock,
+  ; comparing the watch cache's tracked resourceVersion against a target it needs
+  ; to reach. The OLD implementation here answered IMMEDIATELY at the cached last-rev
+  ; and only corrected it ASYNCHRONOUSLY afterward (via the main loop's 'cur-rev-ok
+  ; branch) — for a watch whose own keys never change, last-rev never gets refreshed
+  ; by an event either, so every RequestProgress reply could keep echoing the SAME
+  ; stale revision the watch started with, forever, even while the store's real
+  ; revision climbs from unrelated writes (matches apiserver stats.go's observed
+  ; "current: 1" pin — [-]informer-sync never completes). 1.31 tolerated this because
+  ; it only uses progress bookmarks for lenient "has-synced-eventually" gating, not a
+  ; live freshness bound. Block (bounded, ~0.8s cap so a wedged shard can't hang the
+  ; worker) for a REAL cur-rev round-trip before answering, buffering any interleaved
+  ; watch-response frames so delivery order is preserved (mirrors rev+term / xmin-rev's
+  ; existing bounded-await pattern).
   (define (do-progress)
+    (define (reply! rev)
+      (if (> rev last-rev) (set! last-rev rev))
+      (if (pair? live-wids)
+          (for-each (lambda (wid) (emit-wr! (list wid last-rev #f #f "" 0 '()))) live-wids)
+          (emit-wr! (list -1 last-rev #f #f "" 0 '()))))
     ; cw-kp0: a cross-shard watcher asking "am I caught up?" (the workload's drain) -> flush
     ; the held tail in rev order before answering, so the progress reply reflects everything.
     (if xshard? (xflush-all!))
-    ; cw-l5h: respond to RequestProgress IMMEDIATELY at the best-known rev — kept fresh within one
-    ; tick by the shard's periodic push (watch-progress-all!), whose emitted progress advances
-    ; last-rev. The old cur-rev round-trip lagged under load, so the apiserver re-listed before it
-    ; synced (the re-list churn). Also fire a cur-rev to refresh last-rev (main loop) for next time.
     (send shard-pid (list 'cur-rev (self)))
-    (if (pair? live-wids)
-        (for-each (lambda (wid) (emit-wr! (list wid last-rev #f #f "" 0 '()))) live-wids)
-        (emit-wr! (list -1 last-rev #f #f "" 0 '()))))
+    (let await ((spins 0) (buffered '()))
+      (let ((r (raw-receive 20)))
+        (cond
+          ((and (pair? r) (eq? (car r) 'cur-rev-ok))
+           (for-each emit-wr! (reverse buffered))
+           (reply! (cadr r)))
+          ((and (pair? r) (eq? (car r) 'watch-response))
+           (if xshard? (xbuf! (cadr r)) (await (+ spins 1) (cons (cadr r) buffered))))
+          ((> spins 40) (for-each emit-wr! (reverse buffered)) (reply! last-rev))  ; hard cap: never wedge the worker
+          (else (await (+ spins 1) buffered))))))
 
   (define (handle-client-msg bytes)
     (let* ((req (pb-decode WatchRequest-schema bytes))
@@ -421,13 +446,10 @@
         ((not (pair? m)) (loop))
         ((eq? (car m) 'client-msg)     (handle-client-msg (cadr m)) (loop))
         ((eq? (car m) 'watch-response) (if xshard? (xbuf! (cadr m)) (emit-wr! (cadr m))) (loop))
-        ((eq? (car m) 'cur-rev-ok)     ; cw-l5h: do-progress's reply -> emit per-wid progress at the EXACT current rev
-         (let ((rev (cadr m)))
-           (if (> rev last-rev) (set! last-rev rev))
-           (if (pair? live-wids)
-               (for-each (lambda (wid) (emit-wr! (list wid rev #f #f "" 0 '()))) live-wids)
-               (emit-wr! (list -1 rev #f #f "" 0 '()))))
-         (loop))
+        ; cw-xq9: 'cur-rev-ok is now consumed entirely inside do-progress's own bounded
+        ; await loop (fresh-at-request semantics) — nothing else sends 'cur-rev without
+        ; consuming its own reply (rev+term, xmin-rev), so this main-loop branch is dead;
+        ; any stray reply just falls through to (else (loop)) and is discarded, which is safe.
         ((eq? (car m) 'client-end)     (teardown))   ; falls out of the loop -> exit
         (else (loop))))))
 

@@ -1154,8 +1154,11 @@
             ((eq? (car m) 'fwd-reply)
              (let* ((id (caddr m)) (payload (cadddr m))
                     (e (hashtable-ref fwd-pending id #f)))
+               ; the waiter may be an ASYNC sink ('async worker handle), not a raw
+               ; pid — relay through ack-waiter! (raw send to the list threw, the
+               ; guard ate it, and the client hung; found on the real-AWS WAN run).
                (if e (begin (hashtable-delete! fwd-pending id)
-                            (guard (g (#t #f)) (send (car e) payload))))
+                            (guard (g (#t #f)) (ack-waiter! (car e) payload))))
                (loop st leader elapsed flush-base)))
 
             ;; ---- KV prev-kv seam: (kv-prev CONN KEY) -> the key's CURRENT live record

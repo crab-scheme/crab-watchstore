@@ -428,6 +428,14 @@
   ; can race in before that completes) -- the real risk is cross-shard (xshard?), whose
   ; replay/catch-up is asynchronous; gate on xsynced-once?.
   (define (stream-synced?) (or (not xshard?) xsynced-once?))
+  ; cw-xq9 round 5: replay a message that arrived DURING do-progress's await. A
+  ; 'client-msg here is a PIPELINED WatchRequest (k8s 1.36 interleaves watch
+  ; creates with RequestProgress on one stream at bootstrap); the old await
+  ; silently DROPPED it — the watch then never existed, its apiserver cache
+  ; never synced, and the APF bootstrap ensurer Fatalf'd the whole apiserver.
+  (define (handle-deferred! r)
+    (if (and (pair? r) (eq? (car r) 'client-msg))
+        (handle-client-msg (cadr r))))
   (define (do-progress)
     (define (reply! rev)
       (if (> rev last-rev) (set! last-rev rev))
@@ -438,22 +446,27 @@
     (if (stream-synced?)
         (begin
           (send shard-pid (list 'cur-rev (self)))
-          (let await ((spins 0) (buffered '()))
+          (let await ((spins 0) (buffered '()) (deferred '()))
             (let ((r (raw-receive 20)))
               (cond
                 ((and (pair? r) (eq? (car r) 'cur-rev-ok))
                  (for-each emit-wr! (reverse buffered))
-                 (reply! (cadr r)))
+                 (reply! (cadr r))
+                 (for-each handle-deferred! (reverse deferred)))
                 ((and (pair? r) (eq? (car r) 'watch-response))
-                 (if xshard? (xbuf! (cadr r)) (await (+ spins 1) (cons (cadr r) buffered))))
+                 (if xshard?
+                     (begin (xbuf! (cadr r)) (await (+ spins 1) buffered deferred))
+                     (await (+ spins 1) (cons (cadr r) buffered) deferred)))
+                ((eq? r '*timeout*) (await (+ spins 1) buffered deferred))
                 ; hard cap: never wedge the worker. cw-xq9 round 4: emit NOTHING here (not a
                 ; stale-last-rev reply) -- a timed-out fresh-rev fetch means we genuinely don't
                 ; know the current revision right now; a silent skip is spec-conformant (etcd
                 ; itself sends nothing when it can't honor the progress promise) and a future
                 ; periodic tick / RequestProgress will get a real answer instead of latching a
                 ; possibly-stale one.
-                ((> spins 40) (for-each emit-wr! (reverse buffered)))
-                (else (await (+ spins 1) buffered)))))))) ; unsynced: no reply at all (matches etcd's progressIfSync == false)
+                ((> spins 40) (for-each emit-wr! (reverse buffered))
+                              (for-each handle-deferred! (reverse deferred)))
+                (else (await (+ spins 1) buffered (cons r deferred))))))))) ; unsynced: no reply (etcd progressIfSync == false)
 
   (define (handle-client-msg bytes)
     (let* ((req (pb-decode WatchRequest-schema bytes))

@@ -126,7 +126,14 @@
           (cons 'rng (getopt 'seed 42))
           (cons 'rec '()) (cons 'props '()) (cons 'decided '())
           (cons 'applied 0) (cons 'bids '()) (cons 'holds '())
-          (cons 'mine '()) (cons 'next-slot 1) (cons 'gapt 0) (cons 'seq 0))))
+          (cons 'mine '()) (cons 'next-slot 1) (cons 'gapt 0) (cons 'seq 0)
+          ; base = compaction floor: slots <= base are applied AND pruned; a
+          ; peer asking below it can only be caught up by a STORE snapshot
+          ; (ws-snap, driver's job — mirrors raft's base/snap-req contract).
+          ; snap-need = (peer . peer-base) when WE are the lagging one.
+          (cons 'base 0) (cons 'snap-need #f)
+          ; linearizable reads (Q5): pending bid->tag, done tag list (FIFO).
+          (cons 'reads '()) (cons 'rdone '()))))
 
 (define (qp-id st)      (qp-nget st 'id))
 (define (qp-applied st) (qp-nget st 'applied))
@@ -135,6 +142,41 @@
 (define (qp-coord st)   (qp-nget st 'coord))
 (define (qp-coord? st)  (eqv? (qp-nget st 'id) (qp-nget st 'coord)))
 (define (qp-decided-val st slot) (qp-sget (qp-nget st 'decided) slot))
+(define (qp-base st)      (qp-nget st 'base))
+(define (qp-snap-need st) (qp-nget st 'snap-need))
+(define (qp-clear-snap-need st) (qp-nset st 'snap-need #f))
+
+; ---- compaction + snapshot install (Q4, cw-cec) ----
+; Prune decided slots <= floor (their effects live in the store, which IS the
+; snapshot). No-op unless base < floor <= applied. NOTE: the applied-bid dedup
+; window ('bids) is in-memory; a snapshot payload should carry it (the driver
+; ships it with ws-snap) so a rejoiner cannot re-apply a pre-snapshot batch —
+; same lesson as crab-cache's atomic applied-index (cc-cri).
+(define (qp-compact-to st floor)
+  (if (or (<= floor (qp-nget st 'base)) (> floor (qp-nget st 'applied)))
+      st
+      (qp-nset* st (list
+        'base floor
+        'decided (let loop ((l (qp-nget st 'decided)) (acc '()))
+                   (cond ((null? l) (reverse acc))
+                         ((<= (caar l) floor) (loop (cdr l) acc))
+                         (else (loop (cdr l) (cons (car l) acc)))))))))
+
+; adopt a store snapshot at `base` (the driver has already replaced the
+; persistent store contents and passes the matching sm + applied-bid window).
+(define (qp-install-snapshot st base sm bids)
+  (let ((drop<= (lambda (al) (let loop ((l al) (acc '()))
+                               (cond ((null? l) (reverse acc))
+                                     ((<= (caar l) base) (loop (cdr l) acc))
+                                     (else (loop (cdr l) (cons (car l) acc))))))))
+    (qp-apply-prefix                       ; decided slots above base we already
+     (qp-nset* st (list                    ; heard about apply immediately
+       'base base 'applied base 'sm sm 'bids bids 'snap-need #f 'gapt 0
+       'decided (drop<= (qp-nget st 'decided))
+       'rec (drop<= (qp-nget st 'rec))
+       'props (drop<= (qp-nget st 'props))
+       'mine (drop<= (qp-nget st 'mine))
+       'next-slot (max (qp-nget st 'next-slot) (+ base 1)))))))
 
 ; ============================================================
 ; recorder (interval summary register)
@@ -154,8 +196,14 @@
 (define (qp-on-esp st from msg)
   (let* ((slot (list-ref msg 1)) (s (list-ref msg 2)) (p (list-ref msg 3))
          (dv (qp-sget (qp-nget st 'decided) slot)))
-    (if dv
-        (cons st (list (cons from (list 'decd slot dv))))
+    (cond
+      ; slot compacted: the decided value is gone — never re-run consensus for
+      ; an applied slot; the asker needs a store snapshot.
+      ((<= slot (qp-nget st 'base))
+       (cons st (list (cons from (list 'snapo (qp-nget st 'base))))))
+      (dv
+        (cons st (list (cons from (list 'decd slot dv)))))
+      (else
         (let* ((rec (qp-nget st 'rec))
                (e (let ((x (qp-sget rec slot))) (if x x (list 0 #f #f #f))))
                (r (qp-rec-record e s p))
@@ -163,7 +211,7 @@
                ; seeing traffic for slot k means k is taken: propose above it
                (st (if (>= slot (qp-nget st 'next-slot))
                        (qp-nset st 'next-slot (+ slot 1)) st)))
-          (cons st (list (cons from (cons 'espr (cons slot (cons s (cdr r)))))))))))
+          (cons st (list (cons from (cons 'espr (cons slot (cons s (cdr r))))))))))))
 
 ; ============================================================
 ; proposer
@@ -310,15 +358,19 @@
       (let ((bid (car val)) (cmds (cadr val)))
         (if (qp-bid-applied? st bid)
             st                                ; exactly-once: hedged duplicate
-            (let ((sm (let loop ((c cmds) (sm (qp-nget st 'sm)))
-                        (if (null? c) sm
-                            (loop (cdr c)
-                                  (if (null? (car c)) sm
-                                      ((qp-nget st 'apply) sm (car c))))))))
+            (let* ((sm (let loop ((c cmds) (sm (qp-nget st 'sm)))
+                         (if (null? c) sm
+                             (loop (cdr c)
+                                   (if (null? (car c)) sm
+                                       ((qp-nget st 'apply) sm (car c)))))))
+                   ; a completed read: move its tag to the done queue
+                   (rd (assoc bid (qp-nget st 'reads))))
               (qp-nset* st (list
                 'sm sm
                 'bids (cons bid (qp-take-n (qp-nget st 'bids) (- QP-BIDS-KEEP 1)))
-                'holds (qp-hold-del (qp-nget st 'holds) bid))))))))
+                'holds (qp-hold-del (qp-nget st 'holds) bid)
+                'reads (if rd (qp-hold-del (qp-nget st 'reads) bid) (qp-nget st 'reads))
+                'rdone (if rd (cons (cdr rd) (qp-nget st 'rdone)) (qp-nget st 'rdone)))))))))
 
 ; ============================================================
 ; public API: propose / step / tick
@@ -363,9 +415,21 @@
   (qp-decide st (list-ref msg 1) (list-ref msg 2) #f))
 
 (define (qp-on-fetch st from msg)
-  (let ((dv (qp-sget (qp-nget st 'decided) (list-ref msg 1))))
-    (if dv
-        (cons st (list (cons from (list 'decd (list-ref msg 1) dv))))
+  (let* ((slot (list-ref msg 1))
+         (dv (qp-sget (qp-nget st 'decided) slot)))
+    (cond
+      ((<= slot (qp-nget st 'base))
+       (cons st (list (cons from (list 'snapo (qp-nget st 'base))))))
+      (dv (cons st (list (cons from (list 'decd slot dv)))))
+      (else (cons st '())))))
+
+; a peer told us the slot we need is below its compaction floor: surface the
+; snapshot need to the driver (it ships/installs the store snapshot, then
+; calls qp-install-snapshot).
+(define (qp-on-snapo st from msg)
+  (let ((pbase (list-ref msg 1)))
+    (if (> pbase (qp-nget st 'applied))
+        (cons (qp-nset st 'snap-need (cons from pbase)) '())
         (cons st '()))))
 
 (define (qp-step st from msg)
@@ -374,8 +438,31 @@
     ((espr)  (qp-on-espr st from msg))
     ((decd)  (qp-on-decd st from msg))
     ((fetch) (qp-on-fetch st from msg))
+    ((snapo) (qp-on-snapo st from msg))
     ((pfwd)  (qp-start-slot st (list-ref msg 1)))   ; coordinator adopts + retries
     (else    (cons st '()))))
+
+; ---- linearizable reads (Q5, cw-h4z): a consistent read is an empty batch
+;      through consensus (Meerkat-style read-through-log — no leader, so no
+;      ReadIndex). When its bid applies, every write decided before it has
+;      been applied; the driver drains qp-take-reads and serves at the then-
+;      current store rev. ----
+(define (qp-read st tag)
+  (let* ((seq (+ 1 (qp-nget st 'seq)))
+         (bid (list (qp-nget st 'id) seq))
+         (val (list bid '()))
+         (st (qp-nset st 'seq seq))
+         (st (qp-nset st 'reads (cons (cons bid tag) (qp-nget st 'reads)))))
+    (if (or (qp-coord? st) (<= (qp-nget st 'hedge) 0))
+        (qp-start-slot st val)
+        (let ((st (qp-nset st 'holds
+                    (cons (cons bid (cons val (qp-nget st 'hedge)))
+                          (qp-nget st 'holds)))))
+          (cons st (list (cons (qp-nget st 'coord) (list 'pfwd val))))))))
+
+; -> (done-tags-oldest-first . st')
+(define (qp-take-reads st)
+  (cons (reverse (qp-nget st 'rdone)) (qp-nset st 'rdone '())))
 
 ; ---- tick: hedge countdowns, retransmission, gap fill. No timeouts: none of
 ;      this affects safety, and liveness needs only that ticks keep coming. ----

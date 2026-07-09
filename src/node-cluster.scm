@@ -256,9 +256,22 @@
   (let ((n (string->number (arg-after "--serializable-max-lag" "0")))) (if (and n (>= n 0)) n 0)))
 ; cw-ivt: spawn one shard-main per group (key "0".."N-1"), each its own DB path.
 ; N=1 is byte-identical to the old single "0" spawn (dbbase-shard0).
+; --engine quepaxa (cw-gl8): run this node's shard groups on the QuePaxa engine
+; (leaderless, hedged, no election timeouts) instead of raft. Same mailbox
+; protocol; election-ticks is reinterpreted as the HEDGE tick count and
+; leader-node pins the COORDINATOR. --join / --global-rev stay raft-only.
+(define engine (arg-after "--engine"
+  (let ((e (get-environment-variable "CWS_ENGINE"))) (if e e "raft"))))
+(if (and (string=? engine "quepaxa") (or join? global-rev))
+    (error "--engine quepaxa does not support --join / --global-rev yet (raft-only)"))
+(define shard-body
+  (if (string=? engine "quepaxa")
+      "(include \"src/server/quepaxa-shard.scm\")"
+      "(include \"src/server/shard-actor.scm\")"))
+(define shard-entry (if (string=? engine "quepaxa") 'qp-shard-main 'shard-main))
 (for-each
  (lambda (sk)
-   (spawn-source-dedicated "(include \"src/server/shard-actor.scm\")" 'shard-main
+   (spawn-source-dedicated shard-body shard-entry
                  sk shard-voters me (string-append dbbase "-shard" sk) durable apply-shards
                  election-ticks leader-region region-map serializable-max-lag shard-learners
                  leader-node global-rev))

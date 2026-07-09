@@ -133,7 +133,10 @@
           ; snap-need = (peer . peer-base) when WE are the lagging one.
           (cons 'base 0) (cons 'snap-need #f)
           ; linearizable reads (Q5): pending bid->tag, done tag list (FIFO).
-          (cons 'reads '()) (cons 'rdone '()))))
+          (cons 'reads '()) (cons 'rdone '())
+          ; applied-batch log for the driver's write-ack bridge (Q6): (bid . ncmds)
+          ; appended (newest first) the FIRST time a bid's batch applies.
+          (cons 'adone '()))))
 
 (define (qp-id st)      (qp-nget st 'id))
 (define (qp-applied st) (qp-nget st 'applied))
@@ -281,13 +284,20 @@
         (let ((ph (modulo s 4)))
           (cond
             ((= ph 0)
-             (let ((hi (qp-nget st 'hi)))
-               (if (let loop ((l replies))
-                     (cond ((null? l) #t)
-                           ((let ((F (cadr (car l)))) (and F (= (car F) hi)))
-                            (loop (cdr l)))
-                           (else #f)))
-                   (qp-decide st slot (qp-p-val (cadr (car replies))) #t)  ; fast path
+             ; Fast path — STRICTER than dedis/quepaxa's prio==HI check: require
+             ; every F' to be the SAME hi-priority proposal. A recorder's F is
+             ; write-once per step, so two overlapping majorities can never both
+             ; be unanimous on different values — this keeps the fast path safe
+             ; even if a coordinator handoff briefly leaves two HI proposers on
+             ; one slot (the Go check is safe only under unique-HI-by-design).
+             (let* ((hi (qp-nget st 'hi))
+                    (f0 (cadr (car replies))))
+               (if (and f0 (= (car f0) hi)
+                        (let loop ((l (cdr replies)))
+                          (cond ((null? l) #t)
+                                ((equal? (cadr (car l)) f0) (loop (cdr l)))
+                                (else #f))))
+                   (qp-decide st slot (qp-p-val f0) #t)  ; fast path
                    (let ((bf (qp-pmax-of replies cadr)))
                      (qp-advance-to st slot (+ s 1) (if bf bf p))))))
             ((= ph 1) (qp-advance-to st slot (+ s 1) p))
@@ -370,7 +380,8 @@
                 'bids (cons bid (qp-take-n (qp-nget st 'bids) (- QP-BIDS-KEEP 1)))
                 'holds (qp-hold-del (qp-nget st 'holds) bid)
                 'reads (if rd (qp-hold-del (qp-nget st 'reads) bid) (qp-nget st 'reads))
-                'rdone (if rd (cons (cdr rd) (qp-nget st 'rdone)) (qp-nget st 'rdone)))))))))
+                'rdone (if rd (cons (cdr rd) (qp-nget st 'rdone)) (qp-nget st 'rdone))
+                'adone (cons (cons bid (length cmds)) (qp-nget st 'adone)))))))))
 
 ; ============================================================
 ; public API: propose / step / tick
@@ -463,6 +474,10 @@
 ; -> (done-tags-oldest-first . st')
 (define (qp-take-reads st)
   (cons (reverse (qp-nget st 'rdone)) (qp-nset st 'rdone '())))
+
+; -> (((bid . ncmds) ...) oldest-first . st') — batches applied since last take
+(define (qp-take-applied st)
+  (cons (reverse (qp-nget st 'adone)) (qp-nset st 'adone '())))
 
 ; ---- tick: hedge countdowns, retransmission, gap fill. No timeouts: none of
 ;      this affects safety, and liveness needs only that ticks keep coming. ----

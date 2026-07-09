@@ -97,3 +97,45 @@ instance; instances pipeline like Multi-Paxos.
 
 Raft stays the default engine throughout; quepaxa is opt-in per shard-group
 until Q8/Q9 are green.
+
+---
+
+## Outcome (2026-07-09) — epic cw-15a CLOSED
+
+All engine + integration work shipped on `feat/quepaxa` (Q1–Q9; Q10/Q11 deferred).
+`--engine quepaxa` (or `CWS_ENGINE=quepaxa`) selects the engine per node; raft
+stays the default.
+
+**Conformance under quepaxa (all green, unmodified suites):** kv 25/25,
+watch+lease 18/18, maintenance 25/25 (incl. real MoveLeader = replicated
+QP-COORD coordinator transfer, and snapshot save — whose failure was a
+pre-existing main bug, grpc-snapshot-worker arity, now fixed for both engines),
+auth 22/22 + mgmt 21/21, mTLS 7/7, lease-on-follower 9/9, clientv3 compat
+74/74. Engine unit suites: 69 deterministic checks (core/snapshot/differential)
+incl. chaos soak and a raft-vs-quepaxa differential harness.
+
+**Failover soak (local, durable, coordinator SIGKILL + restart):** 1259 acked /
+0 lost / 11 writes committed WHILE the coordinator was dead — no election
+blackout.
+
+**WAN A/B (docker tc-netem, 150ms RTT, wan-soak.sh, 60s load + leader kill
++ restart):**
+
+| metric                     | raft      | quepaxa   |
+|----------------------------|-----------|-----------|
+| acked writes (60s w/ kill) | 87        | **104**   |
+| lost acked writes          | 0         | 0         |
+| term churn                 | 1 → 3     | **1 → 1** (no terms) |
+| steady-state median        | 437 ms    | 433 ms    |
+| steady-state p99           | 524 ms    | 512 ms    |
+| hashkv convergence         | 3/3       | 3/3       |
+
+Same-latency fast path, ~20% more writes land through the failure window, and
+no election machinery at all. The soak found and we fixed two restart holes:
+rejoin blindness (idle anti-entropy fetch + ranged fetch replies) and bid
+collision (persisted boot epoch in bids).
+
+Remaining (tracked): cw-7e5's real-AWS 2-region leg (instances currently
+stopped; start-instances was permission-gated), Q10 bandit tuning (cw-fbb,
+stretch), Q11 membership parity (cw-2w6, deferred; quepaxa groups refuse
+member-* mutations).

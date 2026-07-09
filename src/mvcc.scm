@@ -9,7 +9,9 @@
 ; (META < KEY < REV < LEASE, so a prefix scan of one never bleeds into another):
 ;
 ;   NS-META  0x00  meta scalars        0x00 || name          -> u64  (current-rev / compact-rev)
-;   NS-KEY   0x01  key-ordered store   0x01 || u64be(lenK) || K || INV(rev16) -> KeyValue record
+;   NS-KEY   0x01  key-ordered store   0x01 || esc(K) || TERM(0x00 0x00) || INV(rev16) -> KeyValue record
+;            (cw-zf7 re-key: esc()/TERM byte-order-preserve K, so on-disk order is
+;            user-key ascending — was u64be(lenK)||K, which sorted length-major.)
 ;   NS-REV   0x02  revision-ordered    0x02 || rev16         -> event record
 ;   NS-LEASE 0x03  lease -> keys index 0x03 || u64be(leaseId) || K -> ()
 ;
@@ -69,17 +71,122 @@
 (define MAX-U64 (- (expt 2 64) 1))
 
 ; ---------------------------------------------------------------------------
-; KEY-CF key:  NS-KEY || u64be(lenK) || K || INV(rev16)
+; KEY-CF key:  NS-KEY || esc(K) || TERM(0x00 0x00) || INV(rev16)      (cw-zf7)
+; ---------------------------------------------------------------------------
+;
+; cw-zf7: the ORIGINAL layout was NS-KEY || u64be(lenK) || K || INV(rev16).
+; That length prefix makes on-disk order LENGTH-MAJOR (all 3-byte keys sort
+; before all 4-byte keys regardless of content), so a user-key RANGE like
+; "p/v1." can't be expressed as a row-bound scan — mvcc-range's general path
+; had to kv-scan the ENTIRE NS-KEY namespace (every key's every version) for
+; any non-point read.  Measured: an etcd LIST at 2000 keys took 11.7s and a
+; kube control plane pointed at it collapsed.
+;
+; The fix is a memcmp/order-preserving escape instead of a length prefix, so
+; the ON-DISK byte order is exactly user-key ascending (then newest-first via
+; INV(rev) within a key's version group), and a user-key range [K1,K2) is a
+; plain row-bound kv-scan-range.  Escape: each literal 0x00 byte in K becomes
+; 0x00 0xFF; the escaped key is TERMINATED by 0x00 0x00.  Since an escaped
+; null is always followed by 0xFF and the terminator is always followed by
+; 0x00, and 0x00 < 0xFF, the terminator byte-pair can never be confused with
+; an escaped null mid-key, and byte-lexicographic order over the escaped form
+; equals byte-lexicographic order over the raw key (etcd keys may contain any
+; byte, including 0x00, hence the escape rather than assuming printable keys).
+;
+; ponytail: NO data migration — pre-1.0 throwaway stores, fresh DBs only. A
+; DB written under the old length-prefixed layout is NOT readable under this
+; one (and vice versa); there is no on-disk version tag to detect/migrate.
 ; ---------------------------------------------------------------------------
 
-(define (key-cf-prefix K)               ; NS-KEY || u64be(lenK) || K  (scan prefix)
+; escape K: each 0x00 byte -> 0x00 0xFF.  Preallocate worst case (2x) and slice
+; back to the actual length instead of an O(n^2) incremental bytevector-append.
+(define (key-cf-escape K)
+  (let* ((n (bytevector-length K))
+         (buf (make-bytevector (* 2 n) 0)))
+    (let loop ((i 0) (j 0))
+      (if (= i n)
+          (subbv buf 0 j)
+          (let ((byte (bytevector-u8-ref K i)))
+            (if (= byte 0)
+                (begin (bytevector-u8-set! buf j 0)
+                       (bytevector-u8-set! buf (+ j 1) #xFF)
+                       (loop (+ i 1) (+ j 2)))
+                (begin (bytevector-u8-set! buf j byte)
+                       (loop (+ i 1) (+ j 1)))))))))
+
+; un-escape: reverse of key-cf-escape (0x00 followed by anything, always 0xFF
+; inside an escaped run, collapses back to a single 0x00).
+(define (key-cf-unescape EK)
+  (let* ((n (bytevector-length EK))
+         (buf (make-bytevector n 0)))
+    (let loop ((i 0) (j 0))
+      (if (= i n)
+          (subbv buf 0 j)
+          (if (= (bytevector-u8-ref EK i) 0)
+              (begin (bytevector-u8-set! buf j 0) (loop (+ i 2) (+ j 1)))
+              (begin (bytevector-u8-set! buf j (bytevector-u8-ref EK i)) (loop (+ i 1) (+ j 1))))))))
+
+(define (key-cf-prefix K)               ; NS-KEY || esc(K) || TERM  (scan prefix; sorts ascending)
   (bytevector-append (mvcc-byte NS-KEY)
-                     (u64->bytes (bytevector-length K))
-                     K))
+                     (key-cf-escape K)
+                     (make-bytevector 2 0)))     ; #u8(0 0) terminator
 
 (define (enc-key K main sub)            ; full KEY-CF key
   (bytevector-append (key-cf-prefix K)
                      (inv16 (rev->16 main sub))))
+
+; find the byte offset of the 0x00 0x00 terminator in a full/prefix KEY-CF key,
+; starting the scan at `start` (byte 1, right after the NS-KEY tag).  A 0x00
+; byte NOT followed by another 0x00 is an escaped null (0x00 0xFF) — skip 2 and
+; keep scanning; a 0x00 followed by 0x00 IS the terminator.
+(define (key-cf-find-term fk start)
+  (let loop ((i start))
+    (if (= (bytevector-u8-ref fk i) 0)
+        (if (= (bytevector-u8-ref fk (+ i 1)) 0)
+            i
+            (loop (+ i 2)))
+        (loop (+ i 1)))))
+
+; prefix-range-end: increment the last non-0xFF byte to produce the exclusive
+; upper bound for a prefix scan.  Returns #f if all bytes are 0xFF (overflow =>
+; treat as to-eof).  (Forward-declared here; also used below by range bounds —
+; moved up from its original spot further down in this file so key-cf-row-bounds
+; can call it.)
+(define (prefix-range-end prefix)
+  (let* ((n   (bytevector-length prefix))
+         (out (subbv prefix 0 n)))
+    (let loop ((i (- n 1)))
+      (cond
+        ((< i 0) #f)   ; all 0xFF — return #f (caller treats as to-eof)
+        ((< (bytevector-u8-ref out i) #xFF)
+         (bytevector-u8-set! out i (+ (bytevector-u8-ref out i) 1))
+         ; zero out bytes after i
+         (let clr ((j (+ i 1)))
+           (if (< j n) (begin (bytevector-u8-set! out j 0) (clr (+ j 1)))))
+         out)
+        (else (loop (- i 1)))))))
+
+; row bounds [start, end) over KEY-CF for a mvcc-range request (K, range-end) —
+; cw-zf7: this is what makes a bounded user-key range a bounded ROW scan instead
+; of the whole-namespace kv-scan the old length-major layout was stuck with.
+;   range-end unset (single key)     -> [prefix(K), prefix(K)+eps)
+;   range-end = to-eof sentinel      -> [prefix(K)-or-NS-start, end-of-NS-KEY)
+;   otherwise (half-open range)      -> [prefix(K), prefix(range-end))
+; NS-KEY's next namespace is NS-REV, so "end of NS-KEY" = (mvcc-byte (+ NS-KEY 1)).
+(define (key-cf-row-bounds key range-end)
+  (let ((ns-end (mvcc-byte (+ NS-KEY 1))))
+    (cond
+      ((range-end-unset? range-end)
+       (let ((p (key-cf-prefix key)))
+         (cons p (or (prefix-range-end p) ns-end))))
+      ((and (range-end-to-eof? range-end)
+            (= (bytevector-length key) 1)
+            (= (bytevector-u8-ref key 0) 0))
+       (cons (mvcc-byte NS-KEY) ns-end))                          ; all-keys
+      ((range-end-to-eof? range-end)
+       (cons (key-cf-prefix key) ns-end))                         ; to-eof
+      (else
+       (cons (key-cf-prefix key) (key-cf-prefix range-end))))))   ; half-open [K, rangeEnd)
 
 ; ---------------------------------------------------------------------------
 ; REV-CF key:  NS-REV || rev16  (PLAIN, ascending — Watch replays oldest->newest)
@@ -400,26 +507,25 @@
   ; DELETE (rangeEnd unset) targets exactly K — resolve it with one mvcc-get-latest
   ; point seek (O(log n)) instead of kv-scanning the WHOLE NS-KEY namespace
   ; (O(total keys)). A live K => (list K); a tombstoned/absent K => '(). This is
-  ; etcd's common single-key Delete; true ranges still scan (the KEY-CF sorts by
-  ; (lenK,K) so different-length keys in a range aren't contiguous — a bounded
-  ; range scan needs a key-ordered secondary index, tracked separately).
+  ; etcd's common single-key Delete.
   (if (range-end-unset? rangeEnd)
       (if (mvcc-get-latest ctx K) (list K) '())
-  ; collect distinct user-keys present in NS-KEY (any version), then filter to range
-  ; + liveness.  We decode the user-key out of each NS-KEY composite key:
-  ;   0x01 || u64be(lenK) || K || INV(rev16)
+  ; cw-zf7: true ranges — the KEY-CF re-key (see the block comment above enc-key)
+  ; sorts rows user-key-ascending, so [K, rangeEnd) is a bounded kv-scan-range,
+  ; not a whole-namespace scan.  We decode the user-key out of each NS-KEY
+  ; composite key: 0x01 || esc(K) || TERM(0x00 0x00) || INV(rev16).
   ; EXP9 (cw-aka): O(n) consecutive-grouping instead of the old O(n^2) `(member uk
-  ; seen)` list dedup. KEY-CF sorts by (lenK, K, INV-rev), so ALL versions of a
+  ; seen)` list dedup. KEY-CF sorts by (K, INV-rev), so ALL versions of a
   ; user-key are CONSECUTIVE — track the previous uk to skip its older versions
   ; without a membership scan. The old quadratic dedup over ~150k keys (a range
   ; DeleteRange, e.g. check perf cleanup) was ~n^2 ops and timed out; this is linear.
-  (let ((rows (kv-scan ctx (mvcc-byte NS-KEY))))
+  (let* ((bounds (key-cf-row-bounds K rangeEnd))
+         (rows   (kv-scan-range ctx (car bounds) (cdr bounds))))
     (let loop ((rs rows) (prev-uk #f) (out '()))
       (if (null? rs)
           (reverse out)
           (let* ((fk   (caar rs))
-                 (lenK (bytes->u64 fk 1))
-                 (uk   (subbv fk 9 (+ 9 lenK))))
+                 (uk   (key-cf-decode-user-key fk)))
             (cond
               ((and prev-uk (equal? uk prev-uk)) (loop (cdr rs) prev-uk out)) ; older version of same key
               ((not (in-range? uk K rangeEnd)) (loop (cdr rs) uk out))
@@ -533,37 +639,24 @@
     ; normal half-open [key, range-end)
     (else (and (not (bv<? uk key)) (bv<? uk range-end)))))
 
-; prefix-range-end: increment the last non-0xFF byte to produce the exclusive
-; upper bound for a prefix scan.  Returns #f if all bytes are 0xFF (overflow =>
-; treat as to-eof, but that can't happen for any real key).
-(define (prefix-range-end prefix)
-  (let* ((n   (bytevector-length prefix))
-         (out (subbv prefix 0 n)))
-    (let loop ((i (- n 1)))
-      (cond
-        ((< i 0) #f)   ; all 0xFF — return #f (caller treats as to-eof)
-        ((< (bytevector-u8-ref out i) #xFF)
-         (bytevector-u8-set! out i (+ (bytevector-u8-ref out i) 1))
-         ; zero out bytes after i
-         (let clr ((j (+ i 1)))
-           (if (< j n) (begin (bytevector-u8-set! out j 0) (clr (+ j 1)))))
-         out)
-        (else (loop (- i 1)))))))
+; (prefix-range-end is defined earlier, alongside key-cf-row-bounds, since
+;  key-cf-row-bounds itself calls it.)
 
 ; ---- decode user-key from a KEY-CF composite key ----
-;   composite: 0x01 || u64be(lenK) || K || INV(rev16)
-;   user-key lives at bytes [9, 9+lenK)
+;   composite: 0x01 || esc(K) || TERM(0x00 0x00) || INV(rev16)
+;   the escaped-key run is bytes [1, term); un-escape to recover K.
 (define (key-cf-decode-user-key fk)
-  (let ((lenK (bytes->u64 fk 1)))
-    (subbv fk 9 (+ 9 lenK))))
+  (let ((term (key-cf-find-term fk 1)))
+    (key-cf-unescape (subbv fk 1 term))))
 
 ; ---- decode the INV(rev16) back to the main revision ----
-;   the inv16 bytes are at offset 9+lenK; un-invert then read the main u64be.
+;   the inv16 bytes are the 16 bytes right after the TERM(0x00 0x00) pair.
 (define (key-cf-decode-main-rev fk)
-  (let* ((lenK   (bytes->u64 fk 1))
-         (inv-bv (subbv fk (+ 9 lenK) (+ 9 lenK 16)))
-         (plain  (inv16 inv-bv)))      ; inv16 is its own inverse (XOR 0xFF)
-    (bytes->u64 plain 0)))             ; high 8 bytes = main
+  (let* ((term    (key-cf-find-term fk 1))
+         (inv-off (+ term 2))
+         (inv-bv  (subbv fk inv-off (+ inv-off 16)))
+         (plain   (inv16 inv-bv)))    ; inv16 is its own inverse (XOR 0xFF)
+    (bytes->u64 plain 0)))            ; high 8 bytes = main
 
 ; ---- in-memory sort of result pairs ((uk . rec) ...) ----
 
@@ -603,9 +696,14 @@
       (let ((halves (split lst)))
         (merge (isort (car halves) less?) (isort (cdr halves) less?)))))
 
-; etcd's Range contract: results are KEY-ASCENDING even with sort NONE (the
-; on-disk KEY-CF layout is length-prefixed, so raw scan order is length-major —
-; k8s apiserver pagination/digest checks broke on this; found on the k3s run).
+; etcd's Range contract: results are KEY-ASCENDING even with sort NONE.  Before
+; cw-zf7's re-key the on-disk KEY-CF layout was length-prefixed (raw scan order
+; length-major, not key order — k8s apiserver pagination/digest checks broke on
+; this, found on the k3s run), so this re-sort was load-bearing for correctness.
+; The re-key makes raw scan order ALREADY key-ascending, but this stays: it's
+; O(n log n) on the now-small per-request RESULT set (not the whole namespace),
+; and keeping one code path for 'none is simpler than proving every mvcc-range
+; caller can rely on scan order (in-flight compaction/GC ordering, etc).
 (define (range-sort items order target)
   (if (eq? order 'none)
       (isort items (lambda (a b) (bv<? (car a) (car b))))
@@ -637,13 +735,12 @@
     (if (and (not (= req-rev 0)) (< req-rev compact-rev))
         (cons 'err-compacted compact-rev)
         ; EXP8 (cw-709): SINGLE-KEY fast path. etcd's most common read is a point
-        ; GET (range-end unset). The general path below kv-scans the WHOLE NS-KEY
-        ; namespace and is O(total keys) per read — catastrophic at scale and the
-        ; cause of the read-hang (cw-b7f), since kv-scan over a sparse prefix also
-        ; trips the cs-store iterator bug (cs-s9i). A point read uses mvcc-get-latest
-        ; (one O(log n) seek), identical visibility semantics (newest version
-        ; <= at-rev, tombstone => absent). Only taken when NO create/mod-rev filters
-        ; apply (those need the group scan); otherwise fall through.
+        ; GET (range-end unset). This uses mvcc-get-latest (one O(log n) seek),
+        ; identical visibility semantics (newest version <= at-rev, tombstone =>
+        ; absent) — cheaper than even the bounded group scan below. Only taken
+        ; when NO create/mod-rev filters apply (those need the group scan);
+        ; otherwise fall through to the general path (cw-zf7: now row-bounded,
+        ; see key-cf-row-bounds — no longer a whole-namespace scan either way).
         (if (and (range-end-unset? range-end)
                  (= min-cr 0) (= max-cr 0) (= min-mr 0) (= max-mr 0))
             (let ((rec (if (= req-rev 0)
@@ -662,8 +759,15 @@
                                                       (vector-ref rec 4)   ; lease
                                                       (make-bytevector 0 0)) ; blank value
                                               rec)))))))
-        ; -- scan NS-KEY namespace forward, group by user-key, pick visible version --
-        (let ((rows (kv-scan ctx (mvcc-byte NS-KEY))))
+        ; -- scan the [key,range-end) row bounds forward, group by user-key, pick
+        ; visible version.  cw-zf7: key-cf-row-bounds turns the request's
+        ; (key, range-end) into a KEY-CF row range, so this is a BOUNDED
+        ; kv-scan-range over exactly the requested keys' version groups, not the
+        ; whole NS-KEY namespace (the pre-re-key general path had no choice but
+        ; to scan everything, since a length-major layout can't express a
+        ; user-key range as row bounds).
+        (let* ((bounds (key-cf-row-bounds key range-end))
+               (rows   (kv-scan-range ctx (car bounds) (cdr bounds))))
           ; Iterate all KEY-CF rows in on-disk order.  Rows are ordered by
           ; user-key (ascending) then by INV(rev) (newest-first within key).
           ; We group consecutive rows sharing the same user-key.

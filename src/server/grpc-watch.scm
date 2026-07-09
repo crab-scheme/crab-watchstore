@@ -236,11 +236,31 @@
   (define last-rev (car init-rt))
 
   ; encode + push one wr-sexp frame; #f return = client hung up.
-  (define (emit-wr! wr-sexp)
-    (let ((hrev (cadr wr-sexp)))                ; cw-l5h: track the high-water global rev
-      (if (> hrev last-rev) (set! last-rev hrev)))
-    (grpc-stream-send! h (pb-encode WatchResponse-schema
-                                    (wg-wr->watchresponse wr-sexp cluster-id member-id cached-term))))
+  ;
+  ; cw-xq9: watch.scm's canceled-response ALWAYS carries header-rev=0 (documented
+  ; there as "header-rev unknown to the registry here -> 0; .14 fills the live
+  ; current-rev when it owns the stream") -- but nothing ever did that fill-in, so
+  ; every ErrCompacted cancellation (watch-check-compaction! mid-stream, or
+  ; watch-cancel!'s ack) reached the client with Header.Revision=0. Under k8s 1.36's
+  ; ConsistentListFromCache (GA+locked), a reflector recovering from ErrCompacted
+  ; relists from ITS OWN watch cache rather than fresh storage -- if that cache's
+  ; tracked revision is itself behind (e.g. it hasn't seen a fresh progress/event in
+  ; a while) and our cancellation gives it no real revision to jump to, there is no
+  ; way to escape: List-from-stale-cache returns a stale RV, Watch resumes below the
+  ; compaction floor, ErrCompacted again -- forever (matches the observed 100+
+  ; repeated "required revision has been compacted" on one frozen resource while the
+  ; store climbed far past it). Patch a REAL current revision onto any 0-header
+  ; canceled/compacted frame via a bounded fresh cur-rev round-trip -- rare (only on
+  ; cancel/compaction), never on the hot event-delivery path.
+  (define (emit-wr! wr-sexp0)
+    (let* ((canceled? (list-ref wr-sexp0 3))
+           (wr-sexp (if (and canceled? (= (cadr wr-sexp0) 0))
+                        (cons (car wr-sexp0) (cons (car (rev+term)) (cddr wr-sexp0)))
+                        wr-sexp0))
+           (hrev (cadr wr-sexp)))                ; cw-l5h: track the high-water global rev
+      (if (> hrev last-rev) (set! last-rev hrev))
+      (grpc-stream-send! h (pb-encode WatchResponse-schema
+                                      (wg-wr->watchresponse wr-sexp cluster-id member-id cached-term)))))
 
   ; ---- WatchCreate: wire->internal start-rev, register at the shard, ack ----
   (define (do-create create-req)

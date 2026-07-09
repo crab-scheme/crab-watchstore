@@ -138,6 +138,41 @@ collision (persisted boot epoch in bids).
 Remaining (tracked): Q10 bandit tuning (cw-fbb, stretch), Q11 membership
 parity (cw-2w6, deferred; quepaxa groups refuse member-* mutations).
 
+## Real Kubernetes on QuePaxa (2026-07-09)
+
+k3s **v1.31.12** with `--datastore-endpoint` = the 5-node 2-region quepaxa
+store: **full convergence in ~50s** — node Ready, coredns/local-path/
+metrics-server pods Running, deployments/scheduling/watches all through
+crab-watchstore. The cluster survived a coordinator SIGKILL and a full store
+rolling-restart (all state durable, k3s reattached and re-converged).
+k8s **v1.36** does NOT converge (apiserver informer-sync never completes;
+watch-cache delegator/WatchList wants stricter progress semantics — tracked).
+
+Getting there found four real bugs no conformance suite had caught
+(the first three fixed on this branch, suites green both engines):
+1. fwd-reply relay dropped ASYNC waiters — all follower-forwarded writes
+   hung in real multi-node deployments (cw-1c3).
+2. Coordinator-gated leases — real etcd serves Lease RPCs on any member;
+   kube bounced off `not leader` 4/5 of the time. Leases are now fully
+   leaderless (keepalive rides consensus as LEASE-KA).
+3. Range results were length-major, not key-ascending (length-prefixed
+   KEY-CF layout + trust-the-scan) — broke apiserver pagination (limit
+   silently skipped keys) and 1.36 cache digest checks.
+4. **The scale ceiling**: every non-point Range kv-scans the entire
+   keyspace history — LIST-all 956ms @500 configmaps → 11.7s @2000;
+   at ~4.5k revisions a queued lin GET took 34s, and a kube relist storm
+   after a kill saturates the 32-worker pool into node-wide starvation
+   (presents as a cluster-wide read deadlock; engine exonerated by
+   test/quepaxa-read-failover.scm). Fix = KEY-CF re-key so user-key
+   ranges bound the scan (tracked, P1).
+
+**Verdict:** multi-region etcd-for-Kubernetes on quepaxa is real at small
+scale — control plane converges, pods run, writes keep flowing through
+coordinator death with zero election churn. Scale today is bounded by the
+read path, not consensus: ~1–2k objects / ~5k revisions before kube's
+list-heavy patterns collapse it. The consensus layer never lost or reordered
+anything under any of it.
+
 ## Real-AWS 2-region A/B (2026-07-09) — cw-7e5 leg completed
 
 5-node cluster (n1–n3 us-east-2, n4–n5 us-west-2, real ~50–70ms inter-region

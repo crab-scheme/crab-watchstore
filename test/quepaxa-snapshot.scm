@@ -119,4 +119,40 @@
     (check "read completed without coordinator" '(dr) tags)
     (check "write visible" '(dw) (qp-sm (qcl-get c 2)))))
 
+; ============================================================
+(section "restart: anti-entropy catch-up + boot-epoch bid uniqueness (WAN-soak bugs)")
+(let* ((c (qcl-make '(1 2 3) '()))
+       ; node 3 does some writes in boot 1 (bids (3 0 1), (3 0 2) with default boot 0)
+       (c (qdrive c 3 (lambda (st) (qp-propose st 'w1)) '()))
+       (c (qdrive c 3 (lambda (st) (qp-propose st 'w2)) '()))
+       (p3 (qp-applied (qcl-get c 3)))
+       (dead '(3))
+       ; cluster moves on while 3 is dead
+       (c (qdrive c 1 (lambda (st) (qp-propose st 'x1)) dead))
+       (c (qdrive c 1 (lambda (st) (qp-propose st 'x2)) dead))
+       ; 3 "restarts": fresh engine, applied restored from its store, boot BUMPED
+       (sm3 (qp-take-n (qp-sm (qcl-get c 1)) p3))
+       (n3 (qp-install-snapshot
+            (make-qp 3 '(1 2 3) test-apply '() '((boot . 1))) p3 sm3 '()))
+       (c (qcl-set c 3 n3)))
+  (check "restarted node is behind" #t (< (qp-applied (qcl-get c 3))
+                                          (qp-applied (qcl-get c 1))))
+  ; idle anti-entropy probes fire after QP-AE-TICKS ticks with NO local gap signal
+  (let loop ((i 0) (c c))
+    (if (< i 20)
+        (loop (+ i 1) (qtick-all c '()))
+        (begin
+          (check "restarted node caught up via anti-entropy fetch"
+                 (qp-applied (qcl-get c 1)) (qp-applied (qcl-get c 3)))
+          (check "histories agree" (qp-sm (qcl-get c 1)) (qp-sm (qcl-get c 3)))
+          ; boot-epoch: 3's fresh seq would repeat pre-crash bids without the
+          ; boot field — peers' dedup window must NOT skip the new write
+          (let* ((c (qdrive c 3 (lambda (st) (qp-propose st 'after-restart)) '()))
+                 (c (qtick-all c '())) (c (qtick-all c '())))
+            (check "post-restart write applies everywhere (no bid collision)"
+                   #t (and (memv 'after-restart (qp-sm (qcl-get c 1)))
+                           (memv 'after-restart (qp-sm (qcl-get c 2)))
+                           (memv 'after-restart (qp-sm (qcl-get c 3))) #t))
+            (check "final agreement" (qp-sm (qcl-get c 1)) (qp-sm (qcl-get c 2))))))))
+
 (done!)

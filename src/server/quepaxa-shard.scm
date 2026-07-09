@@ -258,14 +258,26 @@
     ; propose a client batch: register waiters under the NEXT bid the engine
     ; will assign ((id . seq+1)) — qp-propose-batch allocates exactly one.
     (define (propose-client! st items)          ; items: ((conn . cmd) ...)
-      (let ((bid (list node-name (+ 1 (qp-nget st 'seq)))))
+      (let ((bid (qp-next-bid st)))
         (set! pending-bids (cons (cons bid (map car items)) pending-bids))
         (engine! st (lambda (s) (qp-propose-batch s (map cdr items))))))
 
+    ; boot epoch: persisted, strictly increasing per restart (bids embed it so
+    ; a restart's fresh seq can never collide with pre-crash bids).
+    (define QP-BOOT-KEY (string->utf8 "_qp_boot"))   ; plain key, like _raft_applied
+    (define (persist-boot! n)
+      (kv-put! ctx QP-BOOT-KEY (u64->bytes n))
+      (ctx-flush! ctx))
+    (define boot-epoch
+      (let* ((v (kv-get ctx QP-BOOT-KEY))
+             (nu (+ 1 (if (and v (>= (bytevector-length v) 8)) (bytes->u64 v 0) 0))))
+        (persist-boot! nu)
+        nu))
     (let* ((loaded (ctx-load-applied ctx))
            (p (car loaded))
            (st0 (make-qp node-name voters apply-cmd! 0
                          (list (cons 'coord coord) (cons 'hedge hedge-ticks)
+                               (cons 'boot boot-epoch)
                                (cons 'seed (+ 1 (qp-index-of node-name voters))))))
            (st0 (if (> p 0) (qp-install-snapshot st0 p 0 '()) st0)))
       (publish! st0)
@@ -527,6 +539,7 @@
                     (for-each (lambda (kv) (kv-put! ctx (car kv) (cdr kv))) rows)
                     (set-shard-ctx-crev! ctx -1)
                     (ctx-save-applied! ctx sbase 0)
+                    (persist-boot! boot-epoch)   ; the wipe adopted the SENDER's counter
                     (ctx-flush! ctx)
                     (set! acc '())                 ; installed state supersedes
                     (if (> (reg-count watch-reg) 0)

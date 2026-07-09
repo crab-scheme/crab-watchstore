@@ -122,6 +122,12 @@
           (cons 'hi (getopt 'hi 1000000))
           (cons 'coord (getopt 'coord (car ids)))
           (cons 'hedge (getopt 'hedge 3))
+          ; boot epoch: MUST be strictly increasing across restarts of the same
+          ; node (the driver persists it). It is part of every bid, so a
+          ; restarted node's fresh seq counter can never collide with its
+          ; pre-crash bids — a collision makes peers' exactly-once dedup window
+          ; silently SKIP applying the new batch (found by the WAN kill soak).
+          (cons 'boot (getopt 'boot 0))
           (cons 'apply apply-fn) (cons 'sm sm0)
           (cons 'rng (getopt 'seed 42))
           (cons 'rec '()) (cons 'props '()) (cons 'decided '())
@@ -411,7 +417,7 @@
 (define (qp-propose-batch st cmds)
   (if (null? cmds) (cons st '())
       (let* ((seq (+ 1 (qp-nget st 'seq)))
-             (bid (list (qp-nget st 'id) seq))
+             (bid (list (qp-nget st 'id) (qp-nget st 'boot) seq))
              (val (list bid cmds))
              (st (qp-nset st 'seq seq)))
         (if (or (qp-coord? st) (<= (qp-nget st 'hedge) 0))
@@ -428,14 +434,19 @@
 (define (qp-on-decd st from msg)
   (qp-decide st (list-ref msg 1) (list-ref msg 2) #f))
 
+(define QP-FETCH-SPAN 32)   ; decided slots served per fetch (rejoin catch-up)
 (define (qp-on-fetch st from msg)
-  (let* ((slot (list-ref msg 1))
-         (dv (qp-sget (qp-nget st 'decided) slot)))
-    (cond
-      ((<= slot (qp-nget st 'base))
-       (cons st (list (cons from (list 'snapo (qp-nget st 'base))))))
-      (dv (cons st (list (cons from (list 'decd slot dv)))))
-      (else (cons st '())))))
+  (let ((slot (list-ref msg 1)))
+    (if (<= slot (qp-nget st 'base))
+        (cons st (list (cons from (list 'snapo (qp-nget st 'base)))))
+        ; reply a contiguous RANGE of decided slots from `slot` so a rejoining
+        ; node catches up in one round instead of one-slot-per-tick.
+        (let loop ((i slot) (outs '()))
+          (let ((dv (and (< (- i slot) QP-FETCH-SPAN)
+                         (qp-sget (qp-nget st 'decided) i))))
+            (if dv
+                (loop (+ i 1) (cons (cons from (list 'decd i dv)) outs))
+                (cons st (reverse outs))))))))
 
 ; a peer told us the slot we need is below its compaction floor: surface the
 ; snapshot need to the driver (it ships/installs the store snapshot, then
@@ -463,7 +474,7 @@
 ;      current store rev. ----
 (define (qp-read st tag)
   (let* ((seq (+ 1 (qp-nget st 'seq)))
-         (bid (list (qp-nget st 'id) seq))
+         (bid (list (qp-nget st 'id) (qp-nget st 'boot) seq))
          (val (list bid '()))
          (st (qp-nset st 'seq seq))
          (st (qp-nset st 'reads (cons (cons bid tag) (qp-nget st 'reads)))))
@@ -478,9 +489,13 @@
 (define (qp-take-reads st)
   (cons (reverse (qp-nget st 'rdone)) (qp-nset st 'rdone '())))
 
-; -> (((bid . ncmds) ...) oldest-first . st') — batches applied since last take
+ ; -> (((bid . ncmds) ...) oldest-first . st') — batches applied since last take
 (define (qp-take-applied st)
   (cons (reverse (qp-nget st 'adone)) (qp-nset st 'adone '())))
+
+; the bid the NEXT qp-propose-batch/qp-read on this node will use
+(define (qp-next-bid st)
+  (list (qp-nget st 'id) (qp-nget st 'boot) (+ 1 (qp-nget st 'seq))))
 
 ; ---- tick: hedge countdowns, retransmission, gap fill. No timeouts: none of
 ;      this affects safety, and liveness needs only that ticks keep coming. ----
@@ -512,6 +527,7 @@
                                                     (list 'esp slot s (cdr (assv (car pr) pis))))
                                               acc)))))))))))
 
+(define QP-AE-TICKS 8)      ; idle anti-entropy probe period (rejoin catch-up)
 (define (qp-tick-gap st)
   (let ((next (+ 1 (qp-nget st 'applied))))
     (if (and (< next (qp-nget st 'next-slot))
@@ -525,7 +541,16 @@
             ((>= g QP-GAP-NOOP)
              (qp-start-noop-at (qp-nset st 'gapt 0) next))
             (else (cons st '()))))
-        (cons (qp-nset st 'gapt 0) '()))))
+        ; no LOCAL evidence of a gap — but a restarted node (applied=P,
+        ; next-slot=P+1) can be silently behind a cluster that moved on while
+        ; it was dead. Probe peers periodically; they answer decd only if they
+        ; actually decided our next slot (else silence). Found by the WAN kill
+        ; soak: the restarted coordinator served stale reads forever.
+        (let ((g (+ 1 (qp-nget st 'gapt))))
+          (if (>= g QP-AE-TICKS)
+              (cons (qp-nset st 'gapt 0)
+                    (map (lambda (p) (cons p (list 'fetch next))) (qp-nget st 'peers)))
+              (cons (qp-nset st 'gapt g) '()))))))
 
 (define (qp-tick st)
   (let* ((r1 (qp-tick-holds st))

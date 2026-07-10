@@ -69,6 +69,15 @@
     (define SNAP-CHUNK-ROWS 200)
     (define PROPOSE-BATCH-CAP 64)
 
+    ; CWS_PROF=1: per-write hop profiling (cw-xq9). Logs one line per acked batch:
+    ;   PROF <shard> n=<batch> wait=<submit->propose ms> cons=<propose->ack ms> flush=<last fsync ms>
+    ; wait covers grpc-worker send -> shard dequeue+batch; cons covers the full
+    ; consensus round (mesh hops + peer processing + apply + fsync-before-ack).
+    (define prof? (equal? (get-environment-variable "CWS_PROF") "1"))
+    (define prof-pending '())                ; ((bid tpropose tsubmit n) ...)
+    (define prof-flush-ms 0)
+    (define (prof-ms a b) (exact (round (* 1000 (- a b)))))
+
     (define new-coord #f)                    ; set by a QP-COORD apply; post! adopts
     (define (apply-cmd! sm cmd)
       (if (null? cmd)
@@ -148,6 +157,24 @@
                                               (cond ((null? l) '())
                                                     ((equal? (caar l) bid) (cdr l))
                                                     (else (cons (car l) (del (cdr l))))))))
+                              (if prof?
+                                  (let ((pe (assoc bid prof-pending)))
+                                    (if pe
+                                        (let ((now (current-second)))
+                                          (display (string-append
+                                            "PROF " (qk)
+                                            " n=" (number->string (cadddr pe))
+                                            " wait=" (if (caddr pe)
+                                                         (number->string (prof-ms (cadr pe) (caddr pe)))
+                                                         "-")
+                                            " cons=" (number->string (prof-ms now (cadr pe)))
+                                            " flush=" (number->string prof-flush-ms)))
+                                          (newline)
+                                          (set! prof-pending
+                                                (let del2 ((l prof-pending))
+                                                  (cond ((null? l) '())
+                                                        ((equal? (caar l) bid) (cdr l))
+                                                        (else (cons (car l) (del2 (cdr l)))))))))))
                               (walk (cdr d) rs))))))))
           st)))
 
@@ -228,7 +255,12 @@
           (ctx-save-applied! ctx (qp-applied st) 0))
       (if new-coord
           (begin (set! st (qp-set-coord st new-coord)) (set! new-coord #f)))
-      (if (ctx-dirty? ctx) (ctx-flush! ctx))     ; durable BEFORE any ack
+      (if (ctx-dirty? ctx)
+          (if prof?
+              (let ((t0 (current-second)))
+                (ctx-flush! ctx)
+                (set! prof-flush-ms (prof-ms (current-second) t0)))
+              (ctx-flush! ctx)))                 ; durable BEFORE any ack
       (if (>= (qp-applied st) next-compact)
           (begin
             (set! next-compact (+ (qp-applied st) QP-COMPACT-EVERY))
@@ -284,6 +316,17 @@
     (define (propose-client! st items)          ; items: ((conn . cmd) ...)
       (let ((bid (qp-next-bid st)))
         (set! pending-bids (cons (cons bid (map car items)) pending-bids))
+        (if prof?
+            (let ((tsub (let scan ((l items) (best #f))
+                          (if (null? l) best
+                              (let ((c (caar l)))
+                                (scan (cdr l)
+                                      (if (and (pair? c) (eq? (car c) 'async)
+                                               (>= (length c) 4)
+                                               (or (not best) (< (cadddr c) best)))
+                                          (cadddr c) best)))))))
+              (set! prof-pending
+                    (cons (list bid (current-second) tsub (length items)) prof-pending))))
         (engine! st (lambda (s) (qp-propose-batch s (map cdr items))))))
 
     ; boot epoch: persisted, strictly increasing per restart (bids embed it so

@@ -997,7 +997,9 @@
             (drain-until-room!)
             (set! inflight (+ inflight 1))
             ; cw-ivt: route the async PUT to the key's group.
-            (send (shard-pid-for key) (cons (list 'async (self) h)
+            ; 4th element = submit timestamp for CWS_PROF hop profiling (consumers
+            ; only read elements 1-3; harmless when profiling is off).
+            (send (shard-pid-for key) (cons (list 'async (self) h (current-second))
                                   (list (string->utf8 "PUT") key value (int->bytes lease))))
             'async)
           (handle-put-sync h key value lease want-prev))))

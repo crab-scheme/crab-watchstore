@@ -331,13 +331,20 @@
             ; RAISES at the shard). We just enter merge mode + ack; events arrive on our mailbox.
             (set! xcreated-pending (list cw snap-rev #t #f "" 0 '())))
           ; ---- single-shard (single-group, or a single-key watch) — original path ----
+          ; cw-xq9 root-cause fix (2): a 'client-msg arriving DURING this await is a
+          ; PIPELINED WatchRequest — the compaction-driven re-watch storm sends many
+          ; cancels+creates back-to-back on the one apiserver stream. The old else
+          ; branch silently DROPPED them: a dropped create never acks, its reflector
+          ; waits forever, and that resource's cache freezes at its old RV (the
+          ; post-bootstrap "resourceVersion ... is too old" lockup). Defer + replay
+          ; after the ack, exactly like do-progress (round 5).
           (begin
             (send shard-pid (list 'watch-register (self) spec))
-            (let await ((buffered '()))
+            (let await ((buffered '()) (deferred '()))
               (let ((r (raw-receive)))
                 (cond
-                  ((not (pair? r)) (await buffered))
-                  ((eq? (car r) 'watch-response) (await (cons (cadr r) buffered)))
+                  ((not (pair? r)) (await buffered deferred))
+                  ((eq? (car r) 'watch-response) (await (cons (cadr r) buffered) deferred))
                   ((eq? (car r) 'watch-created)
                    ; cw-l5h: shape is now (watch-created WID CUR-REV). Use the shard's accurate
                    ; current-rev for the created-ack header, NOT the pre-register snap-rev — that
@@ -348,27 +355,33 @@
                      (set! live-wids (cons wid live-wids))
                      (if progress? (set! any-progress? #t))
                      (emit-wr! (list wid crev #t #f "" 0 '()))
-                     (for-each emit-wr! (reverse buffered))))
+                     (for-each emit-wr! (reverse buffered))
+                     (for-each handle-deferred! (reverse deferred))))
                   ((eq? (car r) 'watch-compacted)
                    (emit-wr! (list (if client-wid client-wid 0) 0 #f #t
-                                   "mvcc: required revision has been compacted" (cdr r) '())))
+                                   "mvcc: required revision has been compacted" (cdr r) '()))
+                   (for-each handle-deferred! (reverse deferred)))
                   ((eq? (car r) 'watch-not-leader)
                    (grpc-stream-close! h WG-UNAVAILABLE "etcdserver: no leader"))
-                  (else (await buffered)))))))))
+                  (else (await buffered (cons r deferred))))))))))
 
   ; ---- WatchCancel: deregister at the shard (it emits the canceled frame) ----
   (define (do-cancel wid)
     (send shard-pid (list 'watch-cancel (self) wid))
-    (let await ()
+    ; cw-xq9 root-cause fix (2): defer + replay pipelined 'client-msg frames that
+    ; arrive during the cancel ack await (the old else silently dropped them — see
+    ; do-create). The re-watch storm interleaves cancels with creates.
+    (let await ((deferred '()))
       (let ((r (raw-receive)))
         (cond
-          ((not (pair? r)) (await))
-          ((eq? (car r) 'watch-response) (emit-wr! (cadr r)) (await))
+          ((not (pair? r)) (await deferred))
+          ((eq? (car r) 'watch-response) (emit-wr! (cadr r)) (await deferred))
           ((eq? (car r) 'watch-canceled)
-           (set! live-wids (filter (lambda (w) (not (eqv? w wid))) live-wids)))
+           (set! live-wids (filter (lambda (w) (not (eqv? w wid))) live-wids))
+           (for-each handle-deferred! (reverse deferred)))
           ((eq? (car r) 'watch-not-leader)
            (grpc-stream-close! h WG-UNAVAILABLE "etcdserver: no leader"))
-          (else (await))))))
+          (else (await (cons r deferred)))))))
 
   ; progress_request (§6, cw-5w8): etcd RequestProgress. The kube-apiserver watch
   ; cache sends this to confirm a watch is caught up to its LIST revision; for an

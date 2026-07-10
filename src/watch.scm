@@ -489,23 +489,29 @@
 ;   (watch-check-compaction! reg ctx)  -> list of canceled watch_ids
 ;
 ; Call this from WHERE a Compact is applied (.8/.14 wiring — noted, NOT wired here).
-; A compaction GC's REV-CF events <= compact-rev, so any watcher still BELOW that
-; floor (delivered_rev < compact-rev) can no longer be served its remaining history;
-; cancel it with compact_revision set so the client re-establishes above the floor.
-; A synced watcher is by definition at delivered_rev == current-rev >= compact-rev,
-; so it is never affected.
+;
+; cw-xq9 ROOT CAUSE (post-bootstrap k8s watch freeze): this used to CANCEL any
+; watcher with delivered_rev < compact-rev, reasoning "a synced watcher is by
+; definition at delivered_rev == current-rev".  That premise is FALSE: delivered_rev
+; only advances when an event MATCHES that watcher's range/filters
+; (watch-dispatch-live!), so a synced watcher on a QUIET key range (k8s
+; serviceaccounts/endpoints/... between changes) sits at its registration rev
+; forever — and every k3s 5-minute compaction mass-ErrCompacted ALL of them,
+; triggering an apiserver-wide re-watch storm each cycle.  Real etcd never
+; compaction-cancels a synced watcher; ErrCompacted is only for a watcher that
+; still NEEDS compacted history (an unsynced catch-up).  Every watcher in this
+; registry is synced by construction (registration replays + promotes
+; synchronously before it is added), so live dispatch never reads history and NO
+; registered watcher is harmed by compaction.  Instead of canceling, advance the
+; de-dup floor to compact-1 (events at rev >= compact still deliver) and cancel
+; nothing.  Registration-time resume below the floor still errors via the
+; register path's own compaction check.
 (define (watch-check-compaction! reg ctx)
   (let ((compact (mvcc-compact-rev ctx)))
-    (if (= compact 0)
-        '()
-        (let loop ((ws (reg-watchers reg)) (canceled '()))
-          (if (null? ws)
-              (reverse canceled)
-              (let ((w (car ws)))
-                (if (< (w-delivered-rev w) compact)
-                    (begin
-                      (watch-cancel! reg (w-watch-id w)
-                                     "mvcc: required revision has been compacted"
-                                     compact)
-                      (loop (cdr ws) (cons (w-watch-id w) canceled)))
-                    (loop (cdr ws) canceled))))))))
+    (if (> compact 0)
+        (for-each
+         (lambda (w)
+           (if (< (w-delivered-rev w) (- compact 1))
+               (set-w-delivered-rev! w (- compact 1))))
+         (reg-watchers reg)))
+    '()))

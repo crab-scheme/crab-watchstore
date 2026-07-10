@@ -253,20 +253,24 @@
 (mvcc-apply UCTX (list (b "PUT") (b "zz") (b "v5")))
 (check "§3 current-rev=5 after v5" 5 (mvcc-current-rev UCTX))
 
-; Apply COMPACT to rev 5 through the apply-fn wiring (same pipeline as shard-actor):
-;   mvcc-apply sets compact-rev=5, then watch-check-compaction! detects
-;   delivered_rev(3) < compact-rev(5) and cancels the watcher.
+; Apply COMPACT to rev 5 through the apply-fn wiring (same pipeline as shard-actor).
+; cw-xq9 root-cause fix: watch-check-compaction! no longer CANCELS a registered
+; (synced-by-construction) watcher below the floor — that mass-ErrCompacted every
+; quiet k8s watch at each 5-min compaction and froze the apiserver caches. It now
+; advances the de-dup floor to compact-1 and cancels nothing; live delivery continues.
 (let ((r (mvcc-apply UCTX (list (b "COMPACT") (b "5")))))
   (check "§3 compact to 5 ok" (cons 'ok 5) r))
 (let ((canceled (watch-check-compaction! reg3 UCTX)))
-  (check "§3 watch-check-compaction! (apply-fn COMPACT path) canceled the watcher"
-         (list wid3) canceled))
-(check "§3 registry empty after compaction cancel" 0 (reg-count reg3))
+  (check "§3 watch-check-compaction! cancels NOTHING (cw-xq9)" '() canceled))
+(check "§3 watcher still registered after compaction" 1 (reg-count reg3))
+(check "§3 lagging delivered_rev advanced to compact-1"
+       4 (w-delivered-rev (reg-get reg3 wid3)))
+(check "§3 no canceled WatchResponse emitted" 0 (length (wbox-cancels box3)))
 
-(let ((cs (wbox-cancels box3)))
-  (check "§3 canceled WatchResponse reached consumer via wire bridge" 1 (length cs))
-  (check "§3 cancel compact_revision=5" 5 (wr-compact-revision (car cs)))
-  (check "§3 cancel watch_id correct" wid3 (wr-watch-id (car cs))))
+; the watcher still delivers live events past the compaction
+(set-w-synced?! (reg-get reg3 wid3) #t)
+(unit-apply! reg3 "PUT" "zz" "v6")
+(check "§3 live event after compaction still delivered" 1 (length (wbox-events box3)))
 
 ; ===========================================================================
 ; CLUSTER SECTION — §2: deeper 9-rev historical replay

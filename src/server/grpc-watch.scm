@@ -158,6 +158,7 @@
                                  ((and (pair? r) (eq? (car r) 'cur-rev-ok))
                                   (loop (+ i 1) (if m (min m (cadr r)) (cadr r))))
                                  ((and (pair? r) (eq? (car r) 'watch-response)) (xbuf! (cadr r)) (await (+ spins 1)))
+                                 ((and (pair? r) (eq? (car r) 'client-msg)) (pend! r) (await (+ spins 1)))   ; cw-xq9 fix (3)
                                  ((> spins 40) (loop (+ i 1) m))   ; hard cap: never wedge the worker (<=0.8s/shard)
                                  (else (await (+ spins 1)))))))))))) ; cw-kp0 FIX: was missing one close — the worker never loaded (parse error), so watch delivery was dead
   ; BATCH a rev-ordered list of single-event wr-sexps into ONE WatchResponse and send it.
@@ -222,17 +223,35 @@
   (define PROGRESS-INTERVAL-MS 5000)
 
   (define (ask-shard msg) (send shard-pid msg) (raw-receive))
-  ; (rev . term) read from the shard — called only when the mailbox is clean
-  ; (worker startup / start of a create, before any watcher can deliver).
+  ; cw-xq9 root-cause fix (3): pipelined WatchRequests that arrive while some
+  ; bounded await holds the mailbox are queued here (FIFO) instead of being
+  ; silently dropped, and the MAIN LOOP drains them before its next receive.
+  ; Every drop site (rev+term / do-create / do-cancel / do-progress) feeds this
+  ; one queue, so no interleaving of creates, cancels and progress requests can
+  ; lose a request — a dropped WatchCreateRequest never acks, its apiserver
+  ; reflector waits forever, and that cache freezes at its creation revision
+  ; (the "APF bootstrap ensurer timed out" / scheduler never-syncs lockups).
+  (define pending-msgs '())
+  (define (pend! r) (set! pending-msgs (append pending-msgs (list r))))
+  ; (rev . term) read from the shard — called at worker startup, at the start of
+  ; a create, and to fill a real revision onto 0-header cancel frames.
   ; BOUNDED: a bare raw-receive here hung the worker at STARTUP when the shard was mid-batch
   ; and slow to answer 'cur-rev -> the worker never reached registration (no delivery,
   ; :observed-put-events 0, the client re-establishes -> cascade). The term is cosmetic for
   ; the header; fall back to (0 . 1) on timeout and establish immediately.
+  ; cw-xq9 root-cause fix (3): the await used to DISCARD everything but its own
+  ; 'cur-rev-ok — including live 'watch-response frames for watches ALREADY
+  ; ESTABLISHED on this stream (a create arriving mid-write-burst runs this while
+  ; events are in flight -> silent EVENT GAP -> that cache is pinned forever) and
+  ; pipelined 'client-msg requests. Emit events immediately (they belong to
+  ; already-acked wids, order preserved); queue client requests for the main loop.
   (define (rev+term)
     (send shard-pid (list 'cur-rev (self)))
     (let await ((spins 0))
       (let ((r (raw-receive 100)))
         (cond ((and (pair? r) (eq? (car r) 'cur-rev-ok)) (cons (cadr r) (caddr r)))
+              ((and (pair? r) (eq? (car r) 'watch-response)) (emit-wr! (cadr r)) (await spins))
+              ((and (pair? r) (eq? (car r) 'client-msg)) (pend! r) (await spins))
               ((> spins 5) (cons 0 1))           ; shard busy -> default term, don't hang
               (else (await (+ spins 1)))))))
   (define init-rt (rev+term))
@@ -332,19 +351,21 @@
             (set! xcreated-pending (list cw snap-rev #t #f "" 0 '())))
           ; ---- single-shard (single-group, or a single-key watch) — original path ----
           ; cw-xq9 root-cause fix (2): a 'client-msg arriving DURING this await is a
-          ; PIPELINED WatchRequest — the compaction-driven re-watch storm sends many
-          ; cancels+creates back-to-back on the one apiserver stream. The old else
-          ; branch silently DROPPED them: a dropped create never acks, its reflector
-          ; waits forever, and that resource's cache freezes at its old RV (the
-          ; post-bootstrap "resourceVersion ... is too old" lockup). Defer + replay
-          ; after the ack, exactly like do-progress (round 5).
+          ; PIPELINED WatchRequest — the compaction-driven re-watch storm and the
+          ; bootstrap create burst send many cancels+creates back-to-back on the one
+          ; apiserver stream. The old else branch silently DROPPED them: a dropped
+          ; create never acks, its reflector waits forever, and that resource's cache
+          ; freezes at its old RV. Queue them (pend!); the main loop drains in order.
+          ; NOTE the buffered watch-responses here are the NEW watch's replay — they
+          ; must not be emitted before its created-ack (etcd contract), hence the
+          ; local buffer instead of immediate emit.
           (begin
             (send shard-pid (list 'watch-register (self) spec))
-            (let await ((buffered '()) (deferred '()))
+            (let await ((buffered '()))
               (let ((r (raw-receive)))
                 (cond
-                  ((not (pair? r)) (await buffered deferred))
-                  ((eq? (car r) 'watch-response) (await (cons (cadr r) buffered) deferred))
+                  ((not (pair? r)) (await buffered))
+                  ((eq? (car r) 'watch-response) (await (cons (cadr r) buffered)))
                   ((eq? (car r) 'watch-created)
                    ; cw-l5h: shape is now (watch-created WID CUR-REV). Use the shard's accurate
                    ; current-rev for the created-ack header, NOT the pre-register snap-rev — that
@@ -355,33 +376,32 @@
                      (set! live-wids (cons wid live-wids))
                      (if progress? (set! any-progress? #t))
                      (emit-wr! (list wid crev #t #f "" 0 '()))
-                     (for-each emit-wr! (reverse buffered))
-                     (for-each handle-deferred! (reverse deferred))))
+                     (for-each emit-wr! (reverse buffered))))
                   ((eq? (car r) 'watch-compacted)
                    (emit-wr! (list (if client-wid client-wid 0) 0 #f #t
-                                   "mvcc: required revision has been compacted" (cdr r) '()))
-                   (for-each handle-deferred! (reverse deferred)))
+                                   "mvcc: required revision has been compacted" (cdr r) '())))
                   ((eq? (car r) 'watch-not-leader)
                    (grpc-stream-close! h WG-UNAVAILABLE "etcdserver: no leader"))
-                  (else (await buffered (cons r deferred))))))))))
+                  ((eq? (car r) 'client-msg) (pend! r) (await buffered))
+                  (else (await buffered)))))))))
 
   ; ---- WatchCancel: deregister at the shard (it emits the canceled frame) ----
   (define (do-cancel wid)
     (send shard-pid (list 'watch-cancel (self) wid))
-    ; cw-xq9 root-cause fix (2): defer + replay pipelined 'client-msg frames that
-    ; arrive during the cancel ack await (the old else silently dropped them — see
+    ; cw-xq9 root-cause fix (2): queue pipelined 'client-msg frames that arrive
+    ; during the cancel ack await (the old else silently dropped them — see
     ; do-create). The re-watch storm interleaves cancels with creates.
-    (let await ((deferred '()))
+    (let await ()
       (let ((r (raw-receive)))
         (cond
-          ((not (pair? r)) (await deferred))
-          ((eq? (car r) 'watch-response) (emit-wr! (cadr r)) (await deferred))
+          ((not (pair? r)) (await))
+          ((eq? (car r) 'watch-response) (emit-wr! (cadr r)) (await))
           ((eq? (car r) 'watch-canceled)
-           (set! live-wids (filter (lambda (w) (not (eqv? w wid))) live-wids))
-           (for-each handle-deferred! (reverse deferred)))
+           (set! live-wids (filter (lambda (w) (not (eqv? w wid))) live-wids)))
           ((eq? (car r) 'watch-not-leader)
            (grpc-stream-close! h WG-UNAVAILABLE "etcdserver: no leader"))
-          (else (await (cons r deferred)))))))
+          ((eq? (car r) 'client-msg) (pend! r) (await))
+          (else (await))))))
 
   ; progress_request (§6, cw-5w8): etcd RequestProgress. The kube-apiserver watch
   ; cache sends this to confirm a watch is caught up to its LIST revision; for an
@@ -441,14 +461,11 @@
   ; can race in before that completes) -- the real risk is cross-shard (xshard?), whose
   ; replay/catch-up is asynchronous; gate on xsynced-once?.
   (define (stream-synced?) (or (not xshard?) xsynced-once?))
-  ; cw-xq9 round 5: replay a message that arrived DURING do-progress's await. A
-  ; 'client-msg here is a PIPELINED WatchRequest (k8s 1.36 interleaves watch
-  ; creates with RequestProgress on one stream at bootstrap); the old await
-  ; silently DROPPED it — the watch then never existed, its apiserver cache
-  ; never synced, and the APF bootstrap ensurer Fatalf'd the whole apiserver.
-  (define (handle-deferred! r)
-    (if (and (pair? r) (eq? (car r) 'client-msg))
-        (handle-client-msg (cadr r))))
+  ; cw-xq9 round 5 (now via pend!): a 'client-msg arriving DURING do-progress's
+  ; await is a PIPELINED WatchRequest (k8s 1.36 interleaves watch creates with
+  ; RequestProgress on one stream at bootstrap); the old await silently DROPPED
+  ; it — the watch then never existed, its apiserver cache never synced, and the
+  ; APF bootstrap ensurer Fatalf'd the whole apiserver. Queue for the main loop.
   (define (do-progress)
     (define (reply! rev)
       (if (> rev last-rev) (set! last-rev rev))
@@ -459,27 +476,26 @@
     (if (stream-synced?)
         (begin
           (send shard-pid (list 'cur-rev (self)))
-          (let await ((spins 0) (buffered '()) (deferred '()))
+          (let await ((spins 0) (buffered '()))
             (let ((r (raw-receive 20)))
               (cond
                 ((and (pair? r) (eq? (car r) 'cur-rev-ok))
                  (for-each emit-wr! (reverse buffered))
-                 (reply! (cadr r))
-                 (for-each handle-deferred! (reverse deferred)))
+                 (reply! (cadr r)))
                 ((and (pair? r) (eq? (car r) 'watch-response))
                  (if xshard?
-                     (begin (xbuf! (cadr r)) (await (+ spins 1) buffered deferred))
-                     (await (+ spins 1) (cons (cadr r) buffered) deferred)))
-                ((eq? r '*timeout*) (await (+ spins 1) buffered deferred))
+                     (begin (xbuf! (cadr r)) (await (+ spins 1) buffered))
+                     (await (+ spins 1) (cons (cadr r) buffered))))
+                ((eq? r '*timeout*) (await (+ spins 1) buffered))
                 ; hard cap: never wedge the worker. cw-xq9 round 4: emit NOTHING here (not a
                 ; stale-last-rev reply) -- a timed-out fresh-rev fetch means we genuinely don't
                 ; know the current revision right now; a silent skip is spec-conformant (etcd
                 ; itself sends nothing when it can't honor the progress promise) and a future
                 ; periodic tick / RequestProgress will get a real answer instead of latching a
                 ; possibly-stale one.
-                ((> spins 40) (for-each emit-wr! (reverse buffered))
-                              (for-each handle-deferred! (reverse deferred)))
-                (else (await (+ spins 1) buffered (cons r deferred))))))))) ; unsynced: no reply (etcd progressIfSync == false)
+                ((> spins 40) (for-each emit-wr! (reverse buffered)))
+                ((and (pair? r) (eq? (car r) 'client-msg)) (pend! r) (await (+ spins 1) buffered))
+                (else (await (+ spins 1) buffered))))))))   ; unsynced: no reply (etcd progressIfSync == false)
 
   (define (handle-client-msg bytes)
     (let* ((req (pb-decode WatchRequest-schema bytes))
@@ -526,22 +542,30 @@
   (handle-client-msg (grpc-request-bytes h))   ; the first WatchRequest
   (let loop ()
     (when xcreated-pending (emit-wr! xcreated-pending) (set! xcreated-pending #f))   ; deferred created ack
-    ; arm the idle timeout only on streams that requested progress_notify; others
-    ; block forever (no spurious wakeups, no progress they never asked for).
-    (let ((m (cond (xshard?      (raw-receive XSHARD-FLUSH-MS))   ; flush merged events periodically
-                   (any-progress? (raw-receive PROGRESS-INTERVAL-MS))
-                   (else (raw-receive)))))
-      (cond
-        ((eq? m '*timeout*) (if xshard? (xtick!) (do-progress)) (loop))   ; merge-flush or progress
-        ((not (pair? m)) (loop))
-        ((eq? (car m) 'client-msg)     (handle-client-msg (cadr m)) (loop))
-        ((eq? (car m) 'watch-response) (if xshard? (xbuf! (cadr m)) (emit-wr! (cadr m))) (loop))
-        ; cw-xq9: 'cur-rev-ok is now consumed entirely inside do-progress's own bounded
-        ; await loop (fresh-at-request semantics) — nothing else sends 'cur-rev without
-        ; consuming its own reply (rev+term, xmin-rev), so this main-loop branch is dead;
-        ; any stray reply just falls through to (else (loop)) and is discarded, which is safe.
-        ((eq? (car m) 'client-end)     (teardown))   ; falls out of the loop -> exit
-        (else (loop))))))
+    ; cw-xq9 root-cause fix (3): drain queued pipelined WatchRequests (pend!) in
+    ; arrival order before blocking on the mailbox — they arrived EARLIER than
+    ; anything still queued there.
+    (if (pair? pending-msgs)
+        (let ((r (car pending-msgs)))
+          (set! pending-msgs (cdr pending-msgs))
+          (handle-client-msg (cadr r))
+          (loop))
+        ; arm the idle timeout only on streams that requested progress_notify; others
+        ; block forever (no spurious wakeups, no progress they never asked for).
+        (let ((m (cond (xshard?      (raw-receive XSHARD-FLUSH-MS))   ; flush merged events periodically
+                       (any-progress? (raw-receive PROGRESS-INTERVAL-MS))
+                       (else (raw-receive)))))
+          (cond
+            ((eq? m '*timeout*) (if xshard? (xtick!) (do-progress)) (loop))   ; merge-flush or progress
+            ((not (pair? m)) (loop))
+            ((eq? (car m) 'client-msg)     (handle-client-msg (cadr m)) (loop))
+            ((eq? (car m) 'watch-response) (if xshard? (xbuf! (cadr m)) (emit-wr! (cadr m))) (loop))
+            ; cw-xq9: 'cur-rev-ok is now consumed entirely inside do-progress's own bounded
+            ; await loop (fresh-at-request semantics) — nothing else sends 'cur-rev without
+            ; consuming its own reply (rev+term, xmin-rev), so this main-loop branch is dead;
+            ; any stray reply just falls through to (else (loop)) and is discarded, which is safe.
+            ((eq? (car m) 'client-end)     (teardown))   ; falls out of the loop -> exit
+            (else (loop)))))))
 
 ; ===========================================================================
 ; LeaseKeepAlive worker — one per /etcdserverpb.Lease/LeaseKeepAlive stream

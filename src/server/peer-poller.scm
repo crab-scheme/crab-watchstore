@@ -35,9 +35,14 @@
 (define (peer-poller node-name shard-keys tick-every dial-addrs target . rest)
   (define channel (if (and (pair? rest) (number? (car rest))) (car rest) #f))
   (define heal-owner? (if channel (member "0" shard-keys) #t))
-  (define (poll-msgs)
+  ; cw-xq9: the per-group path BLOCKS (node-poll-ch-wait) up to wait-ms for
+  ; inbound traffic instead of sleep-polling — mesh hop latency becomes
+  ; delivery latency, not polling granularity. Safe: this actor is a
+  ; spawn-source-dedicated thread. The legacy all-channel path keeps the
+  ; non-blocking poll + adaptive sleep.
+  (define (poll-msgs wait-ms)
     (if channel
-        (node-poll-ch (symbol->string node-name) channel)
+        (node-poll-ch-wait (symbol->string node-name) channel wait-ms)
         (node-poll (symbol->string node-name))))
   (define (local-pid sk)
     (table-lookup 'ws-shard-pid (string-append (symbol->string node-name) ":" sk)))
@@ -90,19 +95,25 @@
   ; to drain (null? msgs); under active Raft replication msgs is non-empty and
   ; the loop stays hot, so throughput is unaffected. (Dedicated-thread actor =>
   ; sleep-ms is a real thread sleep that releases the core.)
-  ; HOP LATENCY (cw-xq9): the fixed 5ms idle sleep IS the mesh hop latency for
-  ; low-concurrency traffic — a sequential writer (k8s bootstrap) hits a sleeping
-  ; poller on EVERY consensus hop, so a 2-hop coordinator round costs ~10-13ms
-  ; and a follower-origin round ~20ms on loopback (measured, CWS_PROF). Adaptive
-  ; sleep: 1ms while traffic was seen in the last 50ms (a round is likely in
-  ; flight), back off to 5ms when genuinely idle (keeps the cw-lkq CPU fix).
+  ; HOP LATENCY (cw-xq9): sleep-polling makes the sleep granularity the mesh
+  ; hop latency for low-concurrency traffic — a sequential writer (k8s
+  ; bootstrap) hits a sleeping poller on EVERY consensus hop (measured 12.9ms
+  ; consensus round on loopback at 5ms sleeps, CWS_PROF). Per-group pollers now
+  ; BLOCK in node-poll-ch-wait until inbound traffic or the next tick deadline,
+  ; so frames route immediately and ticks stay wall-clock-paced. The legacy
+  ; all-channel path keeps the adaptive 1ms/5ms sleep.
   (let ((tick-secs (/ tick-every 1000.0)))
     (let loop ((last (current-second)) (busy 0))
-      (let ((msgs (poll-msgs)))
+      (let* ((wait-ms (if channel
+                          (let ((remain (- (+ last tick-secs) (current-second))))
+                            (if (> remain 0) (exact (ceiling (* 1000 remain))) 0))
+                          0))
+             (msgs (poll-msgs wait-ms)))
         (for-each route! msgs)
         (let ((now (current-second)))
           (cond
             ((>= (- now last) tick-secs) (tick-all!) (if heal-owner? (heal!))
              (loop now (if (pair? msgs) now busy)))
-            ((null? msgs) (sleep-ms (if (< (- now busy) 0.05) 1 5)) (loop last busy))
-            (else (loop last now))))))))
+            ((and (not channel) (null? msgs))
+             (sleep-ms (if (< (- now busy) 0.05) 1 5)) (loop last busy))
+            (else (loop last (if (pair? msgs) now busy)))))))))

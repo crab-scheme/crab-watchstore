@@ -90,12 +90,19 @@
   ; to drain (null? msgs); under active Raft replication msgs is non-empty and
   ; the loop stays hot, so throughput is unaffected. (Dedicated-thread actor =>
   ; sleep-ms is a real thread sleep that releases the core.)
+  ; HOP LATENCY (cw-xq9): the fixed 5ms idle sleep IS the mesh hop latency for
+  ; low-concurrency traffic — a sequential writer (k8s bootstrap) hits a sleeping
+  ; poller on EVERY consensus hop, so a 2-hop coordinator round costs ~10-13ms
+  ; and a follower-origin round ~20ms on loopback (measured, CWS_PROF). Adaptive
+  ; sleep: 1ms while traffic was seen in the last 50ms (a round is likely in
+  ; flight), back off to 5ms when genuinely idle (keeps the cw-lkq CPU fix).
   (let ((tick-secs (/ tick-every 1000.0)))
-    (let loop ((last (current-second)))
+    (let loop ((last (current-second)) (busy 0))
       (let ((msgs (poll-msgs)))
         (for-each route! msgs)
         (let ((now (current-second)))
           (cond
-            ((>= (- now last) tick-secs) (tick-all!) (if heal-owner? (heal!)) (loop now))
-            ((null? msgs) (sleep-ms 5) (loop last))
-            (else (loop last))))))))
+            ((>= (- now last) tick-secs) (tick-all!) (if heal-owner? (heal!))
+             (loop now (if (pair? msgs) now busy)))
+            ((null? msgs) (sleep-ms (if (< (- now busy) 0.05) 1 5)) (loop last busy))
+            (else (loop last now))))))))

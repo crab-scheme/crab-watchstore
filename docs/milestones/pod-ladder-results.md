@@ -185,3 +185,26 @@ With fix 4 deployed: 500-pod steady state went from a restart every ~100s to 1 r
 ## Remaining wall (open)
 
 Occasional Range/Txn >5s spikes remain under relist-heavy load (1000-pod climb saw 3 supervisor restarts; 500-pod steady state 1 per 7min): large LISTs (a full 500-1000-pod relist decodes/encodes MBs of protobuf in Scheme) serialize on the single shard thread ahead of lease Txns. Reads-block-writes on the shard actor is the next architectural item: serve MVCC reads (Range/relists) off-thread from a snapshot, keeping the shard thread for writes/consensus. The 1.31 teardown pathologies (0-throughput cascading delete, RS phantom counts) were NOT retested this run.
+
+---
+
+# 5000-pod rung — k3s v1.36 + KWOK fake kubelets (2026-07-11)
+
+Real capacity is hardware-capped (~1500: /24 podCIDR = 254 IPs/node; ~10MB containerd shim per pod on 3.8GB nodes), so the 5000-pod rung keeps 1000 real pods and adds 4000 on **8 KWOK fake nodes** (kwok v0.6.1 standalone controller on the apiserver node, systemd unit). Every Node/Pod/Lease object still round-trips the real crab-watchstore, so this measures the store + control plane, not EC2.
+
+## Climb
+- A single scale-to-4000 burst crash-cycled the apiserver (write flood: creates+bindings+status ≈ 12k writes; lease Txns starved in the queue) and left KCM with **pinned informers** after the crash-churn (deployment controller created zero pods for 8+ min; classic "Too large resource version, current pinned" signature) — cleared by one k3s restart.
+- **Staged scaling (+500/stage, 30s drains) walked 1653 → 5000 in ~15 min**, every stage converging in 0–182s, restarts self-recovering mid-climb.
+
+## Steady state at 5000
+| config | restarts / 12 min |
+|---|---|
+| default leader-election deadlines | 4 (lease Txns behind ~2.8s LIST shard-blocks) |
+| tuned: `leader-elect-lease-duration=60s renew-deadline=40s retry-period=8s` (kcm/sched/ccm) | **0** — 5000/5000 Running, readyz ok, zero deadline-exceeded |
+
+The tuning is the documented k8s knob for slower stores: a 5k-pod LIST blocks the shard ~2.8s (measured via concurrent put: 2790ms during LIST, 60-90ms after), which the default 5s-timeout leader-election renewals sat right on top of.
+
+## Remaining (cw-001)
+1. **Reads-off-thread**: serve Range/relists from an MVCC/RocksDB snapshot off the shard actor — removes the 2.8s write-stall class entirely instead of tolerating it. (Do NOT retry pinned-`revision` chunking: the historical read path is slow — 3.2s→31.5s, reverted ca79c2c.)
+2. Per-row range cost (~0.55ms/row at 5k: key unescape + record decode + FFI iter) — candidate native `bytevector-index`/batched iterator in crabscheme.
+3. KCM pinned-informers after crash-churn: suspect `do-create`'s await holds OTHER watches' buffered events hostage while a busy shard delays the register ack — bound it or prioritize register acks.

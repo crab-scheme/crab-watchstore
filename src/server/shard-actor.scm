@@ -114,6 +114,20 @@
                                     "(include \"src/server/apply-worker.scm\")"
                                     'apply-worker-main handle "default" sync?)
                                    acc))))))
+         ; cw-m9c (G1): a small fixed pool of dedicated-thread readers that serve
+         ; Range/LIST off this actor's mailbox — see range-worker.scm. Always on
+         ; (unlike apply-workers, no serial-compat fallback needed: dispatching a
+         ; read is strictly additive, nothing downstream branches on it). Each
+         ; worker opens its own ctx over the SAME shared RocksDB handle (already
+         ; MultiThreaded — cs-store), so concurrent scans there never block the
+         ; sequencer's writes on that handle.
+         (range-workers (let spawn-r ((i 0) (acc '()))
+                          (if (= i 2) (list->vector (reverse acc))
+                              (spawn-r (+ i 1)
+                                       (cons (spawn-source-dedicated
+                                              "(include \"src/server/range-worker.scm\")"
+                                              'range-worker-main handle "default" sync?)
+                                             acc)))))
          (pending (make-eqv-hashtable))          ; log-index -> conn-pid
          ; ---- dynamic membership (cw-u4a.29) — LEADER-LOCAL, additive. `member-reply-pid`
          ; is the pid of the caller awaiting the in-flight member-add/remove/promote (one at
@@ -286,6 +300,13 @@
     ; cw-gx4: all of this group's inter-node frames route on MY-CHANNEL so
     ; independent groups drain in parallel (TO is already a node-name string).
     (define (gsend to msg) (node-send-ch (symbol->string node-name) to my-channel msg))
+    ; cw-m9c (G1): dispatch a local Range/LIST to the next range-worker in
+    ; round-robin (2-worker pool), off this mailbox entirely — the worker
+    ; scans its own ctx over the shared handle and replies straight to CONN.
+    (define range-rr 0)
+    (define (dispatch-range! conn opts term)
+      (set! range-rr (modulo (+ range-rr 1) (vector-length range-workers)))
+      (send (vector-ref range-workers range-rr) (list 'kv-range-do conn opts term)))
     (define (emit! outs)
       (for-each
        (lambda (o)
@@ -1061,7 +1082,9 @@
                            (gsend (symbol->string leader)
                                       (list 'ws-fwd shard-key node-name fwd-seq opts))))
                        (send conn 'tryagain))
-                   (send conn (range-reply st opts))))
+                   ; cw-m9c (G1): off the mailbox — a range-worker replies
+                   ; straight to CONN so the sequencer never blocks on the scan.
+                   (dispatch-range! conn opts (raft-term st))))
              (loop st leader elapsed flush-base))
 
             ;; ---- forwarded WRITE, leader side (cw-lkq.13) ----

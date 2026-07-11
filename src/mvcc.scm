@@ -690,12 +690,19 @@
 
 ; merge sort (apiserver LISTs run 500+ items; insertion sort was O(n^2) in the
 ; interpreter's hot read path)
+; cw-m9c (G1): `merge` must be TAIL-recursive — a naive `(cons (car a) (merge
+; (cdr a) b))` recurses to depth O(n) (the top-level merge of two N/2 lists
+; unwinds N/2 stack frames), which blew the stack on a dedicated actor thread
+; at ~5-6k rows (a full-keyspace LIST always sorts, even for sort-order
+; 'none — see the comment below). Accumulate + reverse instead: O(1) added
+; stack depth regardless of N.
 (define (isort lst less?)
   (define (merge a b)
-    (cond ((null? a) b)
-          ((null? b) a)
-          ((less? (car b) (car a)) (cons (car b) (merge a (cdr b))))
-          (else (cons (car a) (merge (cdr a) b)))))
+    (let loop ((a a) (b b) (acc '()))
+      (cond ((null? a) (append-reverse acc b))
+            ((null? b) (append-reverse acc a))
+            ((less? (car b) (car a)) (loop a (cdr b) (cons (car b) acc)))
+            (else (loop (cdr a) b (cons (car a) acc))))))
   (define (split lst)
     (let loop ((slow lst) (fast lst) (acc '()))
       (if (or (null? fast) (null? (cdr fast)))

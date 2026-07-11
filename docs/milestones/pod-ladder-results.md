@@ -163,3 +163,25 @@ Team lead restarted `k3s-server` (fresh informer caches, to clear the RS control
 ## Bottom line
 
 This ladder run stopped after rung 2 per the protocol's second-collapse rule, having converged rung 1 (100 pods, 66s) cleanly and identified two distinct store-level failure modes: (1) an idle-period CPU-spin bug in quepaxa's uncompacted per-slot alist state (root-caused via read-only thread/strace diagnostics, fixed and validated-under-load mid-run — no recurrence through rung 2), and (2) a write-throughput ceiling (~1.2s/write under load) in the store's consensus write path that saturates somewhere between 100 and 500 pods' worth of k8s control-plane churn on this shared-CPU store/kubelet topology, which is what actually blocked rung 2 and prevented rung 3. Teardown itself became a third data point: the store's degraded state persisted well past the point where the pod-count measurements ended, blocking clean namespace deletion and even basic `hashkv`/`status` diagnostics for at least 20+ minutes after the last rung-2 poll — evidence that recovery from this class of write-saturation event is slow even after the triggering load (pod churn) has stopped being generated.
+
+---
+
+# Pod Ladder RERUN — k3s v1.36.2 + the cw-xq9 fix stack (2026-07-11)
+
+Cluster: k3s v1.36.2+k3s1 control-plane + 5 agents (all v1.36.2, rejoined with fresh node-token), same 6 AWS instances and store topology as the 1.31 run. Store at this point carries four cw-xq9 root-cause fixes beyond the 1.31 run: (1) blocking node-poll (mesh hop latency 12.9→2.1ms); (2) compaction no longer cancels synced-but-quiet watchers; (3) grpc-watch worker pending-queue (no pipelined-frame drops); (4) O(1) Status/health via incremental live-keyspace stats (commit abad0cf).
+
+| Rung | 1.31 result | 1.36 + fixes result |
+|---|---|---|
+| 100 | converged 66s (readyz flapped twice) | **converged 32s, zero flaps** |
+| 500 | NEVER converged (write wall, scheduler starved) | **converged 360s** (readyz flapped; 1 supervisor restart mid-climb) |
+| 1000 | not attempted | **converged ~7.5min, all 1000 Running** (3 supervisor restarts mid-climb; forward progress preserved across restarts) |
+
+## Rung-2 steady-state finding → fix 4 (the Status full-scan)
+
+After rung-2 convergence the control plane crash-looped every ~100s: `eu-stack` on a store node showed the shard's `cs-actor-blk` thread at 98% CPU in bytevector/bitwise-xor frames — `mvcc-digest-at`, a full-keyspace byte-at-a-time FNV fold in interpreted Scheme, ran ON THE SHARD THREAD for **every Maintenance/Status call and every gRPC health probe**, just to report dbSize/key-count (StatusResponse has no hash field). Lease Txns queued behind each multi-second fold blew their 5s deadlines → k3s exits on lease loss → each crash-boot's full re-LIST burst re-seeded the storm. Proof of mechanism: stopping k3s dropped store put latency from >10s to 55ms instantly (load-driven starvation, not a wedge — distinct from the 1.31 cw-dgp CPU-spin). Fix: incremental live-bytes/live-count counters in shard-ctx (lazy seed, exact put/delete deltas, invalidated on snapshot install); Status/health now O(1); HashKV keeps the scan.
+
+With fix 4 deployed: 500-pod steady state went from a restart every ~100s to 1 restart in 7 minutes.
+
+## Remaining wall (open)
+
+Occasional Range/Txn >5s spikes remain under relist-heavy load (1000-pod climb saw 3 supervisor restarts; 500-pod steady state 1 per 7min): large LISTs (a full 500-1000-pod relist decodes/encodes MBs of protobuf in Scheme) serialize on the single shard thread ahead of lease Txns. Reads-block-writes on the shard actor is the next architectural item: serve MVCC reads (Range/relists) off-thread from a snapshot, keeping the shard thread for writes/consensus. The 1.31 teardown pathologies (0-throughput cascading delete, RS phantom counts) were NOT retested this run.

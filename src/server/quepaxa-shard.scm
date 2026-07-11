@@ -186,7 +186,7 @@
            (guard (e (#t #f))
              (case (car tag)
                ((read) (send (cadr tag) (cons 'read-ok (qp-applied (cdr r)))))
-               ((range) (send (cadr tag) (range-reply (caddr tag)))))))
+               ((range) (range-serve! (cadr tag) (caddr tag))))))
          (car r))
         (cdr r)))
 
@@ -204,6 +204,52 @@
                                  (kv-rec-create-rev rec) (kv-rec-mod-rev rec)
                                  (kv-rec-version rec) (kv-rec-lease rec))))
                        (cdr res))))))
+
+    ; cw-xq9: CHUNKED range serving. An UNLIMITED prefix LIST (k8s 1.36's
+    ; consistency-digest checker lists whole resource prefixes from the store
+    ; every ~5 min; at 1000 pods that's ~3s of scan+materialize) used to hold
+    ; the shard thread for the whole scan — every lease Txn queued behind it
+    ; blew the apiserver's 5s deadline, restarting k3s on the compaction/digest
+    ; cadence. Serve big ranges in RANGE-CHUNK-sized slices pinned at one
+    ; snapshot revision (MVCC gives consistent reads at a fixed rev for free),
+    ; and requeue the continuation at the BACK of our own mailbox so queued
+    ; writes interleave between slices. Bounded/sorted/count-only requests take
+    ; the original single-shot path — their cost is already bounded or their
+    ; semantics don't chunk. Items accumulate in the flattened sendable reply
+    ; shape (records cannot cross send, even to self).
+    (define RANGE-CHUNK 200)
+    (define (range-chunkable? opts)
+      (and (= (range-opt opts 'limit 0) 0)
+           (not (range-opt opts 'count-only #f))
+           (eq? (range-opt opts 'sort-order 'none) 'none)))
+    (define (range-serve! conn opts)
+      (if (range-chunkable? opts)
+          (let ((rev (let ((r (range-opt opts 'revision 0)))
+                       (if (> r 0) r (mvcc-current-rev ctx)))))
+            (range-chunk! conn opts rev (range-opt opts 'key (make-bytevector 0 0)) '() 0))
+          (send conn (range-reply opts))))
+    (define (range-chunk! conn opts rev start acc n)
+      (let* ((rend (range-opt opts 'range-end #f))
+             (res (mvcc-range ctx start rend
+                              (cons (cons 'revision rev)
+                                    (cons (cons 'limit RANGE-CHUNK) opts)))))
+        (if (and (pair? res) (eq? (car res) 'err-compacted))
+            (send conn (list 'kv-range-ok (mvcc-current-rev ctx) 0 'compacted 0 '()))
+            (let* ((items (cdr res))
+                   (flat (map (lambda (item)
+                                (let ((uk (car item)) (rec (cdr item)))
+                                  (list uk (kv-rec-value rec)
+                                        (kv-rec-create-rev rec) (kv-rec-mod-rev rec)
+                                        (kv-rec-version rec) (kv-rec-lease rec))))
+                              items))
+                   (acc2 (append acc flat))
+                   (n2 (+ n (length flat))))
+              (if (< (length items) RANGE-CHUNK)
+                  (send conn (list 'kv-range-ok rev 0 #f n2 acc2))
+                  ; smallest key > last returned = last-key ++ 0x00
+                  (let ((next (bytevector-append (car (car (reverse items)))
+                                                 (make-bytevector 1 0))))
+                    (send (self) (list 'range-cont conn opts rev next acc2 n2))))))))
 
     ; the lagging side pulls; the up-to-date side ships (same ws-snap frames)
     (define (maybe-snap-pull! st0)
@@ -378,8 +424,15 @@
             ((eq? (car m) 'kv-range)
              (let ((conn (cadr m)) (opts (caddr m)))
                (if (range-opt opts 'serializable #f)
-                   (begin (send conn (range-reply opts)) (loop st))
+                   (begin (range-serve! conn opts) (loop st))
                    (loop (engine! st (lambda (s) (qp-read s (list 'range conn opts))))))))
+
+            ;; cw-xq9: chunked-range continuation — self-requeued so writes
+            ;; queued behind the previous slice ran first (see range-serve!).
+            ((eq? (car m) 'range-cont)
+             (range-chunk! (list-ref m 1) (list-ref m 2) (list-ref m 3)
+                           (list-ref m 4) (list-ref m 5) (list-ref m 6))
+             (loop st))
 
             ;; ---- replica-local reads (identical to the raft driver) ----
             ((eq? (car m) 'get)

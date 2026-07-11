@@ -30,7 +30,17 @@
           (immutable cf)
           (immutable sync)
           (mutable   dirty)         ; # of writes buffered since last fsync
-          (mutable   crev)))        ; EXP7: cached current-rev (-1 = not yet read)
+          (mutable   crev)          ; EXP7: cached current-rev (-1 = not yet read)
+          ; cw-xq9: INCREMENTAL live-keyspace accounting (logical bytes = sum of
+          ; user-key+value lengths of live keys; count = # live keys). Status and
+          ; the health probes used to FULL-SCAN + byte-fold the keyspace on every
+          ; call (mvcc-digest-at) on the single shard thread — at 500-pod k8s
+          ; scale each call pinned the shard for seconds, lease Txns behind it
+          ; blew their 5s deadlines, and k3s crash-looped. Maintained by
+          ; mvcc-put!/mvcc-delete-range!; seeded (-1 = unseeded) by
+          ; mvcc-live-stats-seed! at shard boot / snapshot install / reset.
+          (mutable   live-bytes)
+          (mutable   live-count)))
 
 ; (make-ctx handle [cf-name] [sync?])
 (define (make-ctx handle . opts)
@@ -38,6 +48,8 @@
                   (if (and (pair? opts) (car opts)) (car opts) "default")
                   (and (pair? opts) (pair? (cdr opts)) (cadr opts))
                   0
+                  -1
+                  -1
                   -1))
 
 ; ---- raw KV ops ----

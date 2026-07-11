@@ -26,4 +26,5 @@
   (reset-ns! ctx NS-REV)     ; revision-ordered events
   (reset-ns! ctx NS-LEASE)   ; lease -> keys index
   (kv-del! ctx RAFT-APPLIED-KEY)
+  (mvcc-live-stats-invalidate! ctx)   ; cw-xq9: bulk wipe bypassed mvcc-delete
   (ctx-flush! ctx))

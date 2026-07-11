@@ -401,12 +401,15 @@
              (send (cadr m) (list 'cur-rev-ok (mvcc-current-rev ctx) 1))
              (loop st))
             ((eq? (car m) 'status)
-             (let ((dig (mvcc-digest-at ctx 0)))
+             ; cw-xq9: O(1) incremental stats — the old mvcc-digest-at full-scan
+             ; here (per Status AND per health probe) pinned the shard thread at
+             ; 500-pod k8s scale and crash-looped k3s on lease-Txn deadlines.
+             (let ((dig (mvcc-live-stats ctx)))
                ; term is a raft concept; report the constant 1 (etcdctl and the
                ; maintenance proof assert raftTerm > 0). QuePaxa has no terms.
                (send (cadr m) (list 'status-ok (mvcc-current-rev ctx) 1
-                                    (qp-commit st) (qp-applied st) (cadr dig)
-                                    (qp-coord st) (caddr dig))))
+                                    (qp-commit st) (qp-applied st) (car dig)
+                                    (qp-coord st) (cadr dig))))
              (loop st))
             ((eq? (car m) 'hashkv)
              (let* ((req-rev (caddr m))
@@ -596,6 +599,7 @@
                               (kv-scan ctx (make-bytevector 0)))
                     (for-each (lambda (kv) (kv-put! ctx (car kv) (cdr kv))) rows)
                     (set-shard-ctx-crev! ctx -1)
+                    (mvcc-live-stats-invalidate! ctx)   ; cw-xq9: bulk install bypassed mvcc-put!
                     (ctx-save-applied! ctx sbase 0)
                     (persist-boot! boot-epoch)   ; the wipe adopted the SENDER's counter
                     (ctx-flush! ctx)

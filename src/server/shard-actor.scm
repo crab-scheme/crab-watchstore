@@ -1132,6 +1132,7 @@
                     ; mvcc-set-current-rev!), so the cached crev is stale — invalidate
                     ; so the next mvcc-current-rev re-reads the installed value.
                     (set-shard-ctx-crev! ctx -1)
+                    (mvcc-live-stats-invalidate! ctx)   ; cw-xq9: bulk install bypassed mvcc-put!
                     (ctx-save-applied! ctx sbase sterm)
                     (ctx-flush! ctx)
                     (if (> (reg-count watch-reg) 0)
@@ -1593,14 +1594,17 @@
             ;;   (snapshot reply-pid)      -> (snapshot-ok rev ((key . value) ...))
             ;;   (defrag   reply-pid)      -> (defrag-ok)
             ((eq? (car m) 'status)
+             ;; cw-xq9: O(1) incremental stats (mvcc-live-stats) — the old
+             ;; mvcc-digest-at full-scan per Status/health probe pinned the shard
+             ;; thread at 500-pod k8s scale and crash-looped k3s on lease deadlines.
              (let ((conn (cadr m))
-                   (dig  (mvcc-digest-at ctx 0)))         ; (hash size count) at current rev
+                   (dig  (mvcc-live-stats ctx)))          ; (size count), O(1) once seeded
                ;; cw-u4a.33: append the live key COUNT (caddr dig) as a trailing field so the
                ;; /metrics endpoint (etcd_debugging_mvcc_keys_total) + the gRPC Health readiness
                ;; check read it from the SAME digest this seam already computes for db-size — zero
                ;; extra shard cost.  APPENDED, so handle-status (reads indices 1–6) is unaffected.
                (send conn (list 'status-ok (mvcc-current-rev ctx) (raft-term st)
-                                (raft-commit st) (raft-applied st) (cadr dig) leader (caddr dig))))
+                                (raft-commit st) (raft-applied st) (car dig) leader (cadr dig))))
              (loop st leader elapsed flush-base))
             ((eq? (car m) 'hashkv)
              (let* ((conn (cadr m)) (req-rev (caddr m))

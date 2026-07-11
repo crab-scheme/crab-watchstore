@@ -473,6 +473,11 @@
          (create-rev (if prev (kv-rec-create-rev prev) main))
          (version    (if prev (+ 1 (kv-rec-version prev)) 1))
          (prev-lease (if prev (kv-rec-lease prev) 0)))
+    ; cw-xq9: incremental live stats — replace = value-size delta; create = key+value +1
+    (if prev
+        (mvcc-live-stats-add! ctx (- (bytevector-length V)
+                                     (bytevector-length (kv-rec-value prev))) 0)
+        (mvcc-live-stats-add! ctx (+ (bytevector-length K) (bytevector-length V)) 1))
     ; KEY-CF: the new live version
     (kv-put! ctx (enc-key K main sub)
              (kv-record-encode REC-VALUE create-rev main version lease V))
@@ -562,6 +567,11 @@
           (let* ((uk   (car vs))
                  (prev (mvcc-get-latest ctx uk))
                  (lease (if prev (kv-rec-lease prev) 0)))
+            ; cw-xq9: incremental live stats — a live key leaves the keyspace
+            (if prev
+                (mvcc-live-stats-add!
+                 ctx (- (+ (bytevector-length uk)
+                           (bytevector-length (kv-rec-value prev)))) -1))
             ; KEY-CF: a tombstone version (create_rev=0, version=0, no value)
             (kv-put! ctx (enc-key uk main s)
                      (kv-record-encode REC-TOMBSTONE 0 main 0 0 (make-bytevector 0 0)))
@@ -872,6 +882,35 @@
 (define (mvcc-live-kvs ctx at-rev)
   (let ((res (mvcc-range ctx (mvcc-byte 0) (mvcc-byte 0) (list (cons 'revision at-rev)))))
     (if (and (pair? res) (integer? (car res))) (cdr res) '())))
+
+; ---- cw-xq9: incremental live-keyspace stats (see store-ctx.scm field docs) ----
+; Status and the health probes used to call mvcc-digest-at (a full-keyspace
+; byte-at-a-time fold) on EVERY call, on the single shard thread — at 500-pod
+; k8s scale each call pinned the shard for seconds; lease Txns queued behind it
+; blew their 5s deadlines and k3s crash-looped. These counters make Status O(1):
+; seeded lazily by ONE scan, then kept exact by mvcc-put!/mvcc-delete-range!.
+; Bulk paths that bypass those (snapshot install, test reset) must call
+; mvcc-live-stats-invalidate! to force a reseed.
+(define (mvcc-live-stats-invalidate! ctx)
+  (set-shard-ctx-live-bytes! ctx -1)
+  (set-shard-ctx-live-count! ctx -1))
+(define (mvcc-live-stats-add! ctx dbytes dcount)
+  (if (>= (shard-ctx-live-bytes ctx) 0)
+      (begin
+        (set-shard-ctx-live-bytes! ctx (+ (shard-ctx-live-bytes ctx) dbytes))
+        (set-shard-ctx-live-count! ctx (+ (shard-ctx-live-count ctx) dcount)))))
+; (bytes count) — O(1) once seeded; one full scan on first call / after invalidate.
+(define (mvcc-live-stats ctx)
+  (if (< (shard-ctx-live-bytes ctx) 0)
+      (let loop ((kvs (mvcc-live-kvs ctx 0)) (sz 0) (n 0))
+        (if (null? kvs)
+            (begin (set-shard-ctx-live-bytes! ctx sz)
+                   (set-shard-ctx-live-count! ctx n))
+            (loop (cdr kvs)
+                  (+ sz (bytevector-length (caar kvs))
+                        (bytevector-length (kv-rec-value (cdar kvs))))
+                  (+ n 1)))))
+  (list (shard-ctx-live-bytes ctx) (shard-ctx-live-count ctx)))
 
 ; (hash32 total-bytes count) over the live keyspace at at-rev.  The hash folds, per key
 ; in canonical order, key-bytes ‖ u64be(mod_rev) ‖ value-bytes; total-bytes sums

@@ -1040,74 +1040,50 @@
       (else
        ; Step 2: persist the new compact-rev (activates mvcc-range's ErrCompacted gate)
        (kv-put! ctx META-COMPACT-REV (u64->bytes compactRev))
-       ; Step 3: KEY-CF GC — scan NS-KEY grouped by user-key (newest-first per key)
-       ; For each key, find the latest-≤-compactRev version and decide keep/delete.
-       (let ((rows (kv-scan ctx (mvcc-byte NS-KEY))))
-         ; Accumulate rows per user-key.  Scan order: ascending user-key, then
-         ; newest-first within key (INV encoding).  So we process groups naturally.
-         (let gc-loop ((rs rows) (cur-uk #f) (cur-group '()))
-           (define (gc-flush-group group)
-             ; group = list of (fullkey . value-bv) in newest-first scan order.
-             ; Collect all versions with mod_rev <= compactRev.  Because we process
-             ; the group newest-first and cons each matching row, the resulting
-             ; at-or-below list ends up OLDEST-FIRST (the first-processed newest
-             ; version is at the tail).  We reverse it to get newest-first so that
-             ; the HEAD is the "latest-≤-compactRev" candidate.
-             (let split ((g group) (at-or-below '()))
-               (if (null? g)
-                   ; Done splitting.
-                   (if (null? at-or-below)
-                       ; All versions are above compactRev — nothing to GC.
-                       (values)
-                       ; at-or-below is currently oldest-first (due to cons during
-                       ; newest-first traversal); reverse to get newest-first.
-                       (let* ((newest-first (reverse at-or-below))
-                              (latest-row   (car newest-first))   ; highest mod_rev ≤ compactRev
-                              (latest-rec   (kv-record-decode (cdr latest-row)))
-                              (is-tomb      (kv-rec-tombstone? latest-rec))
-                              ; Tombstone at/before compactRev: the key was deleted and
-                              ; no live value needs to anchor reads at compactRev -> delete ALL.
-                              ; Non-tombstone: keep latest (anchors reads at compactRev),
-                              ; delete all older versions in at-or-below.
-                              (to-delete    (if is-tomb
-                                               newest-first          ; delete tombstone + older
-                                               (cdr newest-first)))) ; keep latest, delete older
-                         (for-each (lambda (row) (kv-del! ctx (car row))) to-delete)))
-                   ; Partition this row by its mod_rev vs compactRev.
-                   ; Versions with mod_rev > compactRev are skipped (left in place).
-                   (let* ((row (car g))
-                          (rec (kv-record-decode (cdr row)))
-                          (mr  (kv-rec-mod-rev rec)))
-                     (if (<= mr compactRev)
-                         (split (cdr g) (cons row at-or-below))   ; accumulate GC candidate
-                         (split (cdr g) at-or-below))))))         ; skip (above compactRev)
-           (if (null? rs)
-               ; Flush the last group
-               (if cur-uk (gc-flush-group (reverse cur-group)) (values))
-               ; Accumulate row into the current group, flushing on key change
-               (let* ((row  (car rs))
-                      (fk   (car row))
-                      (uk   (key-cf-decode-user-key fk)))
-                 (cond
-                   ((and cur-uk (equal? uk cur-uk))
-                    ; Same key — accumulate (rows arrive newest-first for this key)
-                    (gc-loop (cdr rs) cur-uk (cons row cur-group)))
-                   (else
-                    ; New key — flush the previous group first
-                    (if cur-uk (gc-flush-group (reverse cur-group)) (values))
-                    (gc-loop (cdr rs) uk (list row))))))))
-       ; Step 4: REV-CF GC — delete every event with rev <= compactRev.
-       ; REV-CF keys are NS-REV || rev16 (plain ascending), so we scan the whole
-       ; NS-REV namespace and delete entries whose embedded rev <= compactRev.
-       (let ((rev-rows (kv-scan ctx (mvcc-byte NS-REV))))
-         (for-each
-          (lambda (row)
-            (let* ((fk  (car row))
-                   ; fk = 0x02 || u64be(main) || u64be(sub); main at byte 1
-                   (rev (bytes->u64 fk 1)))
-              (if (<= rev compactRev)
-                  (kv-del! ctx fk))))
-          rev-rows))
+       ; cw-xq9: WINDOW-DRIVEN GC — O(changes since the last compaction), not
+       ; O(total keyspace). The old steps 3+4 full-scanned BOTH namespaces
+       ; (KEY-CF with values, REV-CF entirely) on every compaction; k3s compacts
+       ; every 5 minutes, so at 1000-pod scale each compaction materialized the
+       ; whole keyspace on the single shard thread — a multi-second stall that
+       ; blew the apiserver's 5s lease-Txn deadlines and restarted k3s each
+       ; cycle. Only a key touched in (cur-compact, compactRev] can have NEW
+       ; garbage: every earlier compaction left each key holding at most one
+       ; live version at-or-below its floor. One BOUNDED REV-CF window scan
+       ; yields both the events to purge (step 4) and the changed-key set
+       ; whose KEY-CF groups need GC (step 3, one bounded per-key scan each).
+       (let* ((win-rows (kv-scan-range ctx (enc-rev (+ cur-compact 1) 0)
+                                           (enc-rev (+ compactRev 1) 0)))
+              (keys (list-sort bv<? (map (lambda (row) (ev-key (event-decode (cdr row))))
+                                         win-rows))))
+         ; Step 3: KEY-CF GC per CHANGED key — same keep/delete rule as before:
+         ; keep the single latest-≤-compactRev version iff it is live; delete
+         ; every older ≤-compactRev version (and the latest too if tombstone).
+         (let gc-keys ((ks keys) (prev #f))
+           (if (pair? ks)
+               (let ((uk (car ks)))
+                 (if (and prev (equal? uk prev))
+                     (gc-keys (cdr ks) prev)          ; dedup consecutive (sorted)
+                     (let* ((bounds (key-cf-row-bounds uk #f))
+                            ; group rows arrive newest-first (INV-rev encoding)
+                            (group (kv-scan-range ctx (car bounds) (cdr bounds))))
+                       (let split ((g group) (below '()))
+                         (if (null? g)
+                             (let ((nf (reverse below)))          ; newest-first ≤ compactRev
+                               (if (pair? nf)
+                                   (let* ((latest-rec (kv-record-decode (cdar nf)))
+                                          (to-delete (if (kv-rec-tombstone? latest-rec)
+                                                         nf          ; deleted key: drop all
+                                                         (cdr nf)))) ; keep live latest
+                                     (for-each (lambda (row) (kv-del! ctx (car row)))
+                                               to-delete))))
+                             (let ((mr (kv-rec-mod-rev (kv-record-decode (cdar g)))))
+                               (if (<= mr compactRev)
+                                   (split (cdr g) (cons (car g) below))
+                                   (split (cdr g) below)))))
+                       (gc-keys (cdr ks) uk))))))
+         ; Step 4: REV-CF GC — the window rows ARE exactly the events to purge
+         ; (events ≤ cur-compact were deleted by prior compactions).
+         (for-each (lambda (row) (kv-del! ctx (car row))) win-rows))
        ; Step 5: compaction does NOT bump current-rev
        (cons 'ok compactRev)))))
 

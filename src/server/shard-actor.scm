@@ -128,6 +128,15 @@
                                               "(include \"src/server/range-worker.scm\")"
                                               'range-worker-main handle "default" sync?)
                                              acc)))))
+         ; cw-04k: watch-event fanout — dedicated-thread worker owning the whole watch
+         ; registry (register/cancel/live-dispatch/compaction-floor), off this actor's
+         ; mailbox. A SINGLE worker (not a round-robin pool like range-workers): the
+         ; per-watcher revision-order guarantee depends on the shard->worker send/receive
+         ; pair being FIFO, which only holds with exactly one receiver. See
+         ; watch-fanout.scm for the ordering + freshness argument.
+         (watch-fanout (spawn-source-dedicated
+                        "(include \"src/server/watch-fanout.scm\")"
+                        'watch-fanout-main handle "default" sync?))
          (pending (make-eqv-hashtable))          ; log-index -> conn-pid
          ; ---- dynamic membership (cw-u4a.29) — LEADER-LOCAL, additive. `member-reply-pid`
          ; is the pid of the caller awaiting the in-flight member-add/remove/promote (one at
@@ -147,7 +156,6 @@
          (read-acks '())                         ; ReadIndex: peers acked (fresh) since round opened
          (round-open? #f)                        ; ReadIndex: a confirmation heartbeat is in flight
          (round-rseq 0)                          ; ReadIndex: the rseq this round's acks must echo (>=)
-         (watch-reg (make-watch-registry))       ; Watch backend registry (cw-u4a.13); empty => apply hook is a no-op
          ; ---- Lease expiry (cw-u4a.17, ADR 0003 §2) — LEADER-LOCAL, never replicated.
          ; lease-deadlines : id -> deadline-second (wall-clock).  The leader seeds it
          ; (untracked live leases get now+ttl on the tick) and scans it for expiry.
@@ -254,7 +262,7 @@
                         (begin (set! backlog (append backlog (list r)))
                                (wait need))))))
             ; the whole batch is durable-visible: emit its watch window at once
-            (watch-on-apply! watch-reg ctx mat-pre (mvcc-current-rev ctx))
+            (watch-notify-apply! mat-pre (mvcc-current-rev ctx))
             (set! mat-count 0)
             (set! mat-pre #f))))
     (define (apply-fn sm cmd)
@@ -272,19 +280,19 @@
                                   (cons 'txnr (cons (mvcc-current-rev ctx) res))
                                   res)
                               acc)))
-            (watch-on-apply! watch-reg ctx pre (mvcc-current-rev ctx))
-            ; Watch backend (cw-u4a.14, ADR 0002 §5 mid-stream ErrCompacted): a
-            ; COMPACT applied here GC's REV-CF events <= compact-rev, so any watcher
-            ; still BELOW that floor (delivered_rev < compact-rev) can no longer be
-            ; served its remaining history — cancel it with compact_revision set so
-            ; the client re-establishes above the floor.  COMPACT does NOT bump
-            ; current-rev, so watch-on-apply! above is already a no-op for it; this
-            ; is the separate wiring point §5 calls for.  Gated on a NON-EMPTY
-            ; registry so a watcher-free apply path (sim-cluster) is unperturbed:
-            ; with no watchers this is a single hashtable-size check, no scan.
-            (if (and (> (reg-count watch-reg) 0)
-                     (pair? cmd) (string=? (cmd-op cmd) "COMPACT"))
-                (watch-check-compaction! watch-reg ctx)))))
+            (watch-notify-apply! pre (mvcc-current-rev ctx))
+            ; Watch backend (cw-u4a.14, ADR 0002 §5 mid-stream ErrCompacted; cw-04k:
+            ; now off-thread on watch-fanout): a COMPACT applied here GC's REV-CF
+            ; events <= compact-rev, so any watcher still BELOW that floor
+            ; (delivered_rev < compact-rev) can no longer be served its remaining
+            ; history — the fanout worker cancels it with compact_revision set so
+            ; the client re-establishes above the floor. COMPACT does NOT bump
+            ; current-rev, so watch-notify-apply! above is already a no-op for it;
+            ; this is the separate wiring point §5 calls for. Unconditional send
+            ; (the fanout worker owns the reg-count check now; COMPACT is rare, so
+            ; this is not a hot-path cost).
+            (if (and (pair? cmd) (string=? (cmd-op cmd) "COMPACT"))
+                (send watch-fanout (list 'watch-compact))))))
       (+ sm 1))
     ; Persist the applied index (+ its term) into the SAME group-commit batch as
     ; the entry's mutations, so a restart restores base/applied/commit and never
@@ -307,6 +315,30 @@
     (define (dispatch-range! conn opts term)
       (set! range-rr (modulo (+ range-rr 1) (vector-length range-workers)))
       (send (vector-ref range-workers range-rr) (list 'kv-range-do conn opts term)))
+    ; cw-04k: notify watch-fanout of a committed (pre,post] window. The message is
+    ; two ints (the worker re-reads REV-CF itself), so mailbox growth under a slow
+    ; worker is O(inflight-count), not O(event-volume) — but count still needs a
+    ; bound, so we cap outstanding un-acked notifies at WATCH-FANOUT-MAX-INFLIGHT and
+    ; block (stashing any other message onto `backlog`, same idiom as
+    ; flush-materializations!'s apply-slice-done wait) rather than growing without
+    ; bound. Under normal operation the worker keeps up and this never blocks — it's
+    ; a true off-thread dispatch; the bound only bites under sustained overload,
+    ; which is the deliberately-chosen backpressure point (etcd itself is not
+    ; unbounded here either — its watch send channel is a bounded buffer).
+    (define WATCH-FANOUT-MAX-INFLIGHT 512)
+    (define watch-inflight 0)
+    (define (watch-drain-one-ack!)
+      (let wait ()
+        (let ((r (raw-receive)))
+          (if (and (pair? r) (eq? (car r) 'watch-apply-ack))
+              (set! watch-inflight (- watch-inflight 1))
+              (begin (set! backlog (append backlog (list r))) (wait))))))
+    (define (watch-notify-apply! pre post)
+      (if (> post pre)
+          (begin
+            (if (>= watch-inflight WATCH-FANOUT-MAX-INFLIGHT) (watch-drain-one-ack!))
+            (send watch-fanout (list 'watch-apply pre post (self)))
+            (set! watch-inflight (+ watch-inflight 1)))))
     (define (emit! outs)
       (for-each
        (lambda (o)
@@ -860,6 +892,14 @@
              (loop st leader elapsed flush-base))
             ((not (pair? m)) (loop st leader elapsed flush-base))
 
+            ;; ---- watch-fanout ack (cw-04k): normal-path drain of the outstanding
+            ;; 'watch-apply counter — most acks land here, NOT in the blocking
+            ;; watch-drain-one-ack! wait (that only triggers once inflight hits the
+            ;; WATCH-FANOUT-MAX-INFLIGHT cap).
+            ((eq? (car m) 'watch-apply-ack)
+             (set! watch-inflight (- watch-inflight 1))
+             (loop st leader elapsed flush-base))
+
             ;; ---- Raft RPC from a peer ----
             ((eq? (car m) 'engine)
              (let ((from (cadr m)) (rpc (caddr m)))
@@ -983,8 +1023,7 @@
              ; apiserver re-lists forever, "current" stuck at the watch-creation rev. Pushing
              ; from the shard (which holds the rev) avoids each watch worker round-tripping the
              ; shard for cur-rev under load (that latency made the apiserver re-list pre-sync).
-             (if (> (reg-count watch-reg) 0)
-                 (watch-progress-all! watch-reg ctx))
+             (send watch-fanout (list 'watch-progress))   ; cw-04k: off-thread; worker owns reg-count check
              (cond
                ((raft-leader? st)
                 ; CheckQuorum: if we lost quorum contact this window, step down —
@@ -1158,10 +1197,11 @@
                     (mvcc-live-stats-invalidate! ctx)   ; cw-xq9: bulk install bypassed mvcc-put!
                     (ctx-save-applied! ctx sbase sterm)
                     (ctx-flush! ctx)
-                    (if (> (reg-count watch-reg) 0)
-                        (begin
-                          (watch-on-apply! watch-reg ctx pre (mvcc-current-rev ctx))
-                          (watch-check-compaction! watch-reg ctx)))
+                    ; cw-04k: off-thread; order matters (apply window before the
+                    ; compaction-floor advance) — sent in that order to the SAME
+                    ; single fanout worker, so FIFO preserves it.
+                    (watch-notify-apply! pre (mvcc-current-rev ctx))
+                    (send watch-fanout (list 'watch-compact))
                     (let ((st2 (raft-install-snapshot st sbase sterm)))
                       ; ack the installed position to the sender (an ordinary
                       ; AER success at base): its next advances past its
@@ -1341,62 +1381,32 @@
                             keys))))
              (loop st leader elapsed flush-base))
 
-            ;; ---- Watch register: (watch-register REPLY-PID SPEC) ----  (cw-u4a.14)
-            ;; The per-conn streaming actor (.14) asks THIS member's shard registry to
+            ;; ---- Watch register: (watch-register REPLY-PID SPEC) ----  (cw-u4a.14;
+            ;; cw-04k: forwarded to watch-fanout, which owns the whole registry now.)
+            ;; The per-conn streaming actor (.14) asks this shard's watch backend to
             ;; establish a watcher.  Served on EVERY replica (cw-lkq.5, etcd-faithful:
             ;; any member serves watches): followers apply the same committed entries,
-            ;; so watch-on-apply! fires here too and REV-CF replay is identical — a
-            ;; follower watch delivers in THIS replica's revision order, exactly
-            ;; once, possibly later than the leader's wall clock (like etcd).  The
-            ;; original leader gate (pre-cw-lkq.5) forced a WAN hop per watch from
-            ;; remote regions.
+            ;; so watch-fanout's watch-on-apply! fires there too and REV-CF replay is
+            ;; identical — a follower watch delivers in THIS replica's revision order,
+            ;; exactly once, possibly later than the leader's wall clock (like etcd).
             ;;
-            ;; SPEC is the sendable assoc-list watch-spec (keys: key/range-end/
-            ;; start-rev/filters/prev-kv/watch-id — all bytevectors/ints/symbols, so
-            ;; it crosses the actor boundary intact).  The registry's deliver-fn must
-            ;; push a SENDABLE shape to REPLY-PID (a watch-response RECORD can't cross
-            ;; a `send`), so we flatten it with watch-response->sexp and tag it
-            ;; 'watch-response.  watch-register! runs the REGISTER->REPLAY->CATCH-UP->
-            ;; PROMOTE handoff on THIS single thread (so the §3 seam stays race-free),
-            ;; delivering any historical replay to REPLY-PID before we ack the id.
-            ;; The reply to the REGISTER request itself is the assigned watch-id, or
-            ;; ('watch-compacted . COMPACT-REV) if start-rev is below the floor (§5).
+            ;; Forwarding (rather than answering inline) is itself the fix this
+            ;; message shape depends on being cheap: this actor just relays the
+            ;; already-sendable SPEC + REPLY-PID to watch-fanout, which registers,
+            ;; replays, and acks REPLY-PID directly — none of that work (which can be
+            ;; O(backlog) for a from-revision resume) touches this mailbox.
             ((eq? (car m) 'watch-register)
-             (let ((reply-pid (cadr m)) (spec (caddr m)))
-               (if #f                       ; cw-lkq.5: served on every replica
-                   (send reply-pid (cons 'watch-not-leader leader))
-                   (let* ((deliver-fn
-                           (lambda (wr)
-                             ; A registry's delivery must NEVER crash the registry:
-                             ; the per-conn consumer (the gRPC stream worker) may have
-                             ; exited, and `send` to a dead actor raises.  Guard it.
-                             (guard (e (#t #f))
-                               (send reply-pid (list 'watch-response (watch-response->sexp wr))))))
-                          (res (watch-register! watch-reg ctx spec deliver-fn)))
-                     (if (and (pair? res) (eq? (car res) 'compacted))
-                         (send reply-pid (cons 'watch-compacted (cdr res)))
-                         ; cw-l5h: carry the ACCURATE current-rev (read here, where the shard
-                         ; is the sole writer of current-rev) so the worker's created-ack uses
-                         ; it. The worker's own pre-register 'cur-rev query times out to rev 0
-                         ; when the shard mailbox is backed up under write load, which left the
-                         ; kube-apiserver watch-cache stuck at "current: 1" -> consistency-check
-                         ; failures -> 503 -> no nodes register. res = watch-id.
-                         (send reply-pid (list 'watch-created res (mvcc-current-rev ctx))))))
-               (loop st leader elapsed flush-base)))
+             (send watch-fanout (list 'watch-register (cadr m) (caddr m)))
+             (loop st leader elapsed flush-base))
 
-            ;; ---- Watch cancel: (watch-cancel REPLY-PID WATCH-ID) ----  (cw-u4a.14)
-            ;; Deregister the watcher + (via its deliver-fn) emit a canceled
-            ;; WatchResponse to the stream, then ack the cancel to REPLY-PID.
-            ;; Replica-local like register (cw-lkq.5).  watch-cancel!
-            ;; runs on this single thread so a cancel concurrent with an in-flight
-            ;; dispatch is serialized (no use-after-cancel, ADR 0002 §6).
+            ;; ---- Watch cancel: (watch-cancel REPLY-PID WATCH-ID) ----  (cw-u4a.14;
+            ;; cw-04k: forwarded to watch-fanout.)  Forwarding through the SAME single
+            ;; worker as watch-register/watch-apply keeps cancel serialized against
+            ;; concurrent live dispatch (no use-after-cancel, ADR 0002 §6) even though
+            ;; it no longer runs on this actor's own thread.
             ((eq? (car m) 'watch-cancel)
-             (let ((reply-pid (cadr m)) (wid (caddr m)))
-               (if #f                       ; cw-lkq.5: served on every replica
-                   (send reply-pid (cons 'watch-not-leader leader))
-                   (let ((ok (watch-cancel! watch-reg wid)))
-                     (send reply-pid (cons 'watch-canceled (if ok wid #f)))))
-               (loop st leader elapsed flush-base)))
+             (send watch-fanout (list 'watch-cancel (cadr m) (caddr m)))
+             (loop st leader elapsed flush-base))
 
             ;; ---- Lease grant: (lease-grant REPLY-PID TTL ID) ----  (cw-u4a.17)
             ;; The client's LeaseGrant.  LEADER-GATED exactly like watch-register /

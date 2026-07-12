@@ -66,7 +66,13 @@
                                               "(include \"src/server/range-worker.scm\")"
                                               'range-worker-main handle "default" sync?)
                                              acc)))))
-         (watch-reg (make-watch-registry))
+         ; cw-04k: same off-thread watch-fanout worker as the raft driver — see
+         ; watch-fanout.scm and shard-actor.scm for the ordering/freshness/backpressure
+         ; argument (identical here: this actor is the worker's sole sender, so FIFO
+         ; preserves the registry's single-thread ordering guarantees off this mailbox).
+         (watch-fanout (spawn-source-dedicated
+                        "(include \"src/server/watch-fanout.scm\")"
+                        'watch-fanout-main handle "default" sync?))
          (lease-deadlines (make-eqv-hashtable))
          (lease-revoking (make-eqv-hashtable)))
 
@@ -113,10 +119,9 @@
                                   (cons 'txnr (cons (mvcc-current-rev ctx) res))
                                   res)
                               acc)))
-            (watch-on-apply! watch-reg ctx pre (mvcc-current-rev ctx))
-            (if (and (> (reg-count watch-reg) 0)
-                     (pair? cmd) (string=? (cmd-op cmd) "COMPACT"))
-                (watch-check-compaction! watch-reg ctx))))))
+            (watch-notify-apply! pre (mvcc-current-rev ctx))
+            (if (and (pair? cmd) (string=? (cmd-op cmd) "COMPACT"))
+                (send watch-fanout (list 'watch-compact)))))))
       (+ sm 1))
 
     (define (gsend to msg) (node-send-ch (symbol->string node-name) to my-channel msg))
@@ -198,6 +203,27 @@
     (define (dispatch-range! conn opts)
       (set! range-rr (modulo (+ range-rr 1) (vector-length range-workers)))
       (send (vector-ref range-workers range-rr) (list 'kv-range-do conn opts 0)))
+
+    ; cw-04k: notify watch-fanout of a committed (pre,post] window, off this mailbox
+    ; (see shard-actor.scm's watch-notify-apply! for the full rationale — identical
+    ; here). watch-backlog is this file's equivalent of the raft driver's `backlog`:
+    ; this driver has no group-commit stash otherwise, so the (rare) blocking-ack
+    ; path needs its own small requeue list, checked first by the main loop below.
+    (define WATCH-FANOUT-MAX-INFLIGHT 512)
+    (define watch-inflight 0)
+    (define watch-backlog '())
+    (define (watch-drain-one-ack!)
+      (let wait ()
+        (let ((r (raw-receive)))
+          (if (and (pair? r) (eq? (car r) 'watch-apply-ack))
+              (set! watch-inflight (- watch-inflight 1))
+              (begin (set! watch-backlog (append watch-backlog (list r))) (wait))))))
+    (define (watch-notify-apply! pre post)
+      (if (> post pre)
+          (begin
+            (if (>= watch-inflight WATCH-FANOUT-MAX-INFLIGHT) (watch-drain-one-ack!))
+            (send watch-fanout (list 'watch-apply pre post (self)))
+            (set! watch-inflight (+ watch-inflight 1)))))
 
     ; drain completed linearizable reads: tag = ('read conn) | ('range conn opts)
     (define (drain-reads! st0)
@@ -355,9 +381,16 @@
            (st0 (if (> p 0) (qp-install-snapshot st0 p 0 '()) st0)))
       (publish! st0)
       (let loop ((st st0))
-        (let ((m (raw-receive)))
+        (let ((m (cond ((pair? watch-backlog)
+                        (let ((b (car watch-backlog))) (set! watch-backlog (cdr watch-backlog)) b))
+                       (else (raw-receive)))))
           (cond
             ((not (pair? m)) (loop st))
+
+            ;; ---- watch-fanout ack (cw-04k): normal-path drain — see shard-actor.scm.
+            ((eq? (car m) 'watch-apply-ack)
+             (set! watch-inflight (- watch-inflight 1))
+             (loop st))
 
             ;; ---- engine RPC from a peer (incl. our snap-pull extension) ----
             ((eq? (car m) 'engine)
@@ -370,8 +403,7 @@
             ((eq? (car m) 'tick)
              (set! ticks (+ ticks 1))
              (if (= 0 (modulo ticks 16)) (collect-garbage))
-             (if (> (reg-count watch-reg) 0)
-                 (watch-progress-all! watch-reg ctx))
+             (send watch-fanout (list 'watch-progress))   ; cw-04k: off-thread
              (let* ((st (engine! st qp-tick))
                     (st (if (qp-coord? st) (lease-tick! st) st)))
                (loop st)))
@@ -489,23 +521,14 @@
              (send (cadr m) (list 'auth-role-list-ok (auth-all-roles ctx)))
              (loop st))
 
-            ;; ---- watch register/cancel (replica-local, identical) ----
+            ;; ---- watch register/cancel (replica-local; cw-04k: forwarded to
+            ;; watch-fanout, which owns the whole registry now — see shard-actor.scm) ----
             ((eq? (car m) 'watch-register)
-             (let ((reply-pid (cadr m)) (spec (caddr m)))
-               (let* ((deliver-fn
-                       (lambda (wr)
-                         (guard (e (#t #f))
-                           (send reply-pid (list 'watch-response (watch-response->sexp wr))))))
-                      (res (watch-register! watch-reg ctx spec deliver-fn)))
-                 (if (and (pair? res) (eq? (car res) 'compacted))
-                     (send reply-pid (cons 'watch-compacted (cdr res)))
-                     (send reply-pid (list 'watch-created res (mvcc-current-rev ctx)))))
-               (loop st)))
+             (send watch-fanout (list 'watch-register (cadr m) (caddr m)))
+             (loop st))
             ((eq? (car m) 'watch-cancel)
-             (let ((reply-pid (cadr m)) (wid (caddr m)))
-               (let ((ok (watch-cancel! watch-reg wid)))
-                 (send reply-pid (cons 'watch-canceled (if ok wid #f))))
-               (loop st)))
+             (send watch-fanout (list 'watch-cancel (cadr m) (caddr m)))
+             (loop st))
 
             ;; ---- leases: fully leaderless (any node serves; found on the k3s run —
             ;; real etcd serves Lease RPCs on ANY member, and a kube control plane
@@ -610,10 +633,11 @@
                     (persist-boot! boot-epoch)   ; the wipe adopted the SENDER's counter
                     (ctx-flush! ctx)
                     (set! acc '())                 ; installed state supersedes
-                    (if (> (reg-count watch-reg) 0)
-                        (begin
-                          (watch-on-apply! watch-reg ctx pre (mvcc-current-rev ctx))
-                          (watch-check-compaction! watch-reg ctx)))
+                    ; cw-04k: off-thread; order matters (apply window before the
+                    ; compaction-floor advance) — FIFO to the single fanout worker
+                    ; preserves it, same as shard-actor.scm's snapshot-install path.
+                    (watch-notify-apply! pre (mvcc-current-rev ctx))
+                    (send watch-fanout (list 'watch-compact))
                     (let ((st2 (qp-install-snapshot st sbase 0 '())))
                       (publish! st2)
                       (loop st2))))

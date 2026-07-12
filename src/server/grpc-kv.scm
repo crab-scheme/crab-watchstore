@@ -61,6 +61,7 @@
 (include "src/store-ctx.scm")
 (include "src/mvcc.scm")
 (include "src/proto.scm")
+(include "src/shard-route.scm")   ; cw-0v2 (G3): prefix-aware key->shard routing
 
 ; ===========================================================================
 ; small helpers
@@ -515,14 +516,10 @@
                                     (string-append my-node-name ":" (number->string i))))))
           (if p (vector-set! shard-pid-cache i p))
           (or p shard-pid))))          ; fall back to group 0 until the replica publishes
-  (define (key-shard key)              ; FNV-1a over the key bytes, mod N
-    (if (<= shard-groups 1) 0
-        (let ((len (bytevector-length key)))
-          (let loop ((i 0) (h 2166136261))
-            (if (= i len) (modulo h shard-groups)
-                (loop (+ i 1)
-                      (modulo (* (bitwise-xor h (bytevector-u8-ref key i)) 16777619)
-                              4294967296)))))))
+  ; cw-0v2 (G3): prefix-aware — a /registry/ key hashes its RESOURCE SEGMENT
+  ; (src/shard-route.scm), so per-resource watch/LIST/CAS stay on one shard and
+  ; pods/leases/events spread across groups; other keys hash whole-key FNV-1a.
+  (define (key-shard key) (shard-route-hash key shard-groups))
   (define (shard-pid-for key) (shard-pid-idx (key-shard key)))
   ; cw-kp0 Phase 4: the distinct shard indices a Txn's keys map to (its participants).
   ; <=1 -> the Txn commits atomically on that one shard (route there). >1 -> it spans
@@ -955,7 +952,11 @@
                          (cons 'max-mod-rev    (list-ref rl 10))))
              ; cw-ivt P2: a spanning range (range-end set) scatter-gathers across groups;
              ; a single-key range routes to its one group.
-             (res (if (and rend (> shard-groups 1)) (shard-range-all opts) (shard-range opts))))
+             ; cw-0v2 (G3): a prefix range CONTAINED in one resource segment (the k8s
+             ; LIST pattern) also routes to its one group — same shard, coherent revs.
+             (res (if (and rend (> shard-groups 1)
+                          (not (shard-route-single? key rend shard-groups)))
+                      (shard-range-all opts) (shard-range opts))))
       (cond
         ((not (pair? res)) (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: not leader")))
         ((eq? (car res) 'kv-range-ok)
@@ -1049,7 +1050,9 @@
       (let* ((want-prev (galist 'prev_kv dr #f))
            ; snapshot the to-be-deleted live KVs via a Range over the same span.
            ; cw-ivt P2: a spanning span scatter-gathers; single-key routes to one group.
-           (span? (and rend (> shard-groups 1)))
+           ; cw-0v2 (G3): a span contained in one resource segment routes to one group.
+           (span? (and rend (> shard-groups 1)
+                       (not (shard-route-single? key rend shard-groups))))
            (prev-kvs (if want-prev
                          (let* ((ropts (list (cons 'key key) (cons 'range-end rend)))
                                 (rres (if span? (shard-range-all ropts) (shard-range ropts))))
@@ -1169,12 +1172,17 @@
       (if deny (cons 'err deny)
       (let* ((itxn  (etcd-txn->internal tr))
              (parts (txn-participant-shards itxn)))
-        ; cw-kp0 Phase 4: in MULTI-GROUP mode every Txn goes through the 2PC coordinator so
-        ; it commits at a global rev — even a single-participant Txn, otherwise it would use
-        ; the shard's LOCAL rev and a key written by both a single-shard Txn and a cross-shard
-        ; Txn would get two incompatible rev sequences (Elle :incompatible-order). Single-group
-        ; (shard-groups=1, no authority) keeps the original local-rev fast path.
-        (if (> shard-groups 1)
+        ; cw-kp0 Phase 4: a Txn that SPANS groups goes through the 2PC coordinator so it
+        ; commits at a global rev.
+        ; cw-0v2 (G3): a SINGLE-participant Txn (the k8s single-key CAS — under prefix
+        ; routing every per-resource Txn is one) routes DIRECTLY to its owning shard:
+        ; atomic there, and its compares/writes live in the SAME shard-local rev domain
+        ; as the direct Put/Range path (2PC's authority-granted revs are a different
+        ; domain — a CAS through 2PC compared against a rev the client took from a
+        ; LIST and got the wrong verdict, and its write bypassed the shard's watchers).
+        ; Mixing 2PC and direct writes on the SAME key remains a documented divergence;
+        ; the k8s access pattern never does.
+        (if (and (> shard-groups 1) (pair? parts) (pair? (cdr parts)))
             (txn-2pc itxn)
             ; cw-l5h: ASYNC Txn submission (mirrors EXP5 handle-put). The blocking ask-shard-on
             ; serialized each worker per Txn -> avgbatch=1 -> ~21 w/s on EBS, starving the kube-
@@ -1542,7 +1550,11 @@
              (cr (and wr (galist 'create_request wr #f)))
              (re (and cr (let ((r (galist 'range_end cr EMPTY)))
                            (if (= (bytevector-length r) 0) #f r)))))
-        (when (and cr re)
+        ; cw-0v2 (G3): a range watch CONTAINED in one resource segment (the k8s
+        ; per-prefix watch) is NOT cross-shard — the worker self-registers at the
+        ; owning shard (grpc-watch.scm makes the same shard-route-single? call).
+        (when (and cr re
+                   (not (shard-route-single? (galist 'key cr EMPTY) re shard-groups)))
           (let* ((key       (galist 'key cr EMPTY))
                  (start-rev (galist 'start_revision cr 0))
                  (prev-kv?  (galist 'prev_kv cr #f))

@@ -577,6 +577,24 @@
   ; a concurrent stream/request message).  The main loop drains these first.
   (define grpc-pending '())
 
+  ; cw-vku: async Range/LIST pool — handle-range hands off after decode+authz so a
+  ; multi-second k8s relist never holds THIS dispatcher's mailbox (see
+  ; server/grpc-range-worker.scm for the field evidence + protocol).
+  (define range-pool
+    (let spawn-rp ((i 0) (acc '()))
+      (if (= i 4) (list->vector (reverse acc))
+          (spawn-rp (+ i 1)
+                    (cons (spawn-source-dedicated
+                           "(include \"src/server/grpc-range-worker.scm\")"
+                           'grpc-range-worker-main (or my-node-name "")
+                           shard-pid cluster-id member-id shard-groups)
+                          acc)))))
+  (define range-pool-rr 0)
+  (define (dispatch-range-async! h opts limit route)
+    (set! range-pool-rr (modulo (+ range-pool-rr 1) (vector-length range-pool)))
+    (send (vector-ref range-pool range-pool-rr) (list 'range-do h opts limit route))
+    'async)
+
   ; ---- shard round-trips (this actor's PID is the reply-pid) ----
   ; raw-receive here must yield the shard's reply; any dispatcher traffic that
   ; races in (*grpc-request* / *grpc-stream-msg* / *grpc-stream-end*) is buffered
@@ -954,24 +972,13 @@
              ; a single-key range routes to its one group.
              ; cw-0v2 (G3): a prefix range CONTAINED in one resource segment (the k8s
              ; LIST pattern) also routes to its one group — same shard, coherent revs.
-             (res (if (and rend (> shard-groups 1)
-                          (not (shard-route-single? key rend shard-groups)))
-                      (shard-range-all opts) (shard-range opts))))
-      (cond
-        ((not (pair? res)) (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: not leader")))
-        ((eq? (car res) 'kv-range-ok)
-         (let ((cur-rev (let ((r (list-ref res 1))) (if (< r 1) 1 r))) ; etcd: never report rev<1 (cw-lkq.9)
-               (term    (list-ref res 2))
-               (err     (list-ref res 3)) (total (list-ref res 4))
-               (tuples  (list-ref res 5)))
-           (if (eq? err 'compacted)
-               (cons 'err (cons GRPC-OUT-OF-RANGE ETCD-ERR-COMPACTED))
-               (let* ((limit (list-ref rl 2))
-                      ; etcd `more` = a limit was applied AND more keys exist past it.
-                      (more  (and (> limit 0) (> total (length tuples)))))
-                 (cons 'ok (etcd-pb-encode-range-resp cluster-id member-id cur-rev term
-                                                      tuples more total))))))
-        (else (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: not leader")))))))) ; +let +if (authz)
+             ; cw-vku: hand off to the async range pool — the blocking shard ask +
+             ; response encode must NOT hold this dispatcher (multi-second k8s
+             ; relists stalled every RPC on this port, incl. sub-ms PUT acks).
+             (route (if (and rend (> shard-groups 1)
+                             (not (shard-route-single? key rend shard-groups)))
+                        'all (key-shard key))))
+      (dispatch-range-async! h opts (list-ref rl 2) route))))) ; +let +if (authz)
 
   ; ---- KV/Put ----
   ; prev_kv snapshot (if requested) -> propose ("PUT" key value lease) -> PutResponse.
@@ -1580,7 +1587,19 @@
                 (send (shard-pid-idx i) (list 'watch-register (self) spec))
                 (rloop (+ i 1)))))))))
 
+  ; cw-vku diagnosis: any single dispatch that holds this dispatcher >100ms
+  ; stalls EVERY conn on this node's client port — log it with wall-clock time.
   (define (dispatch! h)
+    (let ((td (current-second))
+          (path (grpc-request-path h)))       ; capture BEFORE responding closes h
+      (dispatch-inner! h)
+      (let ((ms (exact (round (* 1000 (- (current-second) td))))))
+        (if (>= ms 100)
+            (begin (display (string-append "SLOW grpc-dispatch t=" (number->string td)
+                                           " ms=" (number->string ms)
+                                           " path=" path))
+                   (newline))))))
+  (define (dispatch-inner! h)
     (let ((path (grpc-request-path h))
           (peer (grpc-request-peer-identity h)))
       ; cw-u4a.21: surface the verified mTLS client identity (or #f over h2c /
@@ -1952,10 +1971,26 @@
     ; cyclic garbage is only reclaimed by an explicit cycle-registry sweep on THIS
     ; thread. No-op on builds without tracing-cycle-collector.
     (set! gc-msg-count (+ gc-msg-count 1))
-    (if (= 0 (modulo gc-msg-count 512)) (collect-garbage))
+    (if (= 0 (modulo gc-msg-count 512))
+        ; cw-vku diagnosis: a slow dispatcher GC stalls every conn on this port
+        (let ((t0 (current-second)))
+          (collect-garbage)
+          (let ((ms (exact (round (* 1000 (- (current-second) t0))))))
+            (if (>= ms 100)
+                (begin (display (string-append "SLOW grpc-gc t=" (number->string t0)
+                                               " gc=" (number->string ms)))
+                       (newline))))))
     (let ((m (next-message)))
       (cond
-        ((not (pair? m)) (xwatch-tick!) (loop))   ; idle tick -> flush cross-shard watch buffer in rev order
+        ((not (pair? m))
+         (let ((tx (current-second)))
+           (xwatch-tick!)
+           (let ((ms (exact (round (* 1000 (- (current-second) tx))))))
+             (if (>= ms 100)
+                 (begin (display (string-append "SLOW grpc-xwatch t=" (number->string tx)
+                                                " ms=" (number->string ms)))
+                        (newline)))))
+         (loop))   ; idle tick -> flush cross-shard watch buffer in rev order
         ((eq? (car m) '*grpc-request*)
          (dispatch! (cadr m)) (loop))
         ; EXP5 (cw-juw): async PUT commit landed -> encode + respond now.

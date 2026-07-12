@@ -1016,6 +1016,11 @@
              ; Rc heap can't free — sweep the (thread-local) cycle registry
              ; periodically. No-op on builds without tracing-cycle-collector.
              (if (= 0 (modulo fwd-ticks 16)) (collect-garbage))
+             ; cw-vku: incremental COMPACT GC — the COMPACT apply only flips the
+             ; ErrCompacted gate; the physical sweep runs one bounded slice per
+             ; tick so it never holds this mailbox for the full window. The
+             ; flush-and-drain! right below makes the slice durable this tick.
+             (mvcc-compact-gc-step! ctx)
              (flush-and-drain! flush-base)
              ; cw-l5h: PUSH periodic progress (current rev) to every synced watcher ~every 4
              ; ticks. Idle-resource watches get no events, so this is the only way their kube-

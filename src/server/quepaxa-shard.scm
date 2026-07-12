@@ -94,6 +94,15 @@
     (define prof-pending '())                ; ((bid tpropose tsubmit n) ...)
     (define prof-flush-ms 0)
     (define (prof-ms a b) (exact (round (* 1000 (- a b)))))
+    ; cw-vku diagnosis: always-on slow-path spans (cheap when fast). Any shard
+    ; action (engine step / GC / flush) that holds THIS mailbox >100ms logs one
+    ; line WITH a wall-clock timestamp so stalls correlate across nodes.
+    (define (slow! what ms t0)
+      (if (>= ms 100)
+          (begin
+            (display (string-append "SLOW " (qk) " t=" (number->string t0)
+                                    " " what "=" (number->string ms)))
+            (newline))))
 
     (define new-coord #f)                    ; set by a QP-COORD apply; post! adopts
     (define (apply-cmd! sm cmd)
@@ -113,8 +122,10 @@
                      (ttl (mvcc-lease-meta-get ctx id)))
                 (if ttl (hashtable-set! lease-deadlines id (+ (current-second) ttl)))
                 (set! acc (cons (list 'keepalive-ok id (if ttl ttl 0)) acc)))
-          (let ((pre (mvcc-current-rev ctx)))
+          (let ((pre (mvcc-current-rev ctx))
+                (tap (current-second)))
             (let ((res (mvcc-apply ctx cmd)))
+              (slow! (string-append "apply-" (cmd-op cmd)) (prof-ms (current-second) tap) tap)
               (set! acc (cons (if (string=? (cmd-op cmd) "TXN")
                                   (cons 'txnr (cons (mvcc-current-rev ctx) res))
                                   res)
@@ -184,7 +195,8 @@
                                                          (number->string (prof-ms (cadr pe) (caddr pe)))
                                                          "-")
                                             " cons=" (number->string (prof-ms now (cadr pe)))
-                                            " flush=" (number->string prof-flush-ms)))
+                                            " flush=" (number->string prof-flush-ms)
+                                            " t=" (number->string now)))
                                           (newline)
                                           (set! prof-pending
                                                 (let del2 ((l prof-pending))
@@ -213,11 +225,13 @@
     (define watch-inflight 0)
     (define watch-backlog '())
     (define (watch-drain-one-ack!)
-      (let wait ()
-        (let ((r (raw-receive)))
-          (if (and (pair? r) (eq? (car r) 'watch-apply-ack))
-              (set! watch-inflight (- watch-inflight 1))
-              (begin (set! watch-backlog (append watch-backlog (list r))) (wait))))))
+      (let ((t0 (current-second)))
+        (let wait ()
+          (let ((r (raw-receive)))
+            (if (and (pair? r) (eq? (car r) 'watch-apply-ack))
+                (set! watch-inflight (- watch-inflight 1))
+                (begin (set! watch-backlog (append watch-backlog (list r))) (wait)))))
+        (slow! "watch-wait" (prof-ms (current-second) t0) t0)))
     (define (watch-notify-apply! pre post)
       (if (> post pre)
           (begin
@@ -288,28 +302,38 @@
       (if new-coord
           (begin (set! st (qp-set-coord st new-coord)) (set! new-coord #f)))
       (if (ctx-dirty? ctx)
-          (if prof?
-              (let ((t0 (current-second)))
-                (ctx-flush! ctx)
-                (set! prof-flush-ms (prof-ms (current-second) t0)))
-              (ctx-flush! ctx)))                 ; durable BEFORE any ack
+          (let ((t0 (current-second)))
+            (ctx-flush! ctx)                     ; durable BEFORE any ack
+            (set! prof-flush-ms (prof-ms (current-second) t0))
+            (slow! "flush" prof-flush-ms t0)))
       (if (>= (qp-applied st) next-compact)
           (begin
             (set! next-compact (+ (qp-applied st) QP-COMPACT-EVERY))
             (if (> (- (qp-applied st) QP-LOG-KEEP) (qp-base st))
-                (set! st (qp-compact-to st (- (qp-applied st) QP-LOG-KEEP))))))
-      (let* ((st (drain-writes! st))
+                (let ((t0 (current-second)))
+                  (set! st (qp-compact-to st (- (qp-applied st) QP-LOG-KEEP)))
+                  (slow! "compact" (prof-ms (current-second) t0) t0)))))
+      (let* ((td (current-second))
+             (st (drain-writes! st))
+             (x (slow! "drainw" (prof-ms (current-second) td) td))
              (st (drain-reads! st))
              (st (maybe-snap-pull! st)))
         (publish! st)
         st))
 
     ; run one engine action: (st -> (st' . outs)), then post!
+    (define engine-what "?")                 ; cw-vku: label for slow! spans
     (define (engine! st action)
-      (let* ((old (qp-applied st))
-             (r (action st)))
+      (let* ((t0 (current-second))
+             (old (qp-applied st))
+             (r (action st))
+             (t1 (current-second)))
+        (slow! (string-append engine-what "-act") (prof-ms t1 t0) t0)
         (emit! (cdr r))
-        (post! (car r) old)))
+        (slow! "emit" (prof-ms (current-second) t1) t1)
+        (let ((st2 (post! (car r) old)))
+          (slow! engine-what (prof-ms (current-second) t0) t0)
+          st2)))
 
     ; ---- coordinator lease expiry (same ADR 0003 §2 flow, coordinator-owned) ----
     (define (lease-tick! st)
@@ -359,6 +383,7 @@
                                           (cadddr c) best)))))))
               (set! prof-pending
                     (cons (list bid (current-second) tsub (length items)) prof-pending))))
+        (set! engine-what "propose")
         (engine! st (lambda (s) (qp-propose-batch s (map cdr items))))))
 
     ; boot epoch: persisted, strictly increasing per restart (bids embed it so
@@ -397,13 +422,23 @@
              (let ((from (cadr m)) (rpc (caddr m)))
                (if (eq? (car rpc) 'snap-pull)
                    (begin (ship-snapshot! from st) (loop st))
-                   (loop (engine! st (lambda (s) (qp-step s from rpc)))))))
+                   (begin
+                     (set! engine-what (string-append "peer-" (symbol->string (car rpc))))
+                     (loop (engine! st (lambda (s) (qp-step s from rpc))))))))
 
             ;; ---- tick: hedge/retransmit/gap-fill + lease expiry + progress ----
             ((eq? (car m) 'tick)
              (set! ticks (+ ticks 1))
-             (if (= 0 (modulo ticks 16)) (collect-garbage))
+             (if (= 0 (modulo ticks 16))
+                 (let ((t0 (current-second)))
+                   (collect-garbage)
+                   (slow! "gc" (prof-ms (current-second) t0) t0)))
              (send watch-fanout (list 'watch-progress))   ; cw-04k: off-thread
+             ; cw-vku: incremental COMPACT GC — one bounded slice per tick (the
+             ; apply only flips the gate; see mvcc-compact-gc-step!). Flushed by
+             ; the engine!'s post! below (ctx goes dirty) before any ack.
+             (mvcc-compact-gc-step! ctx)
+             (set! engine-what "tick")
              (let* ((st (engine! st qp-tick))
                     (st (if (qp-coord? st) (lease-tick! st) st)))
                (loop st)))

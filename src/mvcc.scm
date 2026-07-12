@@ -1122,6 +1122,57 @@
        (cons 'ok compactRev)))))
 
 ; ---------------------------------------------------------------------------
+; INCREMENTAL compaction (cw-vku) — for the shard drivers' replicated COMPACT.
+;
+; mvcc-compact runs the whole window's GC synchronously; applied on the shard
+; thread of EVERY replica at the same log position, a 5-min k8s window at 11k
+; pods held every shard mailbox ~1s simultaneously (field: cluster-wide put
+; stalls every ~302s, timestamp-aligned apply-COMPACT on all 5 nodes).
+;
+; mvcc-compact-begin! flips ONLY the ErrCompacted gate (the externally visible
+; state transition — deterministic and identical on every replica) and leaves
+; the physical GC to mvcc-compact-gc-step!, which the driver calls once per
+; tick: one small slice per call, so the shard mailbox is never held for more
+; than one slice. GC progress is tracked in META-COMPACT-GC ("GC done through
+; rev X"); it rides the store, so restarts/snapshots resume where they left
+; off. Physical deletes are invisible to reads (the gate already answers
+; ErrCompacted below the floor; latest-version reads never see pruned rows),
+; so per-replica GC timing may differ — only the gate is replicated state.
+; ---------------------------------------------------------------------------
+(define META-COMPACT-GC (meta-key "compact-gc"))
+(define MVCC-COMPACT-STEP-SLICE 256)   ; revs GC'd per tick (bounds per-tick stall)
+
+(define (mvcc-compact-gc-rev ctx)      ; floor GC has completed through
+  (let ((b (kv-get ctx META-COMPACT-GC)))
+    (if b (bytes->u64 b 0) 0)))
+
+; gate-only compact: same result protocol as mvcc-compact, no GC work.
+(define (mvcc-compact-begin! ctx compactRev)
+  (let ((cur-compact (mvcc-compact-rev ctx))
+        (cur-rev     (mvcc-current-rev ctx)))
+    (cond
+      ((<= compactRev cur-compact) (cons 'err-compacted cur-compact))
+      ((> compactRev cur-rev)      (cons 'err-future-rev cur-rev))
+      (else
+       ; seed the GC cursor at the OLD floor exactly once (a pending cursor
+       ; from an earlier begin! is already <= cur-compact — keep it).
+       (if (not (kv-get ctx META-COMPACT-GC))
+           (kv-put! ctx META-COMPACT-GC (u64->bytes cur-compact)))
+       (kv-put! ctx META-COMPACT-REV (u64->bytes compactRev))
+       (cons 'ok compactRev)))))
+
+; one bounded GC slice; -> #t if more work remains, #f when caught up.
+(define (mvcc-compact-gc-step! ctx)
+  (let ((done (mvcc-compact-gc-rev ctx))
+        (floor (mvcc-compact-rev ctx)))
+    (if (>= done floor)
+        #f
+        (let ((to (min floor (+ done MVCC-COMPACT-STEP-SLICE))))
+          (mvcc-compact-slice! ctx done to)
+          (kv-put! ctx META-COMPACT-GC (u64->bytes to))
+          (< to floor)))))
+
+; ---------------------------------------------------------------------------
 ; mvcc-lease-grant!  (cw-u4a.17, ADR 0003 §1)
 ; ---------------------------------------------------------------------------
 ;
@@ -1412,10 +1463,13 @@
                     (cons "DEL" (cons main deleted)))
              (cons "DEL" (cons prev-rev 0)))))   ; no effect => no bump
       ((string=? op "COMPACT")
-       ; COMPACT does NOT bump current-rev — call mvcc-compact directly.
+       ; COMPACT does NOT bump current-rev.  cw-vku: flip ONLY the ErrCompacted
+       ; gate here — the physical GC is incremental (mvcc-compact-gc-step!, one
+       ; slice per driver tick), so a big window never holds every replica's
+       ; shard mailbox for the full sweep at the same log position.
        ; The rev argument is a decimal-ASCII bytevector (same convention as leaseId).
        (let ((rev (let ((l (bytes->int (list-ref cmd 1)))) (if l l 0))))
-         (mvcc-compact ctx rev)))
+         (mvcc-compact-begin! ctx rev)))
       ((string=? op "LEASE-GRANT")
        ; ("LEASE-GRANT" id ttl): create the lease object.  A grant writes only the
        ; replicated lease-meta scalar (+ the auto-id counter) — NOT a keyspace

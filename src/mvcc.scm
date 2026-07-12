@@ -114,17 +114,9 @@
                 (begin (bytevector-u8-set! buf j byte)
                        (loop (+ i 1) (+ j 1)))))))))
 
-; un-escape: reverse of key-cf-escape (0x00 followed by anything, always 0xFF
-; inside an escaped run, collapses back to a single 0x00).
-(define (key-cf-unescape EK)
-  (let* ((n (bytevector-length EK))
-         (buf (make-bytevector n 0)))
-    (let loop ((i 0) (j 0))
-      (if (= i n)
-          (subbv buf 0 j)
-          (if (= (bytevector-u8-ref EK i) 0)
-              (begin (bytevector-u8-set! buf j 0) (loop (+ i 2) (+ j 1)))
-              (begin (bytevector-u8-set! buf j (bytevector-u8-ref EK i)) (loop (+ i 1) (+ j 1))))))))
+; un-escape (0x00 followed by anything, always 0xFF inside an escaped run,
+; collapses back to a single 0x00) is now done natively — see
+; bytevector-nul-unescape at key-cf-decode-user-key (cw-71k, G2).
 
 (define (key-cf-prefix K)               ; NS-KEY || esc(K) || TERM  (scan prefix; sorts ascending)
   (bytevector-append (mvcc-byte NS-KEY)
@@ -350,6 +342,14 @@
 (define (kv-rec-lease      r) (vector-ref r 4))
 (define (kv-rec-value      r) (vector-ref r 5))
 
+; cw-71k (G2): raw peeks on the ENCODED record bytes.  mvcc-range/compaction
+; inspect EVERY version row of a key but only the visible winner needs the
+; full decode — kv-record-decode subbv's the whole value (multi-KB pod
+; objects), so decoding skipped versions dominated per-row cost at real
+; version depth.  A skipped version now costs two native refs instead.
+(define (kv-raw-tombstone? b) (= (bytevector-u8-ref b 0) REC-TOMBSTONE))
+(define (kv-raw-mod-rev    b) (bytes->u64 b 9))
+
 ; ---------------------------------------------------------------------------
 ; REV-CF event record (ADR §5)
 ;   u8    kind         ; 0 = PUT, 1 = DELETE
@@ -538,7 +538,7 @@
               ; versions newest-first via INV-rev), so decode it inline instead of a
               ; redundant mvcc-get-latest point seek per key (~n extra seeks on a bulk
               ; range delete). Live => include; tombstone => key already absent, skip.
-              ((not (kv-rec-tombstone? (kv-record-decode (cdar rs))))
+              ((not (kv-raw-tombstone? (cdar rs)))   ; cw-71k: tag peek, no full decode
                (loop (cdr rs) uk (cons uk out)))                              ; live -> include
               (else (loop (cdr rs) uk out)))))))                              ; tombstoned -> skip
   ))
@@ -655,9 +655,15 @@
 ; ---- decode user-key from a KEY-CF composite key ----
 ;   composite: 0x01 || esc(K) || TERM(0x00 0x00) || INV(rev16)
 ;   the escaped-key run is bytes [1, term); un-escape to recover K.
+;
+; cw-71k (G2): this is called once per SCANNED ROW in mvcc-range/DeleteRange
+; (every version in a key's group, not just the winner) — profiled at
+; ~0.55ms/row with key-cf-find-term (interpreted byte loop) + subbv (slice
+; alloc) + key-cf-unescape (interpreted byte loop) as three separate passes.
+; bytevector-nul-unescape fuses find-term + unescape into ONE native pass,
+; same playbook as cw-xq9's subbv fix.
 (define (key-cf-decode-user-key fk)
-  (let ((term (key-cf-find-term fk 1)))
-    (key-cf-unescape (subbv fk 1 term))))
+  (bytevector-nul-unescape fk 1))
 
 ; ---- decode the INV(rev16) back to the main revision ----
 ;   the inv16 bytes are the 16 bytes right after the TERM(0x00 0x00) pair.
@@ -794,20 +800,25 @@
               ; (newest→oldest).  Pick the visible version at at-rev.
               (if (null? group)
                   results
+                  ; cw-71k (G2): peek tag/mod-rev off the raw bytes and decode
+                  ; ONLY the visible winner — kv-record-decode copies the whole
+                  ; value, and at real version depth (kubelet status churn)
+                  ; most rows here are skipped, not returned.
                   (let loop ((g group))
                     (if (null? g)
                         results                        ; no visible version
                         (let* ((row (car g))
-                               (rec (kv-record-decode (cdr row)))
-                               (mr  (kv-rec-mod-rev rec)))
+                               (vbv (cdr row))
+                               (mr  (kv-raw-mod-rev vbv)))
                           (cond
                             ; skip versions newer than read revision
                             ((> mr at-rev) (loop (cdr g)))
                             ; first visible version is tombstone -> absent
-                            ((kv-rec-tombstone? rec) results)
+                            ((kv-raw-tombstone? vbv) results)
                             ; live -> add to results if in-range and passes rev filters
                             (else
-                             (let ((cr (kv-rec-create-rev rec)))
+                             (let* ((rec (kv-record-decode vbv))
+                                    (cr  (kv-rec-create-rev rec)))
                                (if (and (range-in-range? uk key range-end)
                                         (or (= min-cr 0) (>= cr min-cr))
                                         (or (= max-cr 0) (<= cr max-cr))
@@ -1077,13 +1088,12 @@
                          (if (null? g)
                              (let ((nf (reverse below)))          ; newest-first ≤ compactRev
                                (if (pair? nf)
-                                   (let* ((latest-rec (kv-record-decode (cdar nf)))
-                                          (to-delete (if (kv-rec-tombstone? latest-rec)
+                                   (let* ((to-delete (if (kv-raw-tombstone? (cdar nf))  ; cw-71k: tag peek
                                                          nf          ; deleted key: drop all
                                                          (cdr nf)))) ; keep live latest
                                      (for-each (lambda (row) (kv-del! ctx (car row)))
                                                to-delete))))
-                             (let ((mr (kv-rec-mod-rev (kv-record-decode (cdar g)))))
+                             (let ((mr (kv-raw-mod-rev (cdar g))))   ; cw-71k: mod-rev peek
                                (if (<= mr compactRev)
                                    (split (cdr g) (cons (car g) below))
                                    (split (cdr g) below)))))

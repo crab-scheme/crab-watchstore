@@ -27,4 +27,6 @@
   (reset-ns! ctx NS-LEASE)   ; lease -> keys index
   (kv-del! ctx RAFT-APPLIED-KEY)
   (mvcc-live-stats-invalidate! ctx)   ; cw-xq9: bulk wipe bypassed mvcc-delete
+  (set-shard-ctx-crev! ctx -1)        ; cw-71k: EXP7 crev cache survives the META
+                                      ; wipe, so current-rev kept counting across resets
   (ctx-flush! ctx))

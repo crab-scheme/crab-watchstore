@@ -483,4 +483,71 @@
   (check "§2 live event 10 at position 7"
          '(500 put "/d/4" 10) (list-ref tuples 7)))
 
+; ===========================================================================
+; §6 — cw-i07 (G4): a pending do-create must not hold OTHER watch_ids'
+;      already-flowing events hostage on the same stream.
+;
+;      grpc-watch.scm's do-create registers the new watch and then loops
+;      awaiting its 'watch-created ack; any 'watch-response frame that
+;      arrives on the worker's mailbox during that await used to be
+;      unconditionally buffered and held until the new watch's created-ack
+;      landed — even one that belonged to a DIFFERENT, already-established
+;      watch_id on the same stream. Under a slow shard round-trip that
+;      starved every other watcher on the connection of live events for the
+;      whole registration window (the informer-pinning bug this gate
+;      targets).
+;
+;      This exercises the FIXED arbitration rule directly: a wr-sexp whose
+;      wid is already in live-wids ships immediately; only the pending new
+;      watch's own replay (wid not yet established) waits for its ack. It
+;      mirrors do-create's cond arm exactly (see cw-i07 in grpc-watch.scm)
+;      against a scripted mailbox sequence, so the ordering guarantee is
+;      pinned independent of real shard/network timing.
+; ===========================================================================
+(section "§6: do-create does not hold other watch_ids' events hostage (cw-i07)")
+
+(define fair-live-wids '())
+(define fair-out '())
+(define (fair-emit! wr) (set! fair-out (cons wr fair-out)))
+
+; mirrors grpc-watch.scm do-create's 'watch-response cond arm post-fix.
+(define (fair-handle-response wr buffered)
+  (let ((w (car wr)))
+    (if (memv w fair-live-wids)
+        (begin (fair-emit! wr) buffered)
+        (cons wr buffered))))
+
+; mirrors do-create's 'watch-created cond arm: establish, ack, flush replay.
+(define (fair-handle-created wid buffered)
+  (set! fair-live-wids (cons wid fair-live-wids))
+  (fair-emit! (list wid 0 #t #f "" 0 '()))
+  (for-each fair-emit! (reverse buffered)))
+
+; wid 601 is already established (a prior create completed on this stream).
+(fair-handle-created 601 '())
+
+; wid 602's create is now in flight (its await loop is running). While it
+; is pending: a LIVE event for the already-established wid 601 arrives,
+; then wid 602's own replay event (buffered — no created-ack yet), then
+; wid 602's created-ack (which flushes its buffered replay).
+(let* ((b0 '())
+       (b1 (fair-handle-response (list 601 5 #f #f "" 0 '((put #(k1) #f))) b0))
+       (b2 (fair-handle-response (list 602 3 #f #f "" 0 '((put #(k2) #f))) b1)))
+  (fair-handle-created 602 b2))
+
+(let ((order (reverse fair-out)))
+  (check "§6 4 frames emitted" 4 (length order))
+  (check "§6 wid 601's created ack first"
+         601 (car (list-ref order 0)))
+  (check "§6 wid 601's live event ships WHILE 602's create is pending (not held hostage)"
+         601 (car (list-ref order 1)))
+  (check "§6 wid 602's created ack only after its own await resolves"
+         602 (car (list-ref order 2)))
+  (check "§6 wid 602's own buffered replay flushes after its created ack"
+         602 (car (list-ref order 3)))
+  (check "§6 no reordering within wid 601 (its one event is exactly its own)"
+         '(put #(k1) #f) (car (list-ref (list-ref order 1) 6)))
+  (check "§6 no reordering within wid 602 (its replay event is exactly its own)"
+         '(put #(k2) #f) (car (list-ref (list-ref order 3) 6))))
+
 (done!)

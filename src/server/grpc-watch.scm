@@ -359,13 +359,28 @@
           ; NOTE the buffered watch-responses here are the NEW watch's replay — they
           ; must not be emitted before its created-ack (etcd contract), hence the
           ; local buffer instead of immediate emit.
+          ;
+          ; cw-i07 (G4): the old else branch buffered EVERY 'watch-response that
+          ; arrived during this await, regardless of which watch_id it belonged to
+          ; — so a slow do-create held ALREADY-ESTABLISHED watchers' live events
+          ; hostage on this stream for the whole registration round-trip (the
+          ; suspected KCM pinned-informer cause). Only the pending NEW watch's own
+          ; replay needs to wait for its created-ack; a wr-sexp whose wid is
+          ; already in live-wids belongs to a watcher that acked earlier on this
+          ; same stream, so ship it straight through emit-wr! — no reordering
+          ; WITHIN a wid (each wid's frames still arrive here in shard-send order,
+          ; and its own frames still only ever go through one of the two arms).
           (begin
             (send shard-pid (list 'watch-register (self) spec))
             (let await ((buffered '()))
               (let ((r (raw-receive)))
                 (cond
                   ((not (pair? r)) (await buffered))
-                  ((eq? (car r) 'watch-response) (await (cons (cadr r) buffered)))
+                  ((eq? (car r) 'watch-response)
+                   (let* ((wr (cadr r)) (wid (car wr)))
+                     (if (memv wid live-wids)
+                         (begin (emit-wr! wr) (await buffered))
+                         (await (cons wr buffered)))))
                   ((eq? (car r) 'watch-created)
                    ; cw-l5h: shape is now (watch-created WID CUR-REV). Use the shard's accurate
                    ; current-rev for the created-ack header, NOT the pre-register snap-rev — that

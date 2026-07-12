@@ -27,6 +27,12 @@
 (define (range-worker-main handle cf sync?)
   (let ((ctx (make-ctx handle cf sync?)))
     (define (range-reply opts term)
+      ; FRESHNESS (cw-m9c judge blocker): this ctx is NOT the applying ctx, so
+      ; its cached current-rev (shard-ctx-crev) is stale the moment the shard
+      ; applies a write. Invalidate before EVERY read so mvcc-current-rev
+      ; re-reads META-CURRENT-REV from RocksDB (same hazard shard-actor.scm
+      ; handles at snapshot-install; mvcc-compact-rev is already uncached).
+      (set-shard-ctx-crev! ctx -1)
       (let* ((key (range-opt opts 'key (make-bytevector 0 0)))
              (rend (range-opt opts 'range-end #f))
              (res (mvcc-range ctx key rend opts)))

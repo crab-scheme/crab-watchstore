@@ -55,6 +55,17 @@
          (my-channel (vector-ref '#(1 3 4 5) (modulo my-group 4)))
          (handle (store-open db-path #t))
          (ctx (make-ctx handle "default" sync?))
+         ; cw-m9c (G1): same dedicated-thread Range/LIST reader pool as the raft
+         ; driver (shard-actor.scm) — big scans must not hold THIS mailbox
+         ; either, or writes/consensus ticks stall behind them for the full
+         ; scan+encode. Workers open their own ctx over the SAME shared handle.
+         (range-workers (let spawn-r ((i 0) (acc '()))
+                          (if (= i 2) (list->vector (reverse acc))
+                              (spawn-r (+ i 1)
+                                       (cons (spawn-source-dedicated
+                                              "(include \"src/server/range-worker.scm\")"
+                                              'range-worker-main handle "default" sync?)
+                                             acc)))))
          (watch-reg (make-watch-registry))
          (lease-deadlines (make-eqv-hashtable))
          (lease-revoking (make-eqv-hashtable)))
@@ -178,6 +189,16 @@
                               (walk (cdr d) rs))))))))
           st)))
 
+    ; cw-m9c (G1): dispatch a Range/LIST to the next range-worker in
+    ; round-robin, off this mailbox entirely — the worker scans its own
+    ; (per-request-refreshed) ctx over the shared handle and replies straight
+    ; to CONN. Any consensus ordering (linearizable read slot) has ALREADY
+    ; resolved by the time we dispatch. Term slot is 0, as range-reply's was.
+    (define range-rr 0)
+    (define (dispatch-range! conn opts)
+      (set! range-rr (modulo (+ range-rr 1) (vector-length range-workers)))
+      (send (vector-ref range-workers range-rr) (list 'kv-range-do conn opts 0)))
+
     ; drain completed linearizable reads: tag = ('read conn) | ('range conn opts)
     (define (drain-reads! st0)
       (let ((r (qp-take-reads st0)))
@@ -186,24 +207,9 @@
            (guard (e (#t #f))
              (case (car tag)
                ((read) (send (cadr tag) (cons 'read-ok (qp-applied (cdr r)))))
-               ((range) (send (cadr tag) (range-reply (caddr tag)))))))
+               ((range) (dispatch-range! (cadr tag) (caddr tag))))))
          (car r))
         (cdr r)))
-
-    (define (range-reply opts)
-      (let* ((key (range-opt opts 'key (make-bytevector 0 0)))
-             (rend (range-opt opts 'range-end #f))
-             (res (mvcc-range ctx key rend opts)))
-        (if (and (pair? res) (eq? (car res) 'err-compacted))
-            (list 'kv-range-ok (mvcc-current-rev ctx) 0 'compacted 0 '())
-            (list 'kv-range-ok (mvcc-current-rev ctx) 0 #f
-                  (car res)
-                  (map (lambda (item)
-                         (let ((uk (car item)) (rec (cdr item)))
-                           (list uk (kv-rec-value rec)
-                                 (kv-rec-create-rev rec) (kv-rec-mod-rev rec)
-                                 (kv-rec-version rec) (kv-rec-lease rec))))
-                       (cdr res))))))
 
     ; the lagging side pulls; the up-to-date side ships (same ws-snap frames)
     (define (maybe-snap-pull! st0)
@@ -378,7 +384,7 @@
             ((eq? (car m) 'kv-range)
              (let ((conn (cadr m)) (opts (caddr m)))
                (if (range-opt opts 'serializable #f)
-                   (begin (send conn (range-reply opts)) (loop st))
+                   (begin (dispatch-range! conn opts) (loop st))
                    (loop (engine! st (lambda (s) (qp-read s (list 'range conn opts))))))))
 
             ;; ---- replica-local reads (identical to the raft driver) ----

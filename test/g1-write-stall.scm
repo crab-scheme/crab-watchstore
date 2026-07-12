@@ -124,4 +124,37 @@
 (check "put-during-LIST stall < 50ms (cw-m9c G1 exit target)"
        #t (< (table-lookup 'ws-test "stall-ms") 50))
 
+; ---- read freshness across the WHOLE worker pool (judge blocker regression) ----
+; Each range-worker owns its own ctx; a cached current-rev there goes stale the
+; moment the shard applies a write. Interleave PUT/LIST 4 times (2x the 2-worker
+; round-robin pool) and assert BOTH the row count and the kv-range-ok header
+; revision advance on EVERY worker — a single stale worker fails this.
+(section "per-worker read freshness")
+(define fresh-src "
+  (define (b s) (string->utf8 s))
+  (define (ask pid msg) (send pid msg) (raw-receive))
+  (define (propose pid cmd) (ask pid (cons (self) cmd)))
+  (define (fresh)
+    (let ((o (table-lookup 'ws-shard-pid \"a:0\"))
+          (zero (make-bytevector 1 0)))
+      (define (list-now)
+        (let ((r (ask o (list 'kv-range (self)
+                              (list (cons 'key zero) (cons 'range-end zero))))))
+          (cons (cadr r) (cadddr (cdr r)))))   ; (rev . total)
+      (let loop ((i 0) (prev (list-now)) (ok #t))
+        (if (= i 4)
+            (table-insert! 'ws-test \"fresh-ok\" (if ok #t 'stale))
+            (begin
+              (propose o (list (b \"PUT\")
+                               (b (string-append \"fresh-\" (number->string i))) (b \"v\")))
+              (let ((cur (list-now)))
+                (loop (+ i 1) cur
+                      (and ok
+                           (> (car cur) (car prev))
+                           (= (cdr cur) (+ (cdr prev) 1))))))))))")
+(spawn-source fresh-src 'fresh)
+(spin (lambda () (table-lookup 'ws-test "fresh-ok")) "freshness sweep")
+(check "LIST count+rev advance after every PUT, across full worker pool"
+       #t (table-lookup 'ws-test "fresh-ok"))
+
 (done!)

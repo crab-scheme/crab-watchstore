@@ -95,8 +95,23 @@
       (if (and (pair? m) (eq? (car m) 'range-do))
           (let ((h (list-ref m 1)) (opts (list-ref m 2))
                 (limit (list-ref m 3)) (route (list-ref m 4)))
-            ; a dead/cancelled call handle must not take the pool worker down
-            (guard (e (#t #f))
+            ; a dead/cancelled call handle must not take the pool worker down —
+            ; but never drop an error SILENTLY (an encode/protocol bug would
+            ; otherwise leave the client hanging until deadline with no trace):
+            ; log the condition, then best-effort UNAVAILABLE so the client
+            ; fails fast instead of timing out.
+            (guard (e (#t
+                       (guard (e2 (#t #f))
+                         (display (string-append
+                                   "ERR grpc-range-worker t=" (number->string (current-second))
+                                   " err=" (if (error-object? e)
+                                               (error-object-message e)
+                                               "non-error condition")
+                                   " path=" (grpc-request-path h)))
+                         (newline))
+                       (guard (e3 (#t #f))
+                         (grpc-respond-error! h QRW-UNAVAILABLE
+                                              "etcdserver: range worker failure"))))
               (respond! h
                         (if (eq? route 'all)
                             (range-all opts limit)

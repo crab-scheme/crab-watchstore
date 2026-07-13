@@ -108,6 +108,11 @@
                 (path (grpc-request-path h))
                 (slot (if (auth-pinned? path h) 0 rr)))
            (when (not (auth-pinned? path h)) (set! rr (+ rr 1)))
+           ; cw-2au: any /Auth/* call may change auth state — tell EVERY worker
+           ; to drop its cached auth-disabled? so the next request re-reads it.
+           (when (string-prefix? "/etcdserverpb.Auth/" path)
+             (let bcast ((i 0))
+               (when (< i n) (send (worker i) '(auth-invalidate)) (bcast (+ i 1)))))
            (guard (e (#t (grpc-respond-error! h GRPC-UNAVAILABLE-ROUTER
                                               "router: worker unavailable")))
              (route! slot (worker slot) m)

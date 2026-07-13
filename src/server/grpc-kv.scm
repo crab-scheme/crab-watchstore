@@ -605,7 +605,7 @@
     (let wait ()
       (let ((r (raw-receive)))
         (if (and (pair? r)
-                 (memq (car r) '(*grpc-request* *grpc-stream-msg* *grpc-stream-end* put-done
+                 (memq (car r) '(*grpc-request* *grpc-stream-msg* *grpc-stream-end* put-done auth-invalidate
                                  ; cw-kp0: cross-shard watch frames delivered to THIS dispatcher's
                                  ; (self) — buffer them for the main loop's relay, never mis-parse
                                  ; one as a shard ack mid-write.
@@ -854,6 +854,13 @@
   ;   (cons 'user name-str)      authenticated as name
   ;   (cons 'err (status . msg)) deny (etcd-faithful: empty name vs bad token)
   (define (auth-identify h)
+    ; cw-2au: the per-request auth-state ask is a SYNC shard round-trip on EVERY
+    ; Range/Txn/write — under load it head-of-line-blocked this dispatcher up to
+    ; 13s (k3s boot reads then time out). Short-circuit through the same cached
+    ; auth-disabled? the async PUT path uses (same documented staleness caveat;
+    ; handle-auth-enable invalidates this worker's cache).
+    (if (auth-disabled?) 'disabled (auth-identify-uncached h)))
+  (define (auth-identify-uncached h)
     (let ((s (ask-shard (list 'auth-state (self)))))
       (if (or (not (pair? s)) (not (eq? (car s) 'auth-state-ok)) (not (cadr s)))
           'disabled                                   ; auth off (or seam down) -> allow
@@ -1310,6 +1317,7 @@
 
   ; ---- Auth/AuthEnable / AuthDisable ----  admin-gated (bootstrap allowed while off).
   (define (handle-auth-enable h bytes)
+    (set! auth-known #f)   ; cw-2au: re-read auth state on next request
     (let ((deny (admin-deny? h)))
       (if deny (cons 'err deny)
           (auth-write-ack->resp (shard-write (list (string->utf8 "AUTH-ENABLE")))
@@ -2002,6 +2010,10 @@
         ; EXP5 (cw-juw): async PUT commit landed -> encode + respond now.
         ((eq? (car m) 'put-done)
          (respond-put-done! m) (loop))
+        ; cw-2au: router broadcast after an /Auth/* call — drop the cached
+        ; auth-disabled? so the next request re-reads replicated auth state.
+        ((eq? (car m) 'auth-invalidate)
+         (set! auth-known #f) (loop))
         ; a subsequent client-streamed message -> forward to the stream worker.
         ; A dead worker (it crashed / already exited) must NOT take down the
         ; dispatcher: guard the send and drop the stale route.

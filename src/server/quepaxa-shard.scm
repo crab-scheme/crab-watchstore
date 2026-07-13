@@ -420,11 +420,34 @@
             ;; ---- engine RPC from a peer (incl. our snap-pull extension) ----
             ((eq? (car m) 'engine)
              (let ((from (cadr m)) (rpc (caddr m)))
-               (if (eq? (car rpc) 'snap-pull)
-                   (begin (ship-snapshot! from st) (loop st))
-                   (begin
-                     (set! engine-what (string-append "peer-" (symbol->string (car rpc))))
-                     (loop (engine! st (lambda (s) (qp-step s from rpc))))))))
+               (cond
+                 ((eq? (car rpc) 'snap-pull)
+                  (ship-snapshot! from st) (loop st))
+                 ; cw-65x: coordinator slot-coalescing — a pfwd storm (every
+                 ; non-coordinator forwards its batches here) used to open one
+                 ; consensus slot PER forwarded batch, so throughput was capped
+                 ; at slots/s regardless of batch size. Scoop every further
+                 ; pfwd already sitting in the mailbox and decide them all in
+                 ; ONE ('multi ...) slot; other frames are re-enqueued to self
+                 ; (same order-tolerance argument as the client-batch drain).
+                 ((and (eq? (car rpc) 'pfwd) (qp-coord? st))
+                  (let collect ((vals (list (cadr rpc))) (n 1))
+                    (let ((nxt (if (< n PROPOSE-BATCH-CAP) (raw-receive 0) '*timeout*)))
+                      (cond
+                        ((and (pair? nxt) (eq? (car nxt) 'engine)
+                              (pair? (caddr nxt)) (eq? (car (caddr nxt)) 'pfwd))
+                         (collect (cons (cadr (caddr nxt)) vals) (+ n 1)))
+                        (else
+                         (if (not (eq? nxt '*timeout*)) (send (self) nxt))
+                         (set! engine-what "pfwd-multi")
+                         (loop (engine! st
+                                 (lambda (s)
+                                   (if (null? (cdr vals))
+                                       (qp-start-slot s (car vals))
+                                       (qp-start-slot s (cons 'multi (reverse vals))))))))))))
+                 (else
+                  (set! engine-what (string-append "peer-" (symbol->string (car rpc))))
+                  (loop (engine! st (lambda (s) (qp-step s from rpc))))))))
 
             ;; ---- tick: hedge/retransmit/gap-fill + lease expiry + progress ----
             ((eq? (car m) 'tick)

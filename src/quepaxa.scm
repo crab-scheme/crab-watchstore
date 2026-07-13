@@ -352,9 +352,19 @@
          (mv (qp-sget mine slot))
          (st (qp-nset st 'mine (qp-sdel mine slot)))
          (st (qp-apply-prefix st)))
-    (if (and mv (not (equal? mv val)) (not (qp-bid-applied? st (car mv))))
+    (if (and mv (not (equal? mv val)) (not (qp-val-applied? st mv)))
         (qp-start-slot st mv)
         (cons st '()))))
+
+; cw-65x: a merged ('multi ...) value is applied iff every sub-bid applied
+; (they always apply together, but check all for safety).
+(define (qp-val-applied? st val)
+  (if (eq? (car val) 'multi)
+      (let loop ((vs (cdr val)))
+        (cond ((null? vs) #t)
+              ((qp-bid-applied? st (caar vs)) (loop (cdr vs)))
+              (else #f)))
+      (qp-bid-applied? st (car val))))
 
 (define (qp-bid-applied? st bid)
   (let loop ((l (qp-nget st 'bids)))
@@ -373,8 +383,19 @@
           (loop (qp-nset (qp-apply-val st val) 'applied next))))))
 
 (define (qp-apply-val st val)
-  (if (null? val) st                          ; no-op gap filler
-      (let ((bid (car val)) (cmds (cadr val)))
+  (cond
+    ((null? val) st)                          ; no-op gap filler
+    ; cw-65x: merged slot — a coordinator coalesced several forwarded batches
+    ; into ONE consensus slot. Apply each sub-batch under its own bid so
+    ; exactly-once dedup, hold clearing, read completion and per-bid acks all
+    ; behave exactly as if each had won its own slot.
+    ((eq? (car val) 'multi)
+     (let loop ((vs (cdr val)) (st st))
+       (if (null? vs) st (loop (cdr vs) (qp-apply-val st (car vs))))))
+    (else (qp-apply-one st val))))
+
+(define (qp-apply-one st val)
+  (let ((bid (car val)) (cmds (cadr val)))
         (if (qp-bid-applied? st bid)
             st                                ; exactly-once: hedged duplicate
             (let* ((sm (let loop ((c cmds) (sm (qp-nget st 'sm)))
@@ -390,7 +411,7 @@
                 'holds (qp-hold-del (qp-nget st 'holds) bid)
                 'reads (if rd (qp-hold-del (qp-nget st 'reads) bid) (qp-nget st 'reads))
                 'rdone (if rd (cons (cdr rd) (qp-nget st 'rdone)) (qp-nget st 'rdone))
-                'adone (cons (cons bid (length cmds)) (qp-nget st 'adone)))))))))
+                'adone (cons (cons bid (length cmds)) (qp-nget st 'adone))))))))
 
 ; ============================================================
 ; public API: propose / step / tick

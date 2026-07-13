@@ -36,6 +36,7 @@
 ; leader shard (cw-u4a.18, a leader-local deadline reset, NO Raft round) ->
 ; LeaseKeepAliveResponse{ID,TTL} streamed back.  TTL=0 signals the lease is gone.
 
+(include "src/safe-send.scm")  ; cw-2au: send-to-dead-pid is a no-op
 (include "src/encoding.scm")
 (include "src/proto.scm")
 (include "src/shard-route.scm")   ; cw-0v2 (G3): prefix-aware key->shard routing (must match grpc-kv.scm)

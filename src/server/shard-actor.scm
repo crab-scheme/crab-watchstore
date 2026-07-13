@@ -38,6 +38,7 @@
 ; commits+applies (which may be a later engine message once a quorum of AERs
 ; arrives).
 
+(include "src/safe-send.scm")  ; cw-2au: send-to-dead-pid is a no-op
 (include "src/encoding.scm")
 (include "src/store-ctx.scm")
 (include "src/mvcc.scm")

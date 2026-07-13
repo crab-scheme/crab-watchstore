@@ -56,6 +56,7 @@
 ; Do NOT re-attempt pinned-revision chunking through mvcc-range (ca79c2c) — unrelated
 ; here, this worker never touches KEY-CF range scans, only REV-CF watch events.
 
+(include "src/safe-send.scm")  ; cw-2au: send-to-dead-pid is a no-op
 (include "src/encoding.scm")
 (include "src/store-ctx.scm")
 (include "src/mvcc.scm")

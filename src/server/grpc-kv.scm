@@ -57,6 +57,7 @@
 ; The handler NEVER opens a store / evaluates a Txn locally; it only uses the codec,
 ; the Txn STRUCT builders + txn-encode, and the kv-rec-*/range-opt helpers — so the
 ; store-touching bodies these files also define are simply never called here.
+(include "src/safe-send.scm")  ; cw-2au: send-to-dead-pid is a no-op
 (include "src/encoding.scm")
 (include "src/store-ctx.scm")
 (include "src/mvcc.scm")

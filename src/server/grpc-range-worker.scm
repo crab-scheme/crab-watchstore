@@ -16,6 +16,7 @@
 ; serializable/linearizable 'kv-range seam; only WHERE the caller blocks
 ; moved. Response codes mirror handle-range exactly.
 
+(include "src/safe-send.scm")  ; cw-2au: send-to-dead-pid is a no-op
 (define QRW-EMPTY (make-bytevector 0 0))
 (define QRW-UNAVAILABLE 14)
 (define QRW-OUT-OF-RANGE 11)

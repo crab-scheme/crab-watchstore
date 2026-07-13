@@ -58,6 +58,7 @@
 ; the test reads it back; .23 overrides watch-stream-emit! to frame bytes onto the
 ; gRPC stream instead.  This is the ONE seam .23 replaces for output.
 
+(include "src/safe-send.scm")  ; cw-2au: send-to-dead-pid is a no-op
 (include "src/watch.scm")   ; watch-response<->sexp bridge + record accessors
 
 ; ---- OUTPUT sink ----------------------------------------------------------

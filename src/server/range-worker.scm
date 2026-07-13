@@ -20,6 +20,7 @@
 ; 3.2s->31.5s) — this is the same single non-chunked mvcc-range call the
 ; shard used to make inline, just off its mailbox.
 
+(include "src/safe-send.scm")  ; cw-2au: send-to-dead-pid is a no-op
 (include "src/encoding.scm")
 (include "src/store-ctx.scm")
 (include "src/mvcc.scm")

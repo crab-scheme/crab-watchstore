@@ -25,6 +25,7 @@
 ; ponytail: durable mode fsyncs per transition batch (no cross-transition
 ; group-commit deferral yet); add the flush-base machinery if w/s needs it.
 
+(include "src/safe-send.scm")  ; cw-2au: send-to-dead-pid is a no-op
 (include "src/encoding.scm")
 (include "src/store-ctx.scm")
 (include "src/mvcc.scm")
@@ -126,6 +127,11 @@
 
     (define new-coord #f)                    ; set by a QP-COORD apply; post! adopts
     (define (apply-cmd! sm cmd)
+      (if (and (pair? cmd) (not (bytevector? (car cmd))))
+          (begin (display "BADCMD apply-cmd!: ") (write cmd) (newline)
+                 (set! acc (cons #f acc))
+                 (+ sm 1))
+      (begin
       (if (null? cmd)
           (set! acc (cons #f acc))
           (if (and (pair? cmd) (string=? (cmd-op cmd) "QP-COORD"))
@@ -154,7 +160,7 @@
             (watch-notify-apply! pre (mvcc-current-rev ctx))
             (if (and (pair? cmd) (string=? (cmd-op cmd) "COMPACT"))
                 (send watch-fanout (list 'watch-compact)))))))
-      (+ sm 1))
+      (+ sm 1))))
 
     (define (gsend to msg) (node-send-ch (symbol->string node-name) to my-channel msg))
     (define (emit! outs)

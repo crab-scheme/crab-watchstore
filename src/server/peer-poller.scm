@@ -32,6 +32,7 @@
 ; one node-poll over Messages. When absent, it's the legacy single-node poller
 ; (node-poll over Messages, routes ALL groups). heal! runs on the "0"-owning
 ; poller only, to avoid N threads racing node-connect.
+(include "src/safe-send.scm")  ; cw-2au: send-to-dead-pid is a no-op
 (define (peer-poller node-name shard-keys tick-every dial-addrs target . rest)
   (define channel (if (and (pair? rest) (number? (car rest))) (car rest) #f))
   (define heal-owner? (if channel (member "0" shard-keys) #t))

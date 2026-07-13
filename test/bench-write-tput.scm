@@ -34,8 +34,10 @@
  (lambda (n)
    (spawn-source "(include \"src/server/quepaxa-shard.scm\")" 'qp-shard-main
                  "0" '(a b c) (string->symbol n) (db n) DURABLE? 1 4 #f '() 0 '() #f #f)
+   ; channel 1 = group 0's engine channel — legacy channel-less node-poll no
+   ; longer drains ch-1 frames, so match prod's per-channel poller (cw-c8b).
    (spawn-source "(include \"src/server/peer-poller.scm\")" 'peer-poller
-                 (string->symbol n) '("0") 150 '() 0))
+                 (string->symbol n) '("0") 150 '() 0 1))
  (list "a" "b" "c"))
 
 (define (spin pred who)
@@ -44,6 +46,10 @@
           (else (loop (+ i 1))))))
 (section "bring-up")
 (spin (lambda () (eq? (table-lookup 'ws-shard-role "a:0") 'leader)) "coordinator")
+; clients on b/c look their shard pid up immediately — wait for ALL nodes' pids,
+; not just the coordinator's election (cw-2au: the lookup raced b/c compile).
+(for-each (lambda (n) (spin (lambda () (table-lookup 'ws-shard-pid (string-append n ":0"))) n))
+          (list "a" "b" "c"))
 (check "coordinator up" 'leader (table-lookup 'ws-shard-role "a:0"))
 
 ; ---- clients: CLIENTS actors, round-robin across nodes; each loops sync PUTs

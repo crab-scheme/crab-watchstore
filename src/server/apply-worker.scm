@@ -19,6 +19,7 @@
 ; ctx: own dirty counter over the SHARED process-global store handle; the
 ; sequencer's ctx-flush! fsyncs the DB WAL, covering writes from every worker.
 
+(include "src/safe-send.scm")  ; cw-2au: send-to-dead-pid is a no-op
 (include "src/encoding.scm")
 (include "src/store-ctx.scm")
 (include "src/mvcc.scm")

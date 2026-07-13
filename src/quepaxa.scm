@@ -395,6 +395,15 @@
     (else (qp-apply-one st val))))
 
 (define (qp-apply-one st val)
+  ; cw-65x diagnostic guard: a malformed decided value must not kill the
+  ; shard actor — log the datum (the bug evidence) and apply nothing.
+  (if (not (and (pair? val) (pair? (cdr val)) (list? (cadr val))))
+      (begin
+        (display "BADVAL qp-apply-one: ") (write val) (newline)
+        st)
+      (qp-apply-one* st val)))
+
+(define (qp-apply-one* st val)
   (let ((bid (car val)) (cmds (cadr val)))
         (if (qp-bid-applied? st bid)
             st                                ; exactly-once: hedged duplicate

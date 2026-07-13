@@ -87,6 +87,24 @@
     (define SNAP-MIN-TICKS 50)
     (define SNAP-CHUNK-ROWS 200)
     (define PROPOSE-BATCH-CAP 64)
+    ; cw-65x H8: propose gating — while >= GATE local batches are in flight,
+    ; newly arriving client cmds accumulate in `stash` instead of opening
+    ; ever more tiny slots (measured: median batch n=2 at 256 clients, every
+    ; slot paying full consensus ceremony). post! flushes the stash as ONE
+    ; batch once in-flight drops below the gate. Pipelining is preserved
+    ; (GATE > 1); batch size becomes arrival-rate x decide-latency.
+    (define PROPOSE-GATE
+      (let ((e (get-environment-variable "CWS_PROPOSE_GATE")))
+        (if e (or (string->number e) 16) 16)))
+    (define stash '())                       ; reversed ((conn . cmd) ...)
+    (define stash-n 0)
+    (define (inflight) (length pending-bids))
+    (define (flush-stash! st)
+      (if (and (pair? stash) (< (inflight) PROPOSE-GATE))
+          (let* ((items (reverse stash)))
+            (set! stash '()) (set! stash-n 0)
+            (propose-client! st items))
+          st))
 
     ; CWS_PROF=1: per-write hop profiling (cw-xq9). Logs one line per acked batch:
     ;   PROF <shard> n=<batch> wait=<submit->propose ms> cons=<propose->ack ms> flush=<last fsync ms>
@@ -319,6 +337,7 @@
       (let* ((td (current-second))
              (st (drain-writes! st))
              (x (slow! "drainw" (prof-ms (current-second) td) td))
+             (st (flush-stash! st))          ; cw-65x H8
              (st (drain-reads! st))
              (st (maybe-snap-pull! st)))
         (publish! st)
@@ -716,4 +735,9 @@
                     ; re-enqueue a non-write frame to SELF (mailbox order shifts
                     ; by one batch; every handler is order-tolerant)
                     (if (not (eq? nxt '*timeout*)) (send (self) nxt))
-                    (loop (propose-client! st (reverse items))))))))))))))
+                    (if (>= (inflight) PROPOSE-GATE)
+                        (begin                       ; H8: too many slots in flight — stash
+                          (set! stash (append items stash))
+                          (set! stash-n (+ stash-n (length items)))
+                          (loop st))
+                        (loop (propose-client! st (reverse items)))))))))))))))

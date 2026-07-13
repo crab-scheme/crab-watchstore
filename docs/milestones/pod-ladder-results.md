@@ -208,3 +208,26 @@ The tuning is the documented k8s knob for slower stores: a 5k-pod LIST blocks th
 1. **Reads-off-thread**: serve Range/relists from an MVCC/RocksDB snapshot off the shard actor — removes the 2.8s write-stall class entirely instead of tolerating it. (Do NOT retry pinned-`revision` chunking: the historical read path is slow — 3.2s→31.5s, reverted ca79c2c.)
 2. Per-row range cost (~0.55ms/row at 5k: key unescape + record decode + FFI iter) — candidate native `bytevector-index`/batched iterator in crabscheme.
 3. KCM pinned-informers after crash-churn: suspect `do-create`'s await holds OTHER watches' buffered events hostage while a busy shard delays the register ack — bound it or prioritize register acks.
+
+## Rung 10k (Phase 1, 2026-07-12/13) — PASSED on stock lease timings
+
+Post-Phase-0 store (PR #4 through eb80151). Fleet: 5x c7g.large store (quepaxa, durable),
+3 k3s 1.36 servers, 18 KWOK nodes. Climb 5k->10k in ~8 min (stages 23-102s); actual pod
+count 11,000 (ladder 1000 + ladder5k 10000).
+
+Three fixes were required to pass untuned (each found by field probe + instrumentation):
+- cw-04k (a32f172): watch fanout off the shard mailbox (dedicated ordered worker, 512-notify cap).
+- cw-vku (ff31c8c): async 4-worker Range pool off the gRPC dispatcher — 11k-pod relists
+  (up to 15.2s encode+scan) were queueing every RPC on the node incl. PUT acks; consensus
+  was healthy (6-30ms) the whole time. Plus: replicated COMPACT apply now only flips the
+  gate; physical GC runs as incremental per-tick slices (was 1-3s synchronous on all 5
+  replicas at the same log position, every ~302s).
+- eb80151: range-worker error logging/fail-fast + test coverage for incremental GC.
+
+Final untuned soak: 30 min at 11,000 pods, restarts=0, readyz ok, 15-min 1/s put probe
+zero >400ms (max ~200ms, avg ~55ms). Leader-election tuning REMOVED — the 5k-rung
+mitigation is no longer needed at 10k.
+
+Known simulator caveat: a k3s restart during kwok status patches left ladder5k pods
+Running but Ready=False (kwok doesn't resync); phase-based counts used throughout.
+Open tail: cw-5qk (stale reads at burst), cw-98k (fanout ack leak), cw-p99 (test flake).

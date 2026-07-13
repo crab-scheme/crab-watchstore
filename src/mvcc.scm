@@ -58,13 +58,9 @@
 
 ; INV(rev16) = bitwise complement of each byte -> DESCENDING on-disk order
 ; (newest revision = smallest key) within a key group.
-(define (inv16 b16)
-  (let ((c (subbv b16 0 16)))
-    (let loop ((i 0))
-      (if (< i 16)
-          (begin (bytevector-u8-set! c i (bitwise-xor (bytevector-u8-ref c i) #xFF))
-                 (loop (+ i 1)))))
-    c))
+; cw-65x: native whole-bv complement (b_bytevector_not); input is always the
+; 16-byte rev->16 output so the old defensive subbv slice is unnecessary.
+(define (inv16 b16) (bytevector-not b16))
 
 ; Largest u64 (2^64-1).  Used as the `sub` in a latest-<=-readRev seek key so the
 ; seek lands at/before the largest-sub record at a given main (cw-u4a.38).
@@ -100,19 +96,9 @@
 
 ; escape K: each 0x00 byte -> 0x00 0xFF.  Preallocate worst case (2x) and slice
 ; back to the actual length instead of an O(n^2) incremental bytevector-append.
-(define (key-cf-escape K)
-  (let* ((n (bytevector-length K))
-         (buf (make-bytevector (* 2 n) 0)))
-    (let loop ((i 0) (j 0))
-      (if (= i n)
-          (subbv buf 0 j)
-          (let ((byte (bytevector-u8-ref K i)))
-            (if (= byte 0)
-                (begin (bytevector-u8-set! buf j 0)
-                       (bytevector-u8-set! buf (+ j 1) #xFF)
-                       (loop (+ i 1) (+ j 2)))
-                (begin (bytevector-u8-set! buf j byte)
-                       (loop (+ i 1) (+ j 1)))))))))
+; cw-65x: native single pass (see b_bytevector_nul_escape in cs-runtime);
+; was an interpreted per-byte loop on the hot apply path.
+(define (key-cf-escape K) (bytevector-nul-escape K))
 
 ; un-escape (0x00 followed by anything, always 0xFF inside an escaped run,
 ; collapses back to a single 0x00) is now done natively — see

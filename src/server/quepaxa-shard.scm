@@ -494,7 +494,14 @@
              (mvcc-compact-gc-step! ctx)
              (set! engine-what "tick")
              (let* ((st (engine! st qp-tick))
-                    (st (if (qp-coord? st) (lease-tick! st) st)))
+                    ; cw-2au scale cliff: lease-tick!'s mvcc-all-lease-ids is a FULL
+                    ; lease-namespace scan in interpreted Scheme ON this shard thread —
+                    ; at ~20k leases (15k+ pods) every-250ms scans starved the shard
+                    ; (38s Txn/LeaseGrant stalls -> k3s deadline storms). Renewals bump
+                    ; lease-deadlines at LEASE-KA apply time; the scan only seeds
+                    ; unseen leases + cleans revoked ones, so 5s granularity is fine
+                    ; (TTLs are 10s+; etcd revokes lazily too).
+                    (st (if (and (qp-coord? st) (= 0 (modulo ticks 20))) (lease-tick! st) st)))
                (loop st)))
 
             ;; ---- linearizable read probe ----

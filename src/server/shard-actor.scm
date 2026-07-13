@@ -105,6 +105,8 @@
          (my-channel (vector-ref '#(1 3 4 5) (modulo my-group 4)))
          (handle  (store-open db-path #t))      ; create-if-missing
          (ctx     (make-ctx handle "default" sync?))
+         ; cw-65x: this is the sole applier ctx — enable the latest-version cache
+         (ctx     (begin (mvcc-enable-latest-cache! ctx) ctx))
          (apply-workers
           (if (< n-apply-workers 2) #f
               (let spawn-w ((i 0) (acc '()))
@@ -1199,7 +1201,7 @@
                     ; mvcc-set-current-rev!), so the cached crev is stale — invalidate
                     ; so the next mvcc-current-rev re-reads the installed value.
                     (set-shard-ctx-crev! ctx -1)
-                    (mvcc-live-stats-invalidate! ctx)   ; cw-xq9: bulk install bypassed mvcc-put!
+                    (mvcc-live-stats-invalidate! ctx) (mvcc-latest-cache-invalidate! ctx)   ; cw-xq9: bulk install bypassed mvcc-put!
                     (ctx-save-applied! ctx sbase sterm)
                     (ctx-flush! ctx)
                     ; cw-04k: off-thread; order matters (apply window before the

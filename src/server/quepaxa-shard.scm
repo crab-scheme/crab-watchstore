@@ -55,6 +55,8 @@
          (my-channel (vector-ref '#(1 3 4 5) (modulo my-group 4)))
          (handle (store-open db-path #t))
          (ctx (make-ctx handle "default" sync?))
+         ; cw-65x: this is the sole applier ctx — enable the latest-version cache
+         (ctx (begin (mvcc-enable-latest-cache! ctx) ctx))
          ; cw-m9c (G1): same dedicated-thread Range/LIST reader pool as the raft
          ; driver (shard-actor.scm) — big scans must not hold THIS mailbox
          ; either, or writes/consensus ticks stall behind them for the full
@@ -686,7 +688,7 @@
                               (kv-scan ctx (make-bytevector 0)))
                     (for-each (lambda (kv) (kv-put! ctx (car kv) (cdr kv))) rows)
                     (set-shard-ctx-crev! ctx -1)
-                    (mvcc-live-stats-invalidate! ctx)   ; cw-xq9: bulk install bypassed mvcc-put!
+                    (mvcc-live-stats-invalidate! ctx) (mvcc-latest-cache-invalidate! ctx)   ; cw-xq9: bulk install bypassed mvcc-put!
                     (ctx-save-applied! ctx sbase 0)
                     (persist-boot! boot-epoch)   ; the wipe adopted the SENDER's counter
                     (ctx-flush! ctx)

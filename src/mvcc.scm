@@ -468,15 +468,32 @@
 ;     (add 0x03||lease||K when lease<>0; remove a stale prior lease-index entry when
 ;     the key previously had a different/zero lease).
 
+; cw-65x: latest-version cache helpers. Keys are utf8 strings (guarded: a
+; non-UTF-8 user key just bypasses the cache — k8s registry keys are text).
+(define (latest-cache-key K)
+  (guard (e (#t #f)) (utf8->string K)))
+(define (latest-cache-evict! ctx K)
+  (let ((c (shard-ctx-latest-cache ctx)))
+    (if c (let ((sk (latest-cache-key K)))
+            (if sk (hashtable-delete! c sk))))))
+(define (mvcc-enable-latest-cache! ctx)
+  (set-shard-ctx-latest-cache! ctx (make-hashtable string-hash string=?)))
+(define (mvcc-latest-cache-invalidate! ctx)
+  (if (shard-ctx-latest-cache ctx) (mvcc-enable-latest-cache! ctx)))
+
 (define (mvcc-put! ctx K V lease main sub)
-  (let* ((prev (mvcc-get-latest ctx K))          ; newest visible (live) record, or #f
-         (create-rev (if prev (kv-rec-create-rev prev) main))
-         (version    (if prev (+ 1 (kv-rec-version prev)) 1))
-         (prev-lease (if prev (kv-rec-lease prev) 0)))
+  (let* ((cache (shard-ctx-latest-cache ctx))
+         (ck (and cache (latest-cache-key K)))
+         (hit (and ck (hashtable-ref cache ck #f)))
+         (prev (if hit #f (mvcc-get-latest ctx K)))  ; newest visible (live) record, or #f
+         (create-rev (cond (hit (vector-ref hit 0)) (prev (kv-rec-create-rev prev)) (else main)))
+         (version    (cond (hit (+ 1 (vector-ref hit 1))) (prev (+ 1 (kv-rec-version prev))) (else 1)))
+         (prev-lease (cond (hit (vector-ref hit 2)) (prev (kv-rec-lease prev)) (else 0)))
+         (prev-vlen  (cond (hit (vector-ref hit 3)) (prev (bytevector-length (kv-rec-value prev))) (else #f))))
+    (if ck (hashtable-set! cache ck (vector create-rev version lease (bytevector-length V))))
     ; cw-xq9: incremental live stats — replace = value-size delta; create = key+value +1
-    (if prev
-        (mvcc-live-stats-add! ctx (- (bytevector-length V)
-                                     (bytevector-length (kv-rec-value prev))) 0)
+    (if prev-vlen
+        (mvcc-live-stats-add! ctx (- (bytevector-length V) prev-vlen) 0)
         (mvcc-live-stats-add! ctx (+ (bytevector-length K) (bytevector-length V)) 1))
     ; KEY-CF: the new live version
     (kv-put! ctx (enc-key K main sub)
@@ -575,6 +592,7 @@
             ; KEY-CF: a tombstone version (create_rev=0, version=0, no value)
             (kv-put! ctx (enc-key uk main s)
                      (kv-record-encode REC-TOMBSTONE 0 main 0 0 (make-bytevector 0 0)))
+            (latest-cache-evict! ctx uk)  ; cw-65x: tombstone kills the live entry
             ; REV-CF: a DELETE event
             (kv-put! ctx (enc-rev main s) (event-encode EV-DELETE uk (make-bytevector 0 0) main))
             ; LEASE index: drop the key's lease entry if it had one
@@ -1238,6 +1256,7 @@
             ; KEY-CF: a tombstone version (create_rev=0, version=0, no value)
             (kv-put! ctx (enc-key uk main s)
                      (kv-record-encode REC-TOMBSTONE 0 main 0 0 (make-bytevector 0 0)))
+            (latest-cache-evict! ctx uk)  ; cw-65x: tombstone kills the live entry
             ; REV-CF: a DELETE event keyed by this op's own main.sub
             (kv-put! ctx (enc-rev main s) (event-encode EV-DELETE uk (make-bytevector 0 0) main))
             ; LEASE index: drop the key's lease entry (mirrors mvcc-delete-range!)

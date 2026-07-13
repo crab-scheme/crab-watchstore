@@ -40,7 +40,14 @@
           ; mvcc-put!/mvcc-delete-range!; seeded (-1 = unseeded) by
           ; mvcc-live-stats-seed! at shard boot / snapshot install / reset.
           (mutable   live-bytes)
-          (mutable   live-count)))
+          (mutable   live-count)
+          ; cw-65x: OPTIONAL latest-version cache for the APPLY path only
+          ; (#f = disabled). key (utf8 string of user key) -> vector
+          ; #(create-rev version lease val-len). Kills the per-PUT KEY-CF
+          ; iterator seek (mvcc-get-latest) that dominated the shard thread.
+          ; Only the applier ctx enables it (single-threaded writes), so it
+          ; is trivially coherent; snapshot-install/reset must invalidate.
+          (mutable   latest-cache)))
 
 ; (make-ctx handle [cf-name] [sync?])
 (define (make-ctx handle . opts)
@@ -50,7 +57,8 @@
                   0
                   -1
                   -1
-                  -1))
+                  -1
+                  #f))
 
 ; ---- raw KV ops ----
 ;

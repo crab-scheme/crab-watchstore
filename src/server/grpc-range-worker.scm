@@ -77,6 +77,16 @@
   ; encode + respond on H — the same result mapping as the old inline handle-range.
   (define (respond! h res limit)
     (cond
+      ; cw-2au: native fused path — kvs arrive as pre-encoded protobuf bytes;
+      ; splice them into the RangeResponse without touching rows.
+      ((and (pair? res) (eq? (car res) 'kv-range-pb-ok))
+       (let ((cur-rev (let ((r (list-ref res 1))) (if (< r 1) 1 r)))
+             (term    (list-ref res 2))
+             (total   (list-ref res 3))
+             (more    (list-ref res 4))
+             (pb      (list-ref res 5)))
+         (grpc-respond! h (etcd-pb-encode-range-resp-pb cluster-id member-id cur-rev term
+                                                        pb more total))))
       ((and (pair? res) (eq? (car res) 'kv-range-ok))
        (let ((cur-rev (let ((r (list-ref res 1))) (if (< r 1) 1 r)))
              (term    (list-ref res 2))

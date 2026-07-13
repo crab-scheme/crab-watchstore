@@ -35,8 +35,29 @@
       ; handles at snapshot-install; mvcc-compact-rev is already uncached).
       (set-shard-ctx-crev! ctx -1)
       (let* ((key (range-opt opts 'key (make-bytevector 0 0)))
-             (rend (range-opt opts 'range-end #f))
-             (res (mvcc-range ctx key rend opts)))
+             (rend (range-opt opts 'range-end #f)))
+        ; cw-2au LIST-scan wall: fused native scan+decode+pb-encode when the
+        ; caller opted in ('native-pb, set only by the unary Range path whose
+        ; responder understands the pb reply), the binary has the builtin
+        ; (CWS_NATIVE_RANGE=1 — do NOT set on the July-12 binary), and the
+        ; request is the plain latest/pinned-rev multi-key LIST shape.
+        (if (and (range-opt opts 'native-pb #f)
+                 (equal? "1" (get-environment-variable "CWS_NATIVE_RANGE"))
+                 (not (range-end-unset? rend))
+                 (memq (range-opt opts 'sort-order 'none) '(none ascend))
+                 (eq? (range-opt opts 'sort-target 'key) 'key)
+                 (= (range-opt opts 'min-create-rev 0) 0)
+                 (= (range-opt opts 'max-create-rev 0) 0)
+                 (= (range-opt opts 'min-mod-rev 0) 0)
+                 (= (range-opt opts 'max-mod-rev 0) 0))
+            (let ((res (mvcc-range-pb ctx key rend opts)))
+              (if (and (pair? res) (eq? (car res) 'err-compacted))
+                  (list 'kv-range-ok (mvcc-current-rev ctx) term 'compacted 0 '())
+                  (list 'kv-range-pb-ok (mvcc-current-rev ctx) term
+                        (car res) (cadr res) (caddr res))))
+            (range-reply-interp key rend opts term))))
+    (define (range-reply-interp key rend opts term)
+      (let* ((res (mvcc-range ctx key rend opts)))
         (if (and (pair? res) (eq? (car res) 'err-compacted))
             (list 'kv-range-ok (mvcc-current-rev ctx) term 'compacted 0 '())
             (list 'kv-range-ok (mvcc-current-rev ctx) term #f

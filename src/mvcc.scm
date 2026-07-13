@@ -526,6 +526,37 @@
 (define (range-end-unset? rangeEnd)
   (or (not rangeEnd) (= (bytevector-length rangeEnd) 0)))
 
+; ---------------------------------------------------------------------------
+; NATIVE fused range (cw-2au LIST-scan wall): store-range-latest-pb walks the
+; KEY-CF in Rust and returns count/more plus the CONCATENATED field-2-tagged
+; `repeated KeyValue` protobuf bytes of a RangeResponse — no per-row Scheme
+; tuples, no cross-actor row copies. Needs a post-cw-c8b binary (undefined
+; globals fail at LOAD only when EVALUATED, so this whole path is gated at
+; runtime on CWS_NATIVE_RANGE=1; do not set that env on the July-12 binary).
+; Semantics mirror mvcc-range's latest-<=at-rev path (tombstone = absent,
+; count ignores limit). Caller must have checked eligibility:
+; multi-key range, sort none/key-ascending, no create/mod-rev filters.
+; ---------------------------------------------------------------------------
+(define (mvcc-range-pb ctx key range-end opts)
+  ; -> (err-compacted . floor) | (count more pb-bytes)
+  (let* ((req-rev     (range-opt opts 'revision 0))
+         (cur-rev     (mvcc-current-rev ctx))
+         (at-rev      (if (= req-rev 0) cur-rev req-rev))
+         (compact-rev (mvcc-compact-rev ctx)))
+    (if (and (not (= req-rev 0)) (< req-rev compact-rev))
+        (cons 'err-compacted compact-rev)
+        (let* ((start (bytevector-append (mvcc-byte NS-KEY) (key-cf-escape key)))
+               ; etcd: range_end = #vu8(0) means "from key to end of keyspace"
+               (end (if (and (= (bytevector-length range-end) 1)
+                             (= (bytevector-u8-ref range-end 0) 0))
+                        (mvcc-byte (+ NS-KEY 1))
+                        (bytevector-append (mvcc-byte NS-KEY) (key-cf-escape range-end)))))
+          (store-range-latest-pb (shard-ctx-handle ctx) (shard-ctx-cf ctx)
+                                 start end at-rev
+                                 (range-opt opts 'limit 0)
+                                 (range-opt opts 'keys-only #f)
+                                 (range-opt opts 'count-only #f))))))
+
 ; All currently-LIVE user keys in [K, rangeEnd), ascending — discovered by scanning
 ; the whole NS-KEY namespace and keeping the newest-visible (non-tombstone) version
 ; per user-key whose key falls in range.  (mvcc-get-latest does the per-key

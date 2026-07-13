@@ -979,7 +979,12 @@
              (route (if (and rend (> shard-groups 1)
                              (not (shard-route-single? key rend shard-groups)))
                         'all (key-shard key))))
-      (dispatch-range-async! h opts (list-ref rl 2) route))))) ; +let +if (authz)
+      ; cw-2au: single-group unary Ranges may use the native fused scan (the
+      ; range worker still checks CWS_NATIVE_RANGE + request shape); the 'all
+      ; scatter path needs per-row tuples to merge, so it never opts in.
+      (dispatch-range-async! h
+                             (if (eq? route 'all) opts (cons (cons 'native-pb #t) opts))
+                             (list-ref rl 2) route))))) ; +let +if (authz)
 
   ; ---- KV/Put ----
   ; prev_kv snapshot (if requested) -> propose ("PUT" key value lease) -> PutResponse.

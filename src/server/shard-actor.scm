@@ -106,7 +106,7 @@
          (handle  (store-open db-path #t))      ; create-if-missing
          (ctx     (make-ctx handle "default" sync?))
          ; cw-65x: this is the sole applier ctx — enable the latest-version cache
-         (ctx     (begin (mvcc-enable-latest-cache! ctx) ctx))
+         (ctx     (begin (mvcc-enable-latest-cache! ctx) (kv-wbuf-enable! ctx) ctx))
          (apply-workers
           (if (< n-apply-workers 2) #f
               (let spawn-w ((i 0) (acc '()))
@@ -282,6 +282,7 @@
                                   (cons 'txnr (cons (mvcc-current-rev ctx) res))
                                   res)
                               acc)))
+            (kv-wbuf-drain! ctx)
             (watch-notify-apply! pre (mvcc-current-rev ctx))
             ; Watch backend (cw-u4a.14, ADR 0002 §5 mid-stream ErrCompacted; cw-04k:
             ; now off-thread on watch-fanout): a COMPACT applied here GC's REV-CF
@@ -1207,7 +1208,8 @@
                     ; cw-04k: off-thread; order matters (apply window before the
                     ; compaction-floor advance) — sent in that order to the SAME
                     ; single fanout worker, so FIFO preserves it.
-                    (watch-notify-apply! pre (mvcc-current-rev ctx))
+                    (kv-wbuf-drain! ctx)
+            (watch-notify-apply! pre (mvcc-current-rev ctx))
                     (send watch-fanout (list 'watch-compact))
                     (let ((st2 (raft-install-snapshot st sbase sterm)))
                       ; ack the installed position to the sender (an ordinary

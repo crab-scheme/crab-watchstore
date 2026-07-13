@@ -56,7 +56,7 @@
          (handle (store-open db-path #t))
          (ctx (make-ctx handle "default" sync?))
          ; cw-65x: this is the sole applier ctx — enable the latest-version cache
-         (ctx (begin (mvcc-enable-latest-cache! ctx) ctx))
+         (ctx (begin (mvcc-enable-latest-cache! ctx) (kv-wbuf-enable! ctx) ctx))
          ; cw-m9c (G1): same dedicated-thread Range/LIST reader pool as the raft
          ; driver (shard-actor.scm) — big scans must not hold THIS mailbox
          ; either, or writes/consensus ticks stall behind them for the full
@@ -132,6 +132,7 @@
                                   (cons 'txnr (cons (mvcc-current-rev ctx) res))
                                   res)
                               acc)))
+            (kv-wbuf-drain! ctx)
             (watch-notify-apply! pre (mvcc-current-rev ctx))
             (if (and (pair? cmd) (string=? (cmd-op cmd) "COMPACT"))
                 (send watch-fanout (list 'watch-compact)))))))
@@ -696,7 +697,8 @@
                     ; cw-04k: off-thread; order matters (apply window before the
                     ; compaction-floor advance) — FIFO to the single fanout worker
                     ; preserves it, same as shard-actor.scm's snapshot-install path.
-                    (watch-notify-apply! pre (mvcc-current-rev ctx))
+                    (kv-wbuf-drain! ctx)
+            (watch-notify-apply! pre (mvcc-current-rev ctx))
                     (send watch-fanout (list 'watch-compact))
                     (let ((st2 (qp-install-snapshot st sbase 0 '())))
                       (publish! st2)

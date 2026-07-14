@@ -24,6 +24,13 @@
 (define (del . parts)  (mvcc-apply CTX (map b parts)))
 (define (compact rev)  (mvcc-apply CTX (list (b "COMPACT") (b (number->string rev)))))
 
+; COMPACT via mvcc-apply flips only the ErrCompacted gate (cw-vku); the
+; physical GC is incremental.  Drive it to completion — as the shard drivers
+; do one slice per tick — before asserting physical row counts, so the
+; assertions also cover the incremental path converging to the old end-state.
+(define (drain-gc!)
+  (let loop () (if (mvcc-compact-gc-step! CTX) (loop))))
+
 (define (latest K)        (mvcc-get-latest CTX (b K)))
 (define (latest-at K rev) (mvcc-get-latest CTX (b K) rev))
 (define (val-of r) (and r (utf8->string (kv-rec-value r))))
@@ -63,6 +70,7 @@
 
 (define compact-result (compact 2))
 (check "COMPACT r2 returns ok" (cons 'ok 2) compact-result)
+(drain-gc!)
 (check "compact-rev = 2 after compact" 2 (mvcc-compact-rev CTX))
 
 ; current-rev must NOT have changed
@@ -95,6 +103,7 @@
 
 (define compact-result-4 (compact 4))
 (check "COMPACT r4 returns ok" (cons 'ok 4) compact-result-4)
+(drain-gc!)
 (check "compact-rev = 4" 4 (mvcc-compact-rev CTX))
 (check "current-rev still 7 after second compact" 7 (mvcc-current-rev CTX))
 
@@ -110,6 +119,7 @@
 ; Latest-≤-6 is the tombstone at r6 => delete ALL (tombstone rule).
 (define compact-result-6 (compact 6))
 (check "COMPACT r6 returns ok" (cons 'ok 6) compact-result-6)
+(drain-gc!)
 (check "compact-rev = 6 after third compact" 6 (mvcc-compact-rev CTX))
 (check "current-rev still 7 after third compact" 7 (mvcc-current-rev CTX))
 

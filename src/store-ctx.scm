@@ -30,7 +30,30 @@
           (immutable cf)
           (immutable sync)
           (mutable   dirty)         ; # of writes buffered since last fsync
-          (mutable   crev)))        ; EXP7: cached current-rev (-1 = not yet read)
+          (mutable   crev)          ; EXP7: cached current-rev (-1 = not yet read)
+          ; cw-xq9: INCREMENTAL live-keyspace accounting (logical bytes = sum of
+          ; user-key+value lengths of live keys; count = # live keys). Status and
+          ; the health probes used to FULL-SCAN + byte-fold the keyspace on every
+          ; call (mvcc-digest-at) on the single shard thread — at 500-pod k8s
+          ; scale each call pinned the shard for seconds, lease Txns behind it
+          ; blew their 5s deadlines, and k3s crash-looped. Maintained by
+          ; mvcc-put!/mvcc-delete-range!; seeded (-1 = unseeded) by
+          ; mvcc-live-stats-seed! at shard boot / snapshot install / reset.
+          (mutable   live-bytes)
+          (mutable   live-count)
+          ; cw-65x: OPTIONAL latest-version cache for the APPLY path only
+          ; (#f = disabled). key (utf8 string of user key) -> vector
+          ; #(create-rev version lease val-len). Kills the per-PUT KEY-CF
+          ; iterator seek (mvcc-get-latest) that dominated the shard thread.
+          ; Only the applier ctx enables it (single-threaded writes), so it
+          ; is trivially coherent; snapshot-install/reset must invalidate.
+          (mutable   latest-cache)
+          ; cw-65x: per-command write buffer (#f disabled; else a list of
+          ; (K . V) newest-first). kv-put! appends; ANY read/delete/flush on
+          ; this ctx drains it first via ONE native store-put-many WriteBatch.
+          ; Applier ctx only; kv-wbuf-drain! MUST run before other actors can
+          ; observe the command (apply-cmd! drains before watch notify/acks).
+          (mutable   wbuf)))
 
 ; (make-ctx handle [cf-name] [sync?])
 (define (make-ctx handle . opts)
@@ -38,7 +61,11 @@
                   (if (and (pair? opts) (car opts)) (car opts) "default")
                   (and (pair? opts) (pair? (cdr opts)) (cadr opts))
                   0
-                  -1))
+                  -1
+                  -1
+                  -1
+                  #f
+                  #f))
 
 ; ---- raw KV ops ----
 ;
@@ -50,13 +77,26 @@
   (set-shard-ctx-dirty! ctx (+ (shard-ctx-dirty ctx) 1)))
 
 (define (kv-get ctx k)
+  (kv-wbuf-drain! ctx)
   (store-get (shard-ctx-handle ctx) (shard-ctx-cf ctx) k))
 
+(define (kv-wbuf-enable! ctx) (set-shard-ctx-wbuf! ctx '()))
+(define (kv-wbuf-drain! ctx)
+  (let ((b (shard-ctx-wbuf ctx)))
+    (if (and b (pair? b))
+        (begin
+          (store-put-many (shard-ctx-handle ctx) (shard-ctx-cf ctx) (reverse b) #f)
+          (set-shard-ctx-wbuf! ctx '())))))
+
 (define (kv-put! ctx k v)
-  (store-put (shard-ctx-handle ctx) (shard-ctx-cf ctx) k v #f)
+  (let ((b (shard-ctx-wbuf ctx)))
+    (if b
+        (set-shard-ctx-wbuf! ctx (cons (cons k v) b))
+        (store-put (shard-ctx-handle ctx) (shard-ctx-cf ctx) k v #f)))
   (ctx-mark-dirty! ctx))
 
 (define (kv-del! ctx k)
+  (kv-wbuf-drain! ctx)
   (store-delete (shard-ctx-handle ctx) (shard-ctx-cf ctx) k #f)
   (ctx-mark-dirty! ctx))
 
@@ -75,6 +115,7 @@
 ; then reset the dirty counter.  No-op when nothing is buffered or in relaxed
 ; mode (the counter is reset either way).
 (define (ctx-flush! ctx)
+  (kv-wbuf-drain! ctx)
   (if (ctx-dirty? ctx)
       (store-flush-wal (shard-ctx-handle ctx) #t))
   (set-shard-ctx-dirty! ctx 0))
@@ -104,6 +145,7 @@
 ; Returns a list of (fullkey . value) bytevector pairs, over a stable snapshot.
 
 (define (kv-scan ctx prefix)
+  (kv-wbuf-drain! ctx)
   (let ((it (store-iter (shard-ctx-handle ctx) (shard-ctx-cf ctx) prefix)))
     (let loop ((acc '()))
       (let ((nx (store-iter-next it)))
@@ -114,6 +156,7 @@
 ; half-open range scan [start, end) — bounds the scan to exactly the needed rows
 ; (e.g. a watch revision window) instead of a full-namespace prefix scan.
 (define (kv-scan-range ctx start end)
+  (kv-wbuf-drain! ctx)
   (let ((it (store-iter-range (shard-ctx-handle ctx) (shard-ctx-cf ctx) start end)))
     (let loop ((acc '()))
       (let ((nx (store-iter-next it)))
@@ -122,6 +165,7 @@
             (begin (store-iter-close it) (reverse acc)))))))
 
 (define (kv-scan-count ctx prefix)
+  (kv-wbuf-drain! ctx)
   (let ((it (store-iter (shard-ctx-handle ctx) (shard-ctx-cf ctx) prefix)))
     (let loop ((n 0))
       (if (store-iter-next it)

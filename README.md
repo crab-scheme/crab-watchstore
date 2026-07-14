@@ -35,6 +35,10 @@ replaces the Redis RESP2 front-end with a gRPC/Protobuf etcd v3 API.
 The interpreter must be built with `--features stdlib-store` (enables `cs-store`
 and `cs-consensus`).
 
+Minimum crabscheme revision: `db19e5a` (branch `feat/cw-71k-native-unescape`) —
+`src/mvcc.scm` uses the native `bytevector-nul-unescape` builtin added there
+(cw-71k, G2); older binaries fail with `undefined variable: bytevector-nul-unescape`.
+
 ## Build & Run
 
 ```sh

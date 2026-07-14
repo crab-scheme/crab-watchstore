@@ -1,0 +1,202 @@
+# QuePaxa consensus engine for crab-watchstore (option 3)
+
+**Branch:** `feat/quepaxa`. **Epic:** see beads (`bd list | grep quepaxa`).
+**Sources:** QuePaxa (SOSP'23, Tennage et al., EPFL DEDIS), Cloudflare Meerkat
+(blog.cloudflare.com/meerkat-introduction), dedis/quepaxa reference impl (Go).
+
+## Why
+
+Our multi-region (us-east-2/us-west-2) shards already needed a hand-tuned "WAN
+election profile" and append/match clamps because Raft's timeout-driven elections
+thrash on jittery WAN links. QuePaxa keeps Multi-Paxos/Raft's 1-RTT normal case
+but replaces timeout-based leader election with a randomized asynchronous core +
+**hedging delays**: a mis-tuned hedge costs latency, never liveness. Meerkat is
+Cloudflare running exactly this for a global control plane.
+
+## Architecture recap (what exists)
+
+- `src/raft.scm` — PURE engine: `(node, input) -> (node' . outputs)`, alist node,
+  tagged-list messages, log entries `(term . command)`, deterministic in-file
+  cluster simulator. Vendored contract from crabscheme `lib/consensus/raft.scm`.
+- `src/server/shard-actor.scm` — the driver: ticks from peer-poller, `('engine
+  from rpc)` frames in, `emit!` outputs over node-send; consumes `raft-leader?`,
+  `raft-applied`, `raft-term`, `raft-commit`, snapshots (`ship-snaps!`),
+  ReadIndex round bookkeeping, leader-region transfer, CheckQuorum/PreVote.
+- `src/server/peer-poller.scm` — transport bridge; **tag-agnostic** (forwards any
+  `ws-engine` frame), so new message types need no transport work.
+- Consumers of leadership: get-fast gating, gr-writer/rev-allocator refill,
+  metrics tables, moveleader, watch progress (leader-only apply path).
+
+## QuePaxa engine design (new `src/quepaxa.scm`)
+
+Same purity contract as raft.scm. Per **log slot** an independent consensus
+instance; instances pipeline like Multi-Paxos.
+
+- **Recorder** (per replica, per slot): the "interval summary register" — a tiny
+  state object storing, per round, the max-ranked proposal seen at each of 4
+  lock-step steps. One RPC: `(rec slot round step proposal)` →
+  `(recr slot round step F A)` where F = max proposal recorded at this step so
+  far, A = aggregate (max of the previous step's recorded set). Dumb, fast,
+  no timeouts — this is what makes followers trivial.
+- **Proposer** (per replica): drives rounds. Round r, steps 0–3:
+  - S0: submit proposal with rank = random ∈ [1, MAX-1]; the round's
+    **coordinator** (current leader analogue) uses rank = MAX → if a quorum of
+    recorders saw only the coordinator's proposal, **decide in 1 RTT (fast
+    path)** — byte-equivalent latency to Raft's healthy-leader case.
+  - S1/S2: spread best / gather common (ensures agreement despite races).
+  - S3: if the best-known proposal provably reached a quorum, decide; else
+    next round with fresh randomness. Terminates with probability 1 — no
+    dueling-leader livelock, no election.
+- **Hedging**: a non-coordinator proposer holds its proposal for `hedge` ticks;
+  if no decision observed, it enters the round too. `hedge` is a latency knob
+  only (safe at any value including 0). Replaces election-timeout, PreVote,
+  CheckQuorum, timeout-now — all deleted on this path.
+- **Decided log → apply**: identical downstream shape to raft
+  (`commit`/`applied`/`sm`, entries `(epoch . command)`), so mvcc apply-fn,
+  ctx-save-applied!, watch pipeline are untouched.
+
+## What must be re-derived (not free)
+
+1. **Snapshot/compaction**: keep `base`/`base-term` semantics; a replica whose
+   slots were compacted requests a store snapshot (reuse ws-snap protocol).
+2. **Linearizable reads**: no leader ⇒ no ReadIndex. Meerkat's approach: a
+   consistent read is a no-op log entry (1 consensus round). Optimization
+   (later): coordinator lease. `range-serializable` path unaffected.
+3. **Leadership-shaped consumers**: map "current coordinator" onto
+   `raft-leader?` consumers (get-fast, gr-writer, moveleader→coordinator
+   reassignment, metrics role). Coordinator is a *preference*, not a safety
+   role — reassignment is just a config write.
+4. **Membership**: static config first (our shards are fixed-topology today);
+   joint-consensus parity deferred to a follow-up bead.
+
+## Task list (beads, dependency order)
+
+- **Q1 core**: `src/quepaxa.scm` single-slot recorder+proposer, 4-step rounds,
+  random ranks, fast path; deterministic sim tests: agreement, validity,
+  progress under reorder/dup/loss, fast-path-is-1-RTT assertion.
+- **Q2 SMR log**: multi-slot pipeline, commit/apply, batch propose
+  (`qp-propose-batch`), no-op barrier, decided-log ≡ raft log shape.
+- **Q3 hedging**: tick-driven hedge schedule in the pure engine
+  (`qp-tick st` returns hedge entries when due); coordinator preference field.
+- **Q4 snapshots**: base/base-term compaction + store-snapshot catch-up parity,
+  reusing ws-snap messages.
+- **Q5 lin-reads**: consistent read as no-op slot; wire to the existing
+  read-ok/pending-read plumbing in shard-actor.
+- **Q6 driver seam**: engine dispatch in shard-actor (`engine 'raft|'quepaxa`
+  from cluster spec per shard-group); route `('engine from rpc)` by tag prefix;
+  coordinator→leader mapping for all leader consumers.
+- **Q7 differential**: sim harness driving BOTH engines over identical op/fault
+  traces; assert identical applied command sequences.
+- **Q8 conformance**: full `test/etcd-*-grpc.sh` suites + watch-scale-bench with
+  the quepaxa flag on; wan-soak.sh A/B raft vs quepaxa.
+- **Q9 AWS WAN A/B**: 5-node 2-region cluster, forced coordinator flaps +
+  induced latency jitter; measure commit p99 + blackout windows vs raft.
+- **Q10 bandit tuning** (stretch): online coordinator + hedge-delay selection
+  (ε-greedy per shard); optional, after Q9 proves the static win.
+- **Q11 membership parity** (deferred): conf-change on the quepaxa path.
+
+Raft stays the default engine throughout; quepaxa is opt-in per shard-group
+until Q8/Q9 are green.
+
+---
+
+## Outcome (2026-07-09) — epic cw-15a CLOSED
+
+All engine + integration work shipped on `feat/quepaxa` (Q1–Q9; Q10/Q11 deferred).
+`--engine quepaxa` (or `CWS_ENGINE=quepaxa`) selects the engine per node; raft
+stays the default.
+
+**Conformance under quepaxa (all green, unmodified suites):** kv 25/25,
+watch+lease 18/18, maintenance 25/25 (incl. real MoveLeader = replicated
+QP-COORD coordinator transfer, and snapshot save — whose failure was a
+pre-existing main bug, grpc-snapshot-worker arity, now fixed for both engines),
+auth 22/22 + mgmt 21/21, mTLS 7/7, lease-on-follower 9/9, clientv3 compat
+74/74. Engine unit suites: 69 deterministic checks (core/snapshot/differential)
+incl. chaos soak and a raft-vs-quepaxa differential harness.
+
+**Failover soak (local, durable, coordinator SIGKILL + restart):** 1259 acked /
+0 lost / 11 writes committed WHILE the coordinator was dead — no election
+blackout.
+
+**WAN A/B (docker tc-netem, 150ms RTT, wan-soak.sh, 60s load + leader kill
++ restart):**
+
+| metric                     | raft      | quepaxa   |
+|----------------------------|-----------|-----------|
+| acked writes (60s w/ kill) | 87        | **104**   |
+| lost acked writes          | 0         | 0         |
+| term churn                 | 1 → 3     | **1 → 1** (no terms) |
+| steady-state median        | 437 ms    | 433 ms    |
+| steady-state p99           | 524 ms    | 512 ms    |
+| hashkv convergence         | 3/3       | 3/3       |
+
+Same-latency fast path, ~20% more writes land through the failure window, and
+no election machinery at all. The soak found and we fixed two restart holes:
+rejoin blindness (idle anti-entropy fetch + ranged fetch replies) and bid
+collision (persisted boot epoch in bids).
+
+Remaining (tracked): Q10 bandit tuning (cw-fbb, stretch), Q11 membership
+parity (cw-2w6, deferred; quepaxa groups refuse member-* mutations).
+
+## Real Kubernetes on QuePaxa (2026-07-09)
+
+k3s **v1.31.12** with `--datastore-endpoint` = the 5-node 2-region quepaxa
+store: **full convergence in ~50s** — node Ready, coredns/local-path/
+metrics-server pods Running, deployments/scheduling/watches all through
+crab-watchstore. The cluster survived a coordinator SIGKILL and a full store
+rolling-restart (all state durable, k3s reattached and re-converged).
+k8s **v1.36** does NOT converge (apiserver informer-sync never completes;
+watch-cache delegator/WatchList wants stricter progress semantics — tracked).
+
+Getting there found four real bugs no conformance suite had caught
+(the first three fixed on this branch, suites green both engines):
+1. fwd-reply relay dropped ASYNC waiters — all follower-forwarded writes
+   hung in real multi-node deployments (cw-1c3).
+2. Coordinator-gated leases — real etcd serves Lease RPCs on any member;
+   kube bounced off `not leader` 4/5 of the time. Leases are now fully
+   leaderless (keepalive rides consensus as LEASE-KA).
+3. Range results were length-major, not key-ascending (length-prefixed
+   KEY-CF layout + trust-the-scan) — broke apiserver pagination (limit
+   silently skipped keys) and 1.36 cache digest checks.
+4. **The scale ceiling**: every non-point Range kv-scans the entire
+   keyspace history — LIST-all 956ms @500 configmaps → 11.7s @2000;
+   at ~4.5k revisions a queued lin GET took 34s, and a kube relist storm
+   after a kill saturates the 32-worker pool into node-wide starvation
+   (presents as a cluster-wide read deadlock; engine exonerated by
+   test/quepaxa-read-failover.scm). Fix = KEY-CF re-key so user-key
+   ranges bound the scan (tracked, P1).
+
+**Verdict:** multi-region etcd-for-Kubernetes on quepaxa is real at small
+scale — control plane converges, pods run, writes keep flowing through
+coordinator death with zero election churn. Scale today is bounded by the
+read path, not consensus: ~1–2k objects / ~5k revisions before kube's
+list-heavy patterns collapse it. The consensus layer never lost or reordered
+anything under any of it.
+
+## Real-AWS 2-region A/B (2026-07-09) — cw-7e5 leg completed
+
+5-node cluster (n1–n3 us-east-2, n4–n5 us-west-2, real ~50–70ms inter-region
+RTT), single shard group, load driven from a co-located east client
+(`deploy/aws-apiserver-smoke/ab-engine.sh`), 60s write load, leader/coordinator
+(n1) SIGKILLed at t=20s and dead 10s (systemd restart).
+
+| metric                      | raft         | quepaxa      |
+|-----------------------------|--------------|--------------|
+| acked writes (60s w/ kill)  | 827          | **879**      |
+| failed writes               | 99           | **2**        |
+| lost acked writes           | 0            | 0            |
+| write-blackout window       | **~15.1s**   | **~10.0s** (= exactly the dead window) |
+| term churn                  | 1 → 2        | 1 → 1 (no terms) |
+| steady-state median / p99   | 52 / 55 ms   | 52 / 55 ms   |
+| hashkv convergence          | 5/5          | 5/5          |
+
+QuePaxa's only 2 failures were the client's own 5s timeouts against the dead
+n1 endpoint; every write routed to a surviving node committed throughout the
+kill window (hedged proposal path). Raft returned 99 straight failures for
+~15s (10s dead + election + client re-routing). Latency parity at steady
+state confirms the 1-RTT coordinator fast path on real WAN.
+
+Bonus find: the run exposed a pre-existing main bug — the origin-side
+`fwd-reply` relay raw-`send`ed to async waiters, so follower-forwarded writes
+via the async gRPC path hung forever (cw-1c3, fixed on this branch; masked in
+docker/local runs whose loads wrote leader-first).

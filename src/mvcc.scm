@@ -9,7 +9,9 @@
 ; (META < KEY < REV < LEASE, so a prefix scan of one never bleeds into another):
 ;
 ;   NS-META  0x00  meta scalars        0x00 || name          -> u64  (current-rev / compact-rev)
-;   NS-KEY   0x01  key-ordered store   0x01 || u64be(lenK) || K || INV(rev16) -> KeyValue record
+;   NS-KEY   0x01  key-ordered store   0x01 || esc(K) || TERM(0x00 0x00) || INV(rev16) -> KeyValue record
+;            (cw-zf7 re-key: esc()/TERM byte-order-preserve K, so on-disk order is
+;            user-key ascending — was u64be(lenK)||K, which sorted length-major.)
 ;   NS-REV   0x02  revision-ordered    0x02 || rev16         -> event record
 ;   NS-LEASE 0x03  lease -> keys index 0x03 || u64be(leaseId) || K -> ()
 ;
@@ -56,6 +58,10 @@
 
 ; INV(rev16) = bitwise complement of each byte -> DESCENDING on-disk order
 ; (newest revision = smallest key) within a key group.
+; cw-65x H5 NOTE: the native (bytevector-not) variant needs a binary with the
+; 566e51b builtins; the validated July-12 fleet binary predates them and an
+; undefined global fails at LOAD, so ship the interpreted loop until cw-c8b
+; (binary regression) is resolved.
 (define (inv16 b16)
   (let ((c (subbv b16 0 16)))
     (let loop ((i 0))
@@ -69,17 +75,116 @@
 (define MAX-U64 (- (expt 2 64) 1))
 
 ; ---------------------------------------------------------------------------
-; KEY-CF key:  NS-KEY || u64be(lenK) || K || INV(rev16)
+; KEY-CF key:  NS-KEY || esc(K) || TERM(0x00 0x00) || INV(rev16)      (cw-zf7)
+; ---------------------------------------------------------------------------
+;
+; cw-zf7: the ORIGINAL layout was NS-KEY || u64be(lenK) || K || INV(rev16).
+; That length prefix makes on-disk order LENGTH-MAJOR (all 3-byte keys sort
+; before all 4-byte keys regardless of content), so a user-key RANGE like
+; "p/v1." can't be expressed as a row-bound scan — mvcc-range's general path
+; had to kv-scan the ENTIRE NS-KEY namespace (every key's every version) for
+; any non-point read.  Measured: an etcd LIST at 2000 keys took 11.7s and a
+; kube control plane pointed at it collapsed.
+;
+; The fix is a memcmp/order-preserving escape instead of a length prefix, so
+; the ON-DISK byte order is exactly user-key ascending (then newest-first via
+; INV(rev) within a key's version group), and a user-key range [K1,K2) is a
+; plain row-bound kv-scan-range.  Escape: each literal 0x00 byte in K becomes
+; 0x00 0xFF; the escaped key is TERMINATED by 0x00 0x00.  Since an escaped
+; null is always followed by 0xFF and the terminator is always followed by
+; 0x00, and 0x00 < 0xFF, the terminator byte-pair can never be confused with
+; an escaped null mid-key, and byte-lexicographic order over the escaped form
+; equals byte-lexicographic order over the raw key (etcd keys may contain any
+; byte, including 0x00, hence the escape rather than assuming printable keys).
+;
+; ponytail: NO data migration — pre-1.0 throwaway stores, fresh DBs only. A
+; DB written under the old length-prefixed layout is NOT readable under this
+; one (and vice versa); there is no on-disk version tag to detect/migrate.
 ; ---------------------------------------------------------------------------
 
-(define (key-cf-prefix K)               ; NS-KEY || u64be(lenK) || K  (scan prefix)
+; escape K: each 0x00 byte -> 0x00 0xFF.  Preallocate worst case (2x) and slice
+; back to the actual length instead of an O(n^2) incremental bytevector-append.
+; cw-65x H5 NOTE: native (bytevector-nul-escape) awaits a post-cw-c8b binary
+; (same reason as inv16 above).
+(define (key-cf-escape K)
+  (let* ((n (bytevector-length K))
+         (buf (make-bytevector (* 2 n) 0)))
+    (let loop ((i 0) (j 0))
+      (if (= i n)
+          (subbv buf 0 j)
+          (let ((byte (bytevector-u8-ref K i)))
+            (if (= byte 0)
+                (begin (bytevector-u8-set! buf j 0)
+                       (bytevector-u8-set! buf (+ j 1) #xFF)
+                       (loop (+ i 1) (+ j 2)))
+                (begin (bytevector-u8-set! buf j byte)
+                       (loop (+ i 1) (+ j 1)))))))))
+
+; un-escape (0x00 followed by anything, always 0xFF inside an escaped run,
+; collapses back to a single 0x00) is now done natively — see
+; bytevector-nul-unescape at key-cf-decode-user-key (cw-71k, G2).
+
+(define (key-cf-prefix K)               ; NS-KEY || esc(K) || TERM  (scan prefix; sorts ascending)
   (bytevector-append (mvcc-byte NS-KEY)
-                     (u64->bytes (bytevector-length K))
-                     K))
+                     (key-cf-escape K)
+                     (make-bytevector 2 0)))     ; #u8(0 0) terminator
 
 (define (enc-key K main sub)            ; full KEY-CF key
   (bytevector-append (key-cf-prefix K)
                      (inv16 (rev->16 main sub))))
+
+; find the byte offset of the 0x00 0x00 terminator in a full/prefix KEY-CF key,
+; starting the scan at `start` (byte 1, right after the NS-KEY tag).  A 0x00
+; byte NOT followed by another 0x00 is an escaped null (0x00 0xFF) — skip 2 and
+; keep scanning; a 0x00 followed by 0x00 IS the terminator.
+(define (key-cf-find-term fk start)
+  (let loop ((i start))
+    (if (= (bytevector-u8-ref fk i) 0)
+        (if (= (bytevector-u8-ref fk (+ i 1)) 0)
+            i
+            (loop (+ i 2)))
+        (loop (+ i 1)))))
+
+; prefix-range-end: increment the last non-0xFF byte to produce the exclusive
+; upper bound for a prefix scan.  Returns #f if all bytes are 0xFF (overflow =>
+; treat as to-eof).  (Forward-declared here; also used below by range bounds —
+; moved up from its original spot further down in this file so key-cf-row-bounds
+; can call it.)
+(define (prefix-range-end prefix)
+  (let* ((n   (bytevector-length prefix))
+         (out (subbv prefix 0 n)))
+    (let loop ((i (- n 1)))
+      (cond
+        ((< i 0) #f)   ; all 0xFF — return #f (caller treats as to-eof)
+        ((< (bytevector-u8-ref out i) #xFF)
+         (bytevector-u8-set! out i (+ (bytevector-u8-ref out i) 1))
+         ; zero out bytes after i
+         (let clr ((j (+ i 1)))
+           (if (< j n) (begin (bytevector-u8-set! out j 0) (clr (+ j 1)))))
+         out)
+        (else (loop (- i 1)))))))
+
+; row bounds [start, end) over KEY-CF for a mvcc-range request (K, range-end) —
+; cw-zf7: this is what makes a bounded user-key range a bounded ROW scan instead
+; of the whole-namespace kv-scan the old length-major layout was stuck with.
+;   range-end unset (single key)     -> [prefix(K), prefix(K)+eps)
+;   range-end = to-eof sentinel      -> [prefix(K)-or-NS-start, end-of-NS-KEY)
+;   otherwise (half-open range)      -> [prefix(K), prefix(range-end))
+; NS-KEY's next namespace is NS-REV, so "end of NS-KEY" = (mvcc-byte (+ NS-KEY 1)).
+(define (key-cf-row-bounds key range-end)
+  (let ((ns-end (mvcc-byte (+ NS-KEY 1))))
+    (cond
+      ((range-end-unset? range-end)
+       (let ((p (key-cf-prefix key)))
+         (cons p (or (prefix-range-end p) ns-end))))
+      ((and (range-end-to-eof? range-end)
+            (= (bytevector-length key) 1)
+            (= (bytevector-u8-ref key 0) 0))
+       (cons (mvcc-byte NS-KEY) ns-end))                          ; all-keys
+      ((range-end-to-eof? range-end)
+       (cons (key-cf-prefix key) ns-end))                         ; to-eof
+      (else
+       (cons (key-cf-prefix key) (key-cf-prefix range-end))))))   ; half-open [K, rangeEnd)
 
 ; ---------------------------------------------------------------------------
 ; REV-CF key:  NS-REV || rev16  (PLAIN, ascending — Watch replays oldest->newest)
@@ -243,6 +348,14 @@
 (define (kv-rec-lease      r) (vector-ref r 4))
 (define (kv-rec-value      r) (vector-ref r 5))
 
+; cw-71k (G2): raw peeks on the ENCODED record bytes.  mvcc-range/compaction
+; inspect EVERY version row of a key but only the visible winner needs the
+; full decode — kv-record-decode subbv's the whole value (multi-KB pod
+; objects), so decoding skipped versions dominated per-row cost at real
+; version depth.  A skipped version now costs two native refs instead.
+(define (kv-raw-tombstone? b) (= (bytevector-u8-ref b 0) REC-TOMBSTONE))
+(define (kv-raw-mod-rev    b) (bytes->u64 b 9))
+
 ; ---------------------------------------------------------------------------
 ; REV-CF event record (ADR §5)
 ;   u8    kind         ; 0 = PUT, 1 = DELETE
@@ -361,11 +474,33 @@
 ;     (add 0x03||lease||K when lease<>0; remove a stale prior lease-index entry when
 ;     the key previously had a different/zero lease).
 
+; cw-65x: latest-version cache helpers. Keys are utf8 strings (guarded: a
+; non-UTF-8 user key just bypasses the cache — k8s registry keys are text).
+(define (latest-cache-key K)
+  (guard (e (#t #f)) (utf8->string K)))
+(define (latest-cache-evict! ctx K)
+  (let ((c (shard-ctx-latest-cache ctx)))
+    (if c (let ((sk (latest-cache-key K)))
+            (if sk (hashtable-delete! c sk))))))
+(define (mvcc-enable-latest-cache! ctx)
+  (set-shard-ctx-latest-cache! ctx (make-hashtable string-hash string=?)))
+(define (mvcc-latest-cache-invalidate! ctx)
+  (if (shard-ctx-latest-cache ctx) (mvcc-enable-latest-cache! ctx)))
+
 (define (mvcc-put! ctx K V lease main sub)
-  (let* ((prev (mvcc-get-latest ctx K))          ; newest visible (live) record, or #f
-         (create-rev (if prev (kv-rec-create-rev prev) main))
-         (version    (if prev (+ 1 (kv-rec-version prev)) 1))
-         (prev-lease (if prev (kv-rec-lease prev) 0)))
+  (let* ((cache (shard-ctx-latest-cache ctx))
+         (ck (and cache (latest-cache-key K)))
+         (hit (and ck (hashtable-ref cache ck #f)))
+         (prev (if hit #f (mvcc-get-latest ctx K)))  ; newest visible (live) record, or #f
+         (create-rev (cond (hit (vector-ref hit 0)) (prev (kv-rec-create-rev prev)) (else main)))
+         (version    (cond (hit (+ 1 (vector-ref hit 1))) (prev (+ 1 (kv-rec-version prev))) (else 1)))
+         (prev-lease (cond (hit (vector-ref hit 2)) (prev (kv-rec-lease prev)) (else 0)))
+         (prev-vlen  (cond (hit (vector-ref hit 3)) (prev (bytevector-length (kv-rec-value prev))) (else #f))))
+    (if ck (hashtable-set! cache ck (vector create-rev version lease (bytevector-length V))))
+    ; cw-xq9: incremental live stats — replace = value-size delta; create = key+value +1
+    (if prev-vlen
+        (mvcc-live-stats-add! ctx (- (bytevector-length V) prev-vlen) 0)
+        (mvcc-live-stats-add! ctx (+ (bytevector-length K) (bytevector-length V)) 1))
     ; KEY-CF: the new live version
     (kv-put! ctx (enc-key K main sub)
              (kv-record-encode REC-VALUE create-rev main version lease V))
@@ -391,6 +526,37 @@
 (define (range-end-unset? rangeEnd)
   (or (not rangeEnd) (= (bytevector-length rangeEnd) 0)))
 
+; ---------------------------------------------------------------------------
+; NATIVE fused range (cw-2au LIST-scan wall): store-range-latest-pb walks the
+; KEY-CF in Rust and returns count/more plus the CONCATENATED field-2-tagged
+; `repeated KeyValue` protobuf bytes of a RangeResponse — no per-row Scheme
+; tuples, no cross-actor row copies. Needs a post-cw-c8b binary (undefined
+; globals fail at LOAD only when EVALUATED, so this whole path is gated at
+; runtime on CWS_NATIVE_RANGE=1; do not set that env on the July-12 binary).
+; Semantics mirror mvcc-range's latest-<=at-rev path (tombstone = absent,
+; count ignores limit). Caller must have checked eligibility:
+; multi-key range, sort none/key-ascending, no create/mod-rev filters.
+; ---------------------------------------------------------------------------
+(define (mvcc-range-pb ctx key range-end opts)
+  ; -> (err-compacted . floor) | (count more pb-bytes)
+  (let* ((req-rev     (range-opt opts 'revision 0))
+         (cur-rev     (mvcc-current-rev ctx))
+         (at-rev      (if (= req-rev 0) cur-rev req-rev))
+         (compact-rev (mvcc-compact-rev ctx)))
+    (if (and (not (= req-rev 0)) (< req-rev compact-rev))
+        (cons 'err-compacted compact-rev)
+        (let* ((start (bytevector-append (mvcc-byte NS-KEY) (key-cf-escape key)))
+               ; etcd: range_end = #vu8(0) means "from key to end of keyspace"
+               (end (if (and (= (bytevector-length range-end) 1)
+                             (= (bytevector-u8-ref range-end 0) 0))
+                        (mvcc-byte (+ NS-KEY 1))
+                        (bytevector-append (mvcc-byte NS-KEY) (key-cf-escape range-end)))))
+          (store-range-latest-pb (shard-ctx-handle ctx) (shard-ctx-cf ctx)
+                                 start end at-rev
+                                 (range-opt opts 'limit 0)
+                                 (range-opt opts 'keys-only #f)
+                                 (range-opt opts 'count-only #f))))))
+
 ; All currently-LIVE user keys in [K, rangeEnd), ascending — discovered by scanning
 ; the whole NS-KEY namespace and keeping the newest-visible (non-tombstone) version
 ; per user-key whose key falls in range.  (mvcc-get-latest does the per-key
@@ -400,26 +566,25 @@
   ; DELETE (rangeEnd unset) targets exactly K — resolve it with one mvcc-get-latest
   ; point seek (O(log n)) instead of kv-scanning the WHOLE NS-KEY namespace
   ; (O(total keys)). A live K => (list K); a tombstoned/absent K => '(). This is
-  ; etcd's common single-key Delete; true ranges still scan (the KEY-CF sorts by
-  ; (lenK,K) so different-length keys in a range aren't contiguous — a bounded
-  ; range scan needs a key-ordered secondary index, tracked separately).
+  ; etcd's common single-key Delete.
   (if (range-end-unset? rangeEnd)
       (if (mvcc-get-latest ctx K) (list K) '())
-  ; collect distinct user-keys present in NS-KEY (any version), then filter to range
-  ; + liveness.  We decode the user-key out of each NS-KEY composite key:
-  ;   0x01 || u64be(lenK) || K || INV(rev16)
+  ; cw-zf7: true ranges — the KEY-CF re-key (see the block comment above enc-key)
+  ; sorts rows user-key-ascending, so [K, rangeEnd) is a bounded kv-scan-range,
+  ; not a whole-namespace scan.  We decode the user-key out of each NS-KEY
+  ; composite key: 0x01 || esc(K) || TERM(0x00 0x00) || INV(rev16).
   ; EXP9 (cw-aka): O(n) consecutive-grouping instead of the old O(n^2) `(member uk
-  ; seen)` list dedup. KEY-CF sorts by (lenK, K, INV-rev), so ALL versions of a
+  ; seen)` list dedup. KEY-CF sorts by (K, INV-rev), so ALL versions of a
   ; user-key are CONSECUTIVE — track the previous uk to skip its older versions
   ; without a membership scan. The old quadratic dedup over ~150k keys (a range
   ; DeleteRange, e.g. check perf cleanup) was ~n^2 ops and timed out; this is linear.
-  (let ((rows (kv-scan ctx (mvcc-byte NS-KEY))))
+  (let* ((bounds (key-cf-row-bounds K rangeEnd))
+         (rows   (kv-scan-range ctx (car bounds) (cdr bounds))))
     (let loop ((rs rows) (prev-uk #f) (out '()))
       (if (null? rs)
           (reverse out)
           (let* ((fk   (caar rs))
-                 (lenK (bytes->u64 fk 1))
-                 (uk   (subbv fk 9 (+ 9 lenK))))
+                 (uk   (key-cf-decode-user-key fk)))
             (cond
               ((and prev-uk (equal? uk prev-uk)) (loop (cdr rs) prev-uk out)) ; older version of same key
               ((not (in-range? uk K rangeEnd)) (loop (cdr rs) uk out))
@@ -427,7 +592,7 @@
               ; versions newest-first via INV-rev), so decode it inline instead of a
               ; redundant mvcc-get-latest point seek per key (~n extra seeks on a bulk
               ; range delete). Live => include; tombstone => key already absent, skip.
-              ((not (kv-rec-tombstone? (kv-record-decode (cdar rs))))
+              ((not (kv-raw-tombstone? (cdar rs)))   ; cw-71k: tag peek, no full decode
                (loop (cdr rs) uk (cons uk out)))                              ; live -> include
               (else (loop (cdr rs) uk out)))))))                              ; tombstoned -> skip
   ))
@@ -456,9 +621,15 @@
           (let* ((uk   (car vs))
                  (prev (mvcc-get-latest ctx uk))
                  (lease (if prev (kv-rec-lease prev) 0)))
+            ; cw-xq9: incremental live stats — a live key leaves the keyspace
+            (if prev
+                (mvcc-live-stats-add!
+                 ctx (- (+ (bytevector-length uk)
+                           (bytevector-length (kv-rec-value prev)))) -1))
             ; KEY-CF: a tombstone version (create_rev=0, version=0, no value)
             (kv-put! ctx (enc-key uk main s)
                      (kv-record-encode REC-TOMBSTONE 0 main 0 0 (make-bytevector 0 0)))
+            (latest-cache-evict! ctx uk)  ; cw-65x: tombstone kills the live entry
             ; REV-CF: a DELETE event
             (kv-put! ctx (enc-rev main s) (event-encode EV-DELETE uk (make-bytevector 0 0) main))
             ; LEASE index: drop the key's lease entry if it had one
@@ -533,37 +704,30 @@
     ; normal half-open [key, range-end)
     (else (and (not (bv<? uk key)) (bv<? uk range-end)))))
 
-; prefix-range-end: increment the last non-0xFF byte to produce the exclusive
-; upper bound for a prefix scan.  Returns #f if all bytes are 0xFF (overflow =>
-; treat as to-eof, but that can't happen for any real key).
-(define (prefix-range-end prefix)
-  (let* ((n   (bytevector-length prefix))
-         (out (subbv prefix 0 n)))
-    (let loop ((i (- n 1)))
-      (cond
-        ((< i 0) #f)   ; all 0xFF — return #f (caller treats as to-eof)
-        ((< (bytevector-u8-ref out i) #xFF)
-         (bytevector-u8-set! out i (+ (bytevector-u8-ref out i) 1))
-         ; zero out bytes after i
-         (let clr ((j (+ i 1)))
-           (if (< j n) (begin (bytevector-u8-set! out j 0) (clr (+ j 1)))))
-         out)
-        (else (loop (- i 1)))))))
+; (prefix-range-end is defined earlier, alongside key-cf-row-bounds, since
+;  key-cf-row-bounds itself calls it.)
 
 ; ---- decode user-key from a KEY-CF composite key ----
-;   composite: 0x01 || u64be(lenK) || K || INV(rev16)
-;   user-key lives at bytes [9, 9+lenK)
+;   composite: 0x01 || esc(K) || TERM(0x00 0x00) || INV(rev16)
+;   the escaped-key run is bytes [1, term); un-escape to recover K.
+;
+; cw-71k (G2): this is called once per SCANNED ROW in mvcc-range/DeleteRange
+; (every version in a key's group, not just the winner) — profiled at
+; ~0.55ms/row with key-cf-find-term (interpreted byte loop) + subbv (slice
+; alloc) + key-cf-unescape (interpreted byte loop) as three separate passes.
+; bytevector-nul-unescape fuses find-term + unescape into ONE native pass,
+; same playbook as cw-xq9's subbv fix.
 (define (key-cf-decode-user-key fk)
-  (let ((lenK (bytes->u64 fk 1)))
-    (subbv fk 9 (+ 9 lenK))))
+  (bytevector-nul-unescape fk 1))
 
 ; ---- decode the INV(rev16) back to the main revision ----
-;   the inv16 bytes are at offset 9+lenK; un-invert then read the main u64be.
+;   the inv16 bytes are the 16 bytes right after the TERM(0x00 0x00) pair.
 (define (key-cf-decode-main-rev fk)
-  (let* ((lenK   (bytes->u64 fk 1))
-         (inv-bv (subbv fk (+ 9 lenK) (+ 9 lenK 16)))
-         (plain  (inv16 inv-bv)))      ; inv16 is its own inverse (XOR 0xFF)
-    (bytes->u64 plain 0)))             ; high 8 bytes = main
+  (let* ((term    (key-cf-find-term fk 1))
+         (inv-off (+ term 2))
+         (inv-bv  (subbv fk inv-off (+ inv-off 16)))
+         (plain   (inv16 inv-bv)))    ; inv16 is its own inverse (XOR 0xFF)
+    (bytes->u64 plain 0)))            ; high 8 bytes = main
 
 ; ---- in-memory sort of result pairs ((uk . rec) ...) ----
 
@@ -585,19 +749,42 @@
       (bv<? a b)
       (< a b)))
 
-; insertion sort (small result sets, avoids any stdlib sort dependency)
+; merge sort (apiserver LISTs run 500+ items; insertion sort was O(n^2) in the
+; interpreter's hot read path)
+; cw-m9c (G1): `merge` must be TAIL-recursive — a naive `(cons (car a) (merge
+; (cdr a) b))` recurses to depth O(n) (the top-level merge of two N/2 lists
+; unwinds N/2 stack frames), which blew the stack on a dedicated actor thread
+; at ~5-6k rows (a full-keyspace LIST always sorts, even for sort-order
+; 'none — see the comment below). Accumulate + reverse instead: O(1) added
+; stack depth regardless of N.
 (define (isort lst less?)
-  (define (insert x sorted)
-    (cond ((null? sorted) (list x))
-          ((less? x (car sorted)) (cons x sorted))
-          (else (cons (car sorted) (insert x (cdr sorted))))))
-  (let loop ((in lst) (out '()))
-    (if (null? in) out
-        (loop (cdr in) (insert (car in) out)))))
+  (define (merge a b)
+    (let loop ((a a) (b b) (acc '()))
+      (cond ((null? a) (append-reverse acc b))
+            ((null? b) (append-reverse acc a))
+            ((less? (car b) (car a)) (loop a (cdr b) (cons (car b) acc)))
+            (else (loop (cdr a) b (cons (car a) acc))))))
+  (define (split lst)
+    (let loop ((slow lst) (fast lst) (acc '()))
+      (if (or (null? fast) (null? (cdr fast)))
+          (cons (reverse acc) slow)
+          (loop (cdr slow) (cddr fast) (cons (car slow) acc)))))
+  (if (or (null? lst) (null? (cdr lst)))
+      lst
+      (let ((halves (split lst)))
+        (merge (isort (car halves) less?) (isort (cdr halves) less?)))))
 
+; etcd's Range contract: results are KEY-ASCENDING even with sort NONE.  Before
+; cw-zf7's re-key the on-disk KEY-CF layout was length-prefixed (raw scan order
+; length-major, not key order — k8s apiserver pagination/digest checks broke on
+; this, found on the k3s run), so this re-sort was load-bearing for correctness.
+; The re-key makes raw scan order ALREADY key-ascending, but this stays: it's
+; O(n log n) on the now-small per-request RESULT set (not the whole namespace),
+; and keeping one code path for 'none is simpler than proving every mvcc-range
+; caller can rely on scan order (in-flight compaction/GC ordering, etc).
 (define (range-sort items order target)
   (if (eq? order 'none)
-      items
+      (isort items (lambda (a b) (bv<? (car a) (car b))))
       (let* ((key-fn (lambda (item) (range-sort-key item target)))
              (asc?   (lambda (a b) (sort-key<? (key-fn a) (key-fn b))))
              (sorted (isort items asc?)))
@@ -626,13 +813,12 @@
     (if (and (not (= req-rev 0)) (< req-rev compact-rev))
         (cons 'err-compacted compact-rev)
         ; EXP8 (cw-709): SINGLE-KEY fast path. etcd's most common read is a point
-        ; GET (range-end unset). The general path below kv-scans the WHOLE NS-KEY
-        ; namespace and is O(total keys) per read — catastrophic at scale and the
-        ; cause of the read-hang (cw-b7f), since kv-scan over a sparse prefix also
-        ; trips the cs-store iterator bug (cs-s9i). A point read uses mvcc-get-latest
-        ; (one O(log n) seek), identical visibility semantics (newest version
-        ; <= at-rev, tombstone => absent). Only taken when NO create/mod-rev filters
-        ; apply (those need the group scan); otherwise fall through.
+        ; GET (range-end unset). This uses mvcc-get-latest (one O(log n) seek),
+        ; identical visibility semantics (newest version <= at-rev, tombstone =>
+        ; absent) — cheaper than even the bounded group scan below. Only taken
+        ; when NO create/mod-rev filters apply (those need the group scan);
+        ; otherwise fall through to the general path (cw-zf7: now row-bounded,
+        ; see key-cf-row-bounds — no longer a whole-namespace scan either way).
         (if (and (range-end-unset? range-end)
                  (= min-cr 0) (= max-cr 0) (= min-mr 0) (= max-mr 0))
             (let ((rec (if (= req-rev 0)
@@ -651,8 +837,15 @@
                                                       (vector-ref rec 4)   ; lease
                                                       (make-bytevector 0 0)) ; blank value
                                               rec)))))))
-        ; -- scan NS-KEY namespace forward, group by user-key, pick visible version --
-        (let ((rows (kv-scan ctx (mvcc-byte NS-KEY))))
+        ; -- scan the [key,range-end) row bounds forward, group by user-key, pick
+        ; visible version.  cw-zf7: key-cf-row-bounds turns the request's
+        ; (key, range-end) into a KEY-CF row range, so this is a BOUNDED
+        ; kv-scan-range over exactly the requested keys' version groups, not the
+        ; whole NS-KEY namespace (the pre-re-key general path had no choice but
+        ; to scan everything, since a length-major layout can't express a
+        ; user-key range as row bounds).
+        (let* ((bounds (key-cf-row-bounds key range-end))
+               (rows   (kv-scan-range ctx (car bounds) (cdr bounds))))
           ; Iterate all KEY-CF rows in on-disk order.  Rows are ordered by
           ; user-key (ascending) then by INV(rev) (newest-first within key).
           ; We group consecutive rows sharing the same user-key.
@@ -662,20 +855,25 @@
               ; (newest→oldest).  Pick the visible version at at-rev.
               (if (null? group)
                   results
+                  ; cw-71k (G2): peek tag/mod-rev off the raw bytes and decode
+                  ; ONLY the visible winner — kv-record-decode copies the whole
+                  ; value, and at real version depth (kubelet status churn)
+                  ; most rows here are skipped, not returned.
                   (let loop ((g group))
                     (if (null? g)
                         results                        ; no visible version
                         (let* ((row (car g))
-                               (rec (kv-record-decode (cdr row)))
-                               (mr  (kv-rec-mod-rev rec)))
+                               (vbv (cdr row))
+                               (mr  (kv-raw-mod-rev vbv)))
                           (cond
                             ; skip versions newer than read revision
                             ((> mr at-rev) (loop (cdr g)))
                             ; first visible version is tombstone -> absent
-                            ((kv-rec-tombstone? rec) results)
+                            ((kv-raw-tombstone? vbv) results)
                             ; live -> add to results if in-range and passes rev filters
                             (else
-                             (let ((cr (kv-rec-create-rev rec)))
+                             (let* ((rec (kv-record-decode vbv))
+                                    (cr  (kv-rec-create-rev rec)))
                                (if (and (range-in-range? uk key range-end)
                                         (or (= min-cr 0) (>= cr min-cr))
                                         (or (= max-cr 0) (<= cr max-cr))
@@ -757,6 +955,35 @@
 (define (mvcc-live-kvs ctx at-rev)
   (let ((res (mvcc-range ctx (mvcc-byte 0) (mvcc-byte 0) (list (cons 'revision at-rev)))))
     (if (and (pair? res) (integer? (car res))) (cdr res) '())))
+
+; ---- cw-xq9: incremental live-keyspace stats (see store-ctx.scm field docs) ----
+; Status and the health probes used to call mvcc-digest-at (a full-keyspace
+; byte-at-a-time fold) on EVERY call, on the single shard thread — at 500-pod
+; k8s scale each call pinned the shard for seconds; lease Txns queued behind it
+; blew their 5s deadlines and k3s crash-looped. These counters make Status O(1):
+; seeded lazily by ONE scan, then kept exact by mvcc-put!/mvcc-delete-range!.
+; Bulk paths that bypass those (snapshot install, test reset) must call
+; mvcc-live-stats-invalidate! to force a reseed.
+(define (mvcc-live-stats-invalidate! ctx)
+  (set-shard-ctx-live-bytes! ctx -1)
+  (set-shard-ctx-live-count! ctx -1))
+(define (mvcc-live-stats-add! ctx dbytes dcount)
+  (if (>= (shard-ctx-live-bytes ctx) 0)
+      (begin
+        (set-shard-ctx-live-bytes! ctx (+ (shard-ctx-live-bytes ctx) dbytes))
+        (set-shard-ctx-live-count! ctx (+ (shard-ctx-live-count ctx) dcount)))))
+; (bytes count) — O(1) once seeded; one full scan on first call / after invalidate.
+(define (mvcc-live-stats ctx)
+  (if (< (shard-ctx-live-bytes ctx) 0)
+      (let loop ((kvs (mvcc-live-kvs ctx 0)) (sz 0) (n 0))
+        (if (null? kvs)
+            (begin (set-shard-ctx-live-bytes! ctx sz)
+                   (set-shard-ctx-live-count! ctx n))
+            (loop (cdr kvs)
+                  (+ sz (bytevector-length (caar kvs))
+                        (bytevector-length (kv-rec-value (cdar kvs))))
+                  (+ n 1)))))
+  (list (shard-ctx-live-bytes ctx) (shard-ctx-live-count ctx)))
 
 ; (hash32 total-bytes count) over the live keyspace at at-rev.  The hash folds, per key
 ; in canonical order, key-bytes ‖ u64be(mod_rev) ‖ value-bytes; total-bytes sums
@@ -872,6 +1099,59 @@
 ;
 ; All deletes go through kv-del! so they batch with the WAL group-commit.
 ; Compaction is synchronous; incremental/background compaction is a future option.
+;
+; cw-8vb (G6): a single window-driven pass (cw-xq9) is O(window) in REV-CF events, but at
+; k3s's 5-min compaction cadence "window" can mean tens of thousands of revisions backed up
+; behind a stale compact floor (e.g. after a burst of key creation, or a compactor that
+; fell behind) — bench/test/bench-compact-scale.scm measured a single un-sliced pass over a
+; ~29k-revision window taking minutes on the shard thread at 100k live keys, dominated by
+; materializing one large sorted `keys` list plus its per-key KEY-CF scans in one shot.
+; MVCC-COMPACT-SLICE bounds each internal pass to a fixed number of revisions so the
+; working set (win-rows / keys) never grows past one slice's worth, regardless of how large
+; the requested compactRev window is. External contract (ErrCompacted gate flips to the
+; FULL target compactRev immediately, single (cons 'ok compactRev) result) is unchanged —
+; only the GC work is chunked.
+(define MVCC-COMPACT-SLICE 2000)
+
+; GC exactly the (from-rev, to-rev] sub-window — the cw-xq9 window-driven pass, unchanged,
+; just parameterized so mvcc-compact can call it repeatedly over bounded slices.
+(define (mvcc-compact-slice! ctx from-rev to-rev)
+  ; Only a key touched in (from-rev, to-rev] can have NEW garbage: every earlier
+  ; compaction left each key holding at most one live version at-or-below its floor. One
+  ; BOUNDED REV-CF window scan yields both the events to purge (step 4) and the
+  ; changed-key set whose KEY-CF groups need GC (step 3, one bounded per-key scan each).
+  (let* ((win-rows (kv-scan-range ctx (enc-rev (+ from-rev 1) 0)
+                                      (enc-rev (+ to-rev 1) 0)))
+         (keys (list-sort bv<? (map (lambda (row) (ev-key (event-decode (cdr row))))
+                                    win-rows))))
+    ; Step 3: KEY-CF GC per CHANGED key — same keep/delete rule as before:
+    ; keep the single latest-≤-to-rev version iff it is live; delete
+    ; every older ≤-to-rev version (and the latest too if tombstone).
+    (let gc-keys ((ks keys) (prev #f))
+      (if (pair? ks)
+          (let ((uk (car ks)))
+            (if (and prev (equal? uk prev))
+                (gc-keys (cdr ks) prev)          ; dedup consecutive (sorted)
+                (let* ((bounds (key-cf-row-bounds uk #f))
+                       ; group rows arrive newest-first (INV-rev encoding)
+                       (group (kv-scan-range ctx (car bounds) (cdr bounds))))
+                  (let split ((g group) (below '()))
+                    (if (null? g)
+                        (let ((nf (reverse below)))          ; newest-first ≤ to-rev
+                          (if (pair? nf)
+                              (let* ((to-delete (if (kv-raw-tombstone? (cdar nf))  ; cw-71k: tag peek
+                                                    nf          ; deleted key: drop all
+                                                    (cdr nf)))) ; keep live latest
+                                (for-each (lambda (row) (kv-del! ctx (car row)))
+                                          to-delete))))
+                        (let ((mr (kv-raw-mod-rev (cdar g))))   ; cw-71k: mod-rev peek
+                          (if (<= mr to-rev)
+                              (split (cdr g) (cons (car g) below))
+                              (split (cdr g) below)))))
+                  (gc-keys (cdr ks) uk))))))
+    ; Step 4: REV-CF GC — the window rows ARE exactly the events to purge
+    ; (events ≤ from-rev were deleted by prior compactions/slices).
+    (for-each (lambda (row) (kv-del! ctx (car row))) win-rows)))
 
 (define (mvcc-compact ctx compactRev)
   (let ((cur-compact (mvcc-compact-rev ctx))
@@ -886,76 +1166,66 @@
       (else
        ; Step 2: persist the new compact-rev (activates mvcc-range's ErrCompacted gate)
        (kv-put! ctx META-COMPACT-REV (u64->bytes compactRev))
-       ; Step 3: KEY-CF GC — scan NS-KEY grouped by user-key (newest-first per key)
-       ; For each key, find the latest-≤-compactRev version and decide keep/delete.
-       (let ((rows (kv-scan ctx (mvcc-byte NS-KEY))))
-         ; Accumulate rows per user-key.  Scan order: ascending user-key, then
-         ; newest-first within key (INV encoding).  So we process groups naturally.
-         (let gc-loop ((rs rows) (cur-uk #f) (cur-group '()))
-           (define (gc-flush-group group)
-             ; group = list of (fullkey . value-bv) in newest-first scan order.
-             ; Collect all versions with mod_rev <= compactRev.  Because we process
-             ; the group newest-first and cons each matching row, the resulting
-             ; at-or-below list ends up OLDEST-FIRST (the first-processed newest
-             ; version is at the tail).  We reverse it to get newest-first so that
-             ; the HEAD is the "latest-≤-compactRev" candidate.
-             (let split ((g group) (at-or-below '()))
-               (if (null? g)
-                   ; Done splitting.
-                   (if (null? at-or-below)
-                       ; All versions are above compactRev — nothing to GC.
-                       (values)
-                       ; at-or-below is currently oldest-first (due to cons during
-                       ; newest-first traversal); reverse to get newest-first.
-                       (let* ((newest-first (reverse at-or-below))
-                              (latest-row   (car newest-first))   ; highest mod_rev ≤ compactRev
-                              (latest-rec   (kv-record-decode (cdr latest-row)))
-                              (is-tomb      (kv-rec-tombstone? latest-rec))
-                              ; Tombstone at/before compactRev: the key was deleted and
-                              ; no live value needs to anchor reads at compactRev -> delete ALL.
-                              ; Non-tombstone: keep latest (anchors reads at compactRev),
-                              ; delete all older versions in at-or-below.
-                              (to-delete    (if is-tomb
-                                               newest-first          ; delete tombstone + older
-                                               (cdr newest-first)))) ; keep latest, delete older
-                         (for-each (lambda (row) (kv-del! ctx (car row))) to-delete)))
-                   ; Partition this row by its mod_rev vs compactRev.
-                   ; Versions with mod_rev > compactRev are skipped (left in place).
-                   (let* ((row (car g))
-                          (rec (kv-record-decode (cdr row)))
-                          (mr  (kv-rec-mod-rev rec)))
-                     (if (<= mr compactRev)
-                         (split (cdr g) (cons row at-or-below))   ; accumulate GC candidate
-                         (split (cdr g) at-or-below))))))         ; skip (above compactRev)
-           (if (null? rs)
-               ; Flush the last group
-               (if cur-uk (gc-flush-group (reverse cur-group)) (values))
-               ; Accumulate row into the current group, flushing on key change
-               (let* ((row  (car rs))
-                      (fk   (car row))
-                      (uk   (key-cf-decode-user-key fk)))
-                 (cond
-                   ((and cur-uk (equal? uk cur-uk))
-                    ; Same key — accumulate (rows arrive newest-first for this key)
-                    (gc-loop (cdr rs) cur-uk (cons row cur-group)))
-                   (else
-                    ; New key — flush the previous group first
-                    (if cur-uk (gc-flush-group (reverse cur-group)) (values))
-                    (gc-loop (cdr rs) uk (list row))))))))
-       ; Step 4: REV-CF GC — delete every event with rev <= compactRev.
-       ; REV-CF keys are NS-REV || rev16 (plain ascending), so we scan the whole
-       ; NS-REV namespace and delete entries whose embedded rev <= compactRev.
-       (let ((rev-rows (kv-scan ctx (mvcc-byte NS-REV))))
-         (for-each
-          (lambda (row)
-            (let* ((fk  (car row))
-                   ; fk = 0x02 || u64be(main) || u64be(sub); main at byte 1
-                   (rev (bytes->u64 fk 1)))
-              (if (<= rev compactRev)
-                  (kv-del! ctx fk))))
-          rev-rows))
+       ; cw-xq9 + cw-8vb: WINDOW-DRIVEN GC, sliced to bound per-pass working set — see
+       ; MVCC-COMPACT-SLICE above.
+       (let slice ((from cur-compact))
+         (when (< from compactRev)
+           (let ((to (min compactRev (+ from MVCC-COMPACT-SLICE))))
+             (mvcc-compact-slice! ctx from to)
+             (slice to))))
        ; Step 5: compaction does NOT bump current-rev
        (cons 'ok compactRev)))))
+
+; ---------------------------------------------------------------------------
+; INCREMENTAL compaction (cw-vku) — for the shard drivers' replicated COMPACT.
+;
+; mvcc-compact runs the whole window's GC synchronously; applied on the shard
+; thread of EVERY replica at the same log position, a 5-min k8s window at 11k
+; pods held every shard mailbox ~1s simultaneously (field: cluster-wide put
+; stalls every ~302s, timestamp-aligned apply-COMPACT on all 5 nodes).
+;
+; mvcc-compact-begin! flips ONLY the ErrCompacted gate (the externally visible
+; state transition — deterministic and identical on every replica) and leaves
+; the physical GC to mvcc-compact-gc-step!, which the driver calls once per
+; tick: one small slice per call, so the shard mailbox is never held for more
+; than one slice. GC progress is tracked in META-COMPACT-GC ("GC done through
+; rev X"); it rides the store, so restarts/snapshots resume where they left
+; off. Physical deletes are invisible to reads (the gate already answers
+; ErrCompacted below the floor; latest-version reads never see pruned rows),
+; so per-replica GC timing may differ — only the gate is replicated state.
+; ---------------------------------------------------------------------------
+(define META-COMPACT-GC (meta-key "compact-gc"))
+(define MVCC-COMPACT-STEP-SLICE 256)   ; revs GC'd per tick (bounds per-tick stall)
+
+(define (mvcc-compact-gc-rev ctx)      ; floor GC has completed through
+  (let ((b (kv-get ctx META-COMPACT-GC)))
+    (if b (bytes->u64 b 0) 0)))
+
+; gate-only compact: same result protocol as mvcc-compact, no GC work.
+(define (mvcc-compact-begin! ctx compactRev)
+  (let ((cur-compact (mvcc-compact-rev ctx))
+        (cur-rev     (mvcc-current-rev ctx)))
+    (cond
+      ((<= compactRev cur-compact) (cons 'err-compacted cur-compact))
+      ((> compactRev cur-rev)      (cons 'err-future-rev cur-rev))
+      (else
+       ; seed the GC cursor at the OLD floor exactly once (a pending cursor
+       ; from an earlier begin! is already <= cur-compact — keep it).
+       (if (not (kv-get ctx META-COMPACT-GC))
+           (kv-put! ctx META-COMPACT-GC (u64->bytes cur-compact)))
+       (kv-put! ctx META-COMPACT-REV (u64->bytes compactRev))
+       (cons 'ok compactRev)))))
+
+; one bounded GC slice; -> #t if more work remains, #f when caught up.
+(define (mvcc-compact-gc-step! ctx)
+  (let ((done (mvcc-compact-gc-rev ctx))
+        (floor (mvcc-compact-rev ctx)))
+    (if (>= done floor)
+        #f
+        (let ((to (min floor (+ done MVCC-COMPACT-STEP-SLICE))))
+          (mvcc-compact-slice! ctx done to)
+          (kv-put! ctx META-COMPACT-GC (u64->bytes to))
+          (< to floor)))))
 
 ; ---------------------------------------------------------------------------
 ; mvcc-lease-grant!  (cw-u4a.17, ADR 0003 §1)
@@ -1023,6 +1293,7 @@
             ; KEY-CF: a tombstone version (create_rev=0, version=0, no value)
             (kv-put! ctx (enc-key uk main s)
                      (kv-record-encode REC-TOMBSTONE 0 main 0 0 (make-bytevector 0 0)))
+            (latest-cache-evict! ctx uk)  ; cw-65x: tombstone kills the live entry
             ; REV-CF: a DELETE event keyed by this op's own main.sub
             (kv-put! ctx (enc-rev main s) (event-encode EV-DELETE uk (make-bytevector 0 0) main))
             ; LEASE index: drop the key's lease entry (mirrors mvcc-delete-range!)
@@ -1248,10 +1519,13 @@
                     (cons "DEL" (cons main deleted)))
              (cons "DEL" (cons prev-rev 0)))))   ; no effect => no bump
       ((string=? op "COMPACT")
-       ; COMPACT does NOT bump current-rev — call mvcc-compact directly.
+       ; COMPACT does NOT bump current-rev.  cw-vku: flip ONLY the ErrCompacted
+       ; gate here — the physical GC is incremental (mvcc-compact-gc-step!, one
+       ; slice per driver tick), so a big window never holds every replica's
+       ; shard mailbox for the full sweep at the same log position.
        ; The rev argument is a decimal-ASCII bytevector (same convention as leaseId).
        (let ((rev (let ((l (bytes->int (list-ref cmd 1)))) (if l l 0))))
-         (mvcc-compact ctx rev)))
+         (mvcc-compact-begin! ctx rev)))
       ((string=? op "LEASE-GRANT")
        ; ("LEASE-GRANT" id ttl): create the lease object.  A grant writes only the
        ; replicated lease-meta scalar (+ the auto-id counter) — NOT a keyspace

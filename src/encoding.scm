@@ -11,12 +11,14 @@
 
 ; ---- bytevector slice ----
 
+; cw-xq9: native bytevector-copy! instead of a byte-at-a-time interpreted loop.
+; kv-record-decode subbv's the FULL VALUE of every row it touches — a 1000-pod
+; k8s LIST copied ~3.5MB one interpreted byte at a time (~3ms/key, ~3s/LIST,
+; all of it on the single shard thread).
 (define (subbv b start end)
-  (let* ((n (- end start)) (out (make-bytevector n 0)))
-    (let loop ((i 0))
-      (if (= i n) out
-          (begin (bytevector-u8-set! out i (bytevector-u8-ref b (+ start i)))
-                 (loop (+ i 1)))))))
+  (let ((out (make-bytevector (- end start) 0)))
+    (bytevector-copy! out 0 b start end)   ; R7RS arg order: (dest at src start end)
+    out))
 
 ; ---- u64 big-endian ----
 

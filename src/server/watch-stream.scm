@@ -58,6 +58,7 @@
 ; the test reads it back; .23 overrides watch-stream-emit! to frame bytes onto the
 ; gRPC stream instead.  This is the ONE seam .23 replaces for output.
 
+(include "src/safe-send.scm")  ; cw-2au: send-to-dead-pid is a no-op
 (include "src/watch.scm")   ; watch-response<->sexp bridge + record accessors
 
 ; ---- OUTPUT sink ----------------------------------------------------------
@@ -139,13 +140,14 @@
             ((not (pair? r)) (await))
             ((eq? (car r) 'watch-response) (on-watch-response (cadr r)) (await))
             ((eq? (car r) 'watch-created)
-             (let* ((wid (cdr r))
+             (let* ((wid (cadr r))           ; cw-l5h: shape is now (watch-created WID CUR-REV)
+                    (crev (caddr r))
                     (progress? (let ((c (assq 'progress-notify spec-alist)))
                                  (and c (cdr c)))))
                (hashtable-set! watchers wid (make-ws-info wid #t progress? 0))
-               ; etcd's immediate empty CREATED ack on the stream.
+               ; etcd's immediate empty CREATED ack on the stream — carry the shard's real rev.
                (emit! (watch-response->sexp
-                       (make-watch-response wid 0 '() #t #f #f 0)))
+                       (make-watch-response wid crev '() #t #f #f 0)))
                (send reply-pid (cons 'watch-create-ok wid))))
             ((eq? (car r) 'watch-compacted)
              (send reply-pid (cons 'watch-create-compacted (cdr r))))

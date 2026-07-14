@@ -32,6 +32,7 @@
 ;                           shard-pid cluster-id member-id cluster-members my-name pool-size)
 ; Then (grpc-serve "host:port" <this-router-pid>) routes etcd calls through it.
 
+(include "src/safe-send.scm")  ; cw-2au: send-to-dead-pid is a no-op
 (define GRPC-UNAVAILABLE-ROUTER 14)   ; gRPC UNAVAILABLE (client retries)
 
 (define (grpc-router-main shard-pid cluster-id member-id cluster-members my-node-name pool-size . rest)
@@ -50,8 +51,6 @@
 
   ; round-robin cursor for unary calls.
   (define rr 0)
-  (define (next-worker!)
-    (let ((w (worker rr))) (set! rr (+ rr 1)) w))
 
   ; handle -> worker pid, held only for the lifetime of a streaming call.
   (define stream-routes (make-eqv-hashtable))
@@ -73,14 +72,27 @@
         (let ((tok (grpc-request-metadata h "token")))
           (and tok (> (string-length tok) 0)))))
 
+  (define (spawn-worker!)
+    (spawn-source-dedicated "(include \"src/server/grpc-kv.scm\")"
+                            'grpc-kv-main
+                            shard-pid cluster-id member-id
+                            cluster-members my-node-name shard-groups))
+
+  ; cw-2au: a worker CAN die (runtime panic, cascade from a dead peer). safe-send
+  ; makes plain `send` a silent no-op, so route with the RAISING %send: on failure
+  ; respawn a fresh worker into that slot and retry once, so one crash costs one
+  ; request at most instead of a permanently dark slot ("router: worker unavailable"
+  ; -> k3s bootstrap panic loop was the 150k-campaign wall).
+  (define (route! slot w m)
+    (guard (e (#t (let ((fresh (spawn-worker!)))
+                    (vector-set! workers (modulo slot n) fresh)
+                    (guard (e2 (#t #f)) (%send fresh m)))))
+      (%send w m)))
+
   ; ---- spawn the pool (an expression, so AFTER all internal defines) ----
   (let build ((i 0))
     (when (< i pool)
-      (vector-set! workers i
-                   (spawn-source-dedicated "(include \"src/server/grpc-kv.scm\")"
-                                           'grpc-kv-main
-                                           shard-pid cluster-id member-id
-                                           cluster-members my-node-name shard-groups))
+      (vector-set! workers i (spawn-worker!))
       (build (+ i 1))))
 
   (display "node ") (display my-node-name)
@@ -94,12 +106,19 @@
         ((eq? (car m) '*grpc-request*)
          (let* ((h    (cadr m))
                 (path (grpc-request-path h))
-                (w    (if (auth-pinned? path h) (worker 0) (next-worker!))))
-           (when (streaming-path? path)
-             (hashtable-set! stream-routes h w))
+                (slot (if (auth-pinned? path h) 0 rr)))
+           (when (not (auth-pinned? path h)) (set! rr (+ rr 1)))
+           ; cw-2au: any /Auth/* call may change auth state — tell EVERY worker
+           ; to drop its cached auth-disabled? so the next request re-reads it.
+           (when (string-prefix? "/etcdserverpb.Auth/" path)
+             (let bcast ((i 0))
+               (when (< i n) (send (worker i) '(auth-invalidate)) (bcast (+ i 1)))))
            (guard (e (#t (grpc-respond-error! h GRPC-UNAVAILABLE-ROUTER
                                               "router: worker unavailable")))
-             (send w m)))
+             (route! slot (worker slot) m)
+             ; record AFTER routing so a respawned worker is the one on the map.
+             (when (streaming-path? path)
+               (hashtable-set! stream-routes h (worker slot)))))
          (loop))
         ; a follow-up client-streamed message -> the worker that owns the stream.
         ((eq? (car m) '*grpc-stream-msg*)

@@ -57,10 +57,12 @@
 ; The handler NEVER opens a store / evaluates a Txn locally; it only uses the codec,
 ; the Txn STRUCT builders + txn-encode, and the kv-rec-*/range-opt helpers — so the
 ; store-touching bodies these files also define are simply never called here.
+(include "src/safe-send.scm")  ; cw-2au: send-to-dead-pid is a no-op
 (include "src/encoding.scm")
 (include "src/store-ctx.scm")
 (include "src/mvcc.scm")
 (include "src/proto.scm")
+(include "src/shard-route.scm")   ; cw-0v2 (G3): prefix-aware key->shard routing
 
 ; ===========================================================================
 ; small helpers
@@ -515,14 +517,10 @@
                                     (string-append my-node-name ":" (number->string i))))))
           (if p (vector-set! shard-pid-cache i p))
           (or p shard-pid))))          ; fall back to group 0 until the replica publishes
-  (define (key-shard key)              ; FNV-1a over the key bytes, mod N
-    (if (<= shard-groups 1) 0
-        (let ((len (bytevector-length key)))
-          (let loop ((i 0) (h 2166136261))
-            (if (= i len) (modulo h shard-groups)
-                (loop (+ i 1)
-                      (modulo (* (bitwise-xor h (bytevector-u8-ref key i)) 16777619)
-                              4294967296)))))))
+  ; cw-0v2 (G3): prefix-aware — a /registry/ key hashes its RESOURCE SEGMENT
+  ; (src/shard-route.scm), so per-resource watch/LIST/CAS stay on one shard and
+  ; pods/leases/events spread across groups; other keys hash whole-key FNV-1a.
+  (define (key-shard key) (shard-route-hash key shard-groups))
   (define (shard-pid-for key) (shard-pid-idx (key-shard key)))
   ; cw-kp0 Phase 4: the distinct shard indices a Txn's keys map to (its participants).
   ; <=1 -> the Txn commits atomically on that one shard (route there). >1 -> it spans
@@ -580,6 +578,24 @@
   ; a concurrent stream/request message).  The main loop drains these first.
   (define grpc-pending '())
 
+  ; cw-vku: async Range/LIST pool — handle-range hands off after decode+authz so a
+  ; multi-second k8s relist never holds THIS dispatcher's mailbox (see
+  ; server/grpc-range-worker.scm for the field evidence + protocol).
+  (define range-pool
+    (let spawn-rp ((i 0) (acc '()))
+      (if (= i 4) (list->vector (reverse acc))
+          (spawn-rp (+ i 1)
+                    (cons (spawn-source-dedicated
+                           "(include \"src/server/grpc-range-worker.scm\")"
+                           'grpc-range-worker-main (or my-node-name "")
+                           shard-pid cluster-id member-id shard-groups)
+                          acc)))))
+  (define range-pool-rr 0)
+  (define (dispatch-range-async! h opts limit route)
+    (set! range-pool-rr (modulo (+ range-pool-rr 1) (vector-length range-pool)))
+    (send (vector-ref range-pool range-pool-rr) (list 'range-do h opts limit route))
+    'async)
+
   ; ---- shard round-trips (this actor's PID is the reply-pid) ----
   ; raw-receive here must yield the shard's reply; any dispatcher traffic that
   ; races in (*grpc-request* / *grpc-stream-msg* / *grpc-stream-end*) is buffered
@@ -589,7 +605,7 @@
     (let wait ()
       (let ((r (raw-receive)))
         (if (and (pair? r)
-                 (memq (car r) '(*grpc-request* *grpc-stream-msg* *grpc-stream-end* put-done
+                 (memq (car r) '(*grpc-request* *grpc-stream-msg* *grpc-stream-end* put-done auth-invalidate
                                  ; cw-kp0: cross-shard watch frames delivered to THIS dispatcher's
                                  ; (self) — buffer them for the main loop's relay, never mis-parse
                                  ; one as a shard ack mid-write.
@@ -720,6 +736,10 @@
     (set! inflight (- inflight 1))
     (let ((h (cadr m)) (payload (caddr m)))
       (cond
+        ((and (pair? payload) (eq? (car payload) 'txnr))   ; cw-l5h: async Txn result tagged (txnr rev . result)
+         (grpc-respond! h (pb-encode TxnResponse-schema
+                                     (internal-txn-result->etcd (cddr payload)
+                                                                (make-header cluster-id member-id (cadr payload) (wterm!))))))
         ((and (pair? payload) (string? (car payload)) (string=? (car payload) "PUT"))
          (grpc-respond! h (etcd-pb-encode-put-resp cluster-id member-id (cdr payload) (wterm!) #f)))
         ((and (pair? payload) (eq? (car payload) 'err-lease-not-found))
@@ -834,6 +854,13 @@
   ;   (cons 'user name-str)      authenticated as name
   ;   (cons 'err (status . msg)) deny (etcd-faithful: empty name vs bad token)
   (define (auth-identify h)
+    ; cw-2au: the per-request auth-state ask is a SYNC shard round-trip on EVERY
+    ; Range/Txn/write — under load it head-of-line-blocked this dispatcher up to
+    ; 13s (k3s boot reads then time out). Short-circuit through the same cached
+    ; auth-disabled? the async PUT path uses (same documented staleness caveat;
+    ; handle-auth-enable invalidates this worker's cache).
+    (if (auth-disabled?) 'disabled (auth-identify-uncached h)))
+  (define (auth-identify-uncached h)
     (let ((s (ask-shard (list 'auth-state (self)))))
       (if (or (not (pair? s)) (not (eq? (car s) 'auth-state-ok)) (not (cadr s)))
           'disabled                                   ; auth off (or seam down) -> allow
@@ -951,22 +978,20 @@
                          (cons 'max-mod-rev    (list-ref rl 10))))
              ; cw-ivt P2: a spanning range (range-end set) scatter-gathers across groups;
              ; a single-key range routes to its one group.
-             (res (if (and rend (> shard-groups 1)) (shard-range-all opts) (shard-range opts))))
-      (cond
-        ((not (pair? res)) (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: not leader")))
-        ((eq? (car res) 'kv-range-ok)
-         (let ((cur-rev (let ((r (list-ref res 1))) (if (< r 1) 1 r))) ; etcd: never report rev<1 (cw-lkq.9)
-               (term    (list-ref res 2))
-               (err     (list-ref res 3)) (total (list-ref res 4))
-               (tuples  (list-ref res 5)))
-           (if (eq? err 'compacted)
-               (cons 'err (cons GRPC-OUT-OF-RANGE ETCD-ERR-COMPACTED))
-               (let* ((limit (list-ref rl 2))
-                      ; etcd `more` = a limit was applied AND more keys exist past it.
-                      (more  (and (> limit 0) (> total (length tuples)))))
-                 (cons 'ok (etcd-pb-encode-range-resp cluster-id member-id cur-rev term
-                                                      tuples more total))))))
-        (else (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: not leader")))))))) ; +let +if (authz)
+             ; cw-0v2 (G3): a prefix range CONTAINED in one resource segment (the k8s
+             ; LIST pattern) also routes to its one group — same shard, coherent revs.
+             ; cw-vku: hand off to the async range pool — the blocking shard ask +
+             ; response encode must NOT hold this dispatcher (multi-second k8s
+             ; relists stalled every RPC on this port, incl. sub-ms PUT acks).
+             (route (if (and rend (> shard-groups 1)
+                             (not (shard-route-single? key rend shard-groups)))
+                        'all (key-shard key))))
+      ; cw-2au: single-group unary Ranges may use the native fused scan (the
+      ; range worker still checks CWS_NATIVE_RANGE + request shape); the 'all
+      ; scatter path needs per-row tuples to merge, so it never opts in.
+      (dispatch-range-async! h
+                             (if (eq? route 'all) opts (cons (cons 'native-pb #t) opts))
+                             (list-ref rl 2) route))))) ; +let +if (authz)
 
   ; ---- KV/Put ----
   ; prev_kv snapshot (if requested) -> propose ("PUT" key value lease) -> PutResponse.
@@ -993,7 +1018,9 @@
             (drain-until-room!)
             (set! inflight (+ inflight 1))
             ; cw-ivt: route the async PUT to the key's group.
-            (send (shard-pid-for key) (cons (list 'async (self) h)
+            ; 4th element = submit timestamp for CWS_PROF hop profiling (consumers
+            ; only read elements 1-3; harmless when profiling is off).
+            (send (shard-pid-for key) (cons (list 'async (self) h (current-second))
                                   (list (string->utf8 "PUT") key value (int->bytes lease))))
             'async)
           (handle-put-sync h key value lease want-prev))))
@@ -1043,7 +1070,9 @@
       (let* ((want-prev (galist 'prev_kv dr #f))
            ; snapshot the to-be-deleted live KVs via a Range over the same span.
            ; cw-ivt P2: a spanning span scatter-gathers; single-key routes to one group.
-           (span? (and rend (> shard-groups 1)))
+           ; cw-0v2 (G3): a span contained in one resource segment routes to one group.
+           (span? (and rend (> shard-groups 1)
+                       (not (shard-route-single? key rend shard-groups))))
            (prev-kvs (if want-prev
                          (let* ((ropts (list (cons 'key key) (cons 'range-end rend)))
                                 (rres (if span? (shard-range-all ropts) (shard-range ropts))))
@@ -1163,22 +1192,29 @@
       (if deny (cons 'err deny)
       (let* ((itxn  (etcd-txn->internal tr))
              (parts (txn-participant-shards itxn)))
-        ; cw-kp0 Phase 4: in MULTI-GROUP mode every Txn goes through the 2PC coordinator so
-        ; it commits at a global rev — even a single-participant Txn, otherwise it would use
-        ; the shard's LOCAL rev and a key written by both a single-shard Txn and a cross-shard
-        ; Txn would get two incompatible rev sequences (Elle :incompatible-order). Single-group
-        ; (shard-groups=1, no authority) keeps the original local-rev fast path.
-        (if (> shard-groups 1)
+        ; cw-kp0 Phase 4: a Txn that SPANS groups goes through the 2PC coordinator so it
+        ; commits at a global rev.
+        ; cw-0v2 (G3): a SINGLE-participant Txn (the k8s single-key CAS — under prefix
+        ; routing every per-resource Txn is one) routes DIRECTLY to its owning shard:
+        ; atomic there, and its compares/writes live in the SAME shard-local rev domain
+        ; as the direct Put/Range path (2PC's authority-granted revs are a different
+        ; domain — a CAS through 2PC compared against a rev the client took from a
+        ; LIST and got the wrong verdict, and its write bypassed the shard's watchers).
+        ; Mixing 2PC and direct writes on the SAME key remains a documented divergence;
+        ; the k8s access pattern never does.
+        (if (and (> shard-groups 1) (pair? parts) (pair? (cdr parts)))
             (txn-2pc itxn)
-            (let* ((tgt (if (null? parts) 0 (car parts)))
-                   (ack (ask-shard-on (shard-pid-idx tgt)
-                                      (cons (self) (list (string->utf8 "TXN") (txn-encode itxn))))))
-              (cond
-                ((and (pair? ack) (boolean? (car ack)))
-                 (cons 'ok (pb-encode TxnResponse-schema (internal-txn-result->etcd ack (shard-header)))))
-                ((eq? ack 'tryagain)      (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: not leader")))
-                ((eq? ack 'indeterminate) (cons 'err (cons GRPC-UNAVAILABLE "etcdserver: leader changed")))
-                (else (cons 'err (cons GRPC-INTERNAL "txn: unexpected ack"))))))))))
+            ; cw-l5h: ASYNC Txn submission (mirrors EXP5 handle-put). The blocking ask-shard-on
+            ; serialized each worker per Txn -> avgbatch=1 -> ~21 w/s on EBS, starving the kube-
+            ; apiserver. Submit tagged with the call handle + return 'async; concurrent k8s Txns
+            ; now fill the shard mailbox and BATCH into shared group-commit rounds (amortizing the
+            ; fsync). apply-fn tags the commit rev; respond-put-done! encodes the TxnResponse.
+            (let ((tgt (if (null? parts) 0 (car parts))))
+              (drain-until-room!)
+              (set! inflight (+ inflight 1))
+              (send (shard-pid-idx tgt) (cons (list 'async (self) h)
+                                              (list (string->utf8 "TXN") (txn-encode itxn))))
+              'async))))))
 
   ; ---- Lease/LeaseGrant (UNARY, cw-u4a.17) ----
   ; Propose ("LEASE-GRANT" id ttl) through the shard's async commit->ack bridge;
@@ -1281,6 +1317,7 @@
 
   ; ---- Auth/AuthEnable / AuthDisable ----  admin-gated (bootstrap allowed while off).
   (define (handle-auth-enable h bytes)
+    (set! auth-known #f)   ; cw-2au: re-read auth state on next request
     (let ((deny (admin-deny? h)))
       (if deny (cons 'err deny)
           (auth-write-ack->resp (shard-write (list (string->utf8 "AUTH-ENABLE")))
@@ -1534,7 +1571,11 @@
              (cr (and wr (galist 'create_request wr #f)))
              (re (and cr (let ((r (galist 'range_end cr EMPTY)))
                            (if (= (bytevector-length r) 0) #f r)))))
-        (when (and cr re)
+        ; cw-0v2 (G3): a range watch CONTAINED in one resource segment (the k8s
+        ; per-prefix watch) is NOT cross-shard — the worker self-registers at the
+        ; owning shard (grpc-watch.scm makes the same shard-route-single? call).
+        (when (and cr re
+                   (not (shard-route-single? (galist 'key cr EMPTY) re shard-groups)))
           (let* ((key       (galist 'key cr EMPTY))
                  (start-rev (galist 'start_revision cr 0))
                  (prev-kv?  (galist 'prev_kv cr #f))
@@ -1560,7 +1601,19 @@
                 (send (shard-pid-idx i) (list 'watch-register (self) spec))
                 (rloop (+ i 1)))))))))
 
+  ; cw-vku diagnosis: any single dispatch that holds this dispatcher >100ms
+  ; stalls EVERY conn on this node's client port — log it with wall-clock time.
   (define (dispatch! h)
+    (let ((td (current-second))
+          (path (grpc-request-path h)))       ; capture BEFORE responding closes h
+      (dispatch-inner! h)
+      (let ((ms (exact (round (* 1000 (- (current-second) td))))))
+        (if (>= ms 100)
+            (begin (display (string-append "SLOW grpc-dispatch t=" (number->string td)
+                                           " ms=" (number->string ms)
+                                           " path=" path))
+                   (newline))))))
+  (define (dispatch-inner! h)
     (let ((path (grpc-request-path h))
           (peer (grpc-request-peer-identity h)))
       ; cw-u4a.21: surface the verified mTLS client identity (or #f over h2c /
@@ -1932,15 +1985,35 @@
     ; cyclic garbage is only reclaimed by an explicit cycle-registry sweep on THIS
     ; thread. No-op on builds without tracing-cycle-collector.
     (set! gc-msg-count (+ gc-msg-count 1))
-    (if (= 0 (modulo gc-msg-count 512)) (collect-garbage))
+    (if (= 0 (modulo gc-msg-count 512))
+        ; cw-vku diagnosis: a slow dispatcher GC stalls every conn on this port
+        (let ((t0 (current-second)))
+          (collect-garbage)
+          (let ((ms (exact (round (* 1000 (- (current-second) t0))))))
+            (if (>= ms 100)
+                (begin (display (string-append "SLOW grpc-gc t=" (number->string t0)
+                                               " gc=" (number->string ms)))
+                       (newline))))))
     (let ((m (next-message)))
       (cond
-        ((not (pair? m)) (xwatch-tick!) (loop))   ; idle tick -> flush cross-shard watch buffer in rev order
+        ((not (pair? m))
+         (let ((tx (current-second)))
+           (xwatch-tick!)
+           (let ((ms (exact (round (* 1000 (- (current-second) tx))))))
+             (if (>= ms 100)
+                 (begin (display (string-append "SLOW grpc-xwatch t=" (number->string tx)
+                                                " ms=" (number->string ms)))
+                        (newline)))))
+         (loop))   ; idle tick -> flush cross-shard watch buffer in rev order
         ((eq? (car m) '*grpc-request*)
          (dispatch! (cadr m)) (loop))
         ; EXP5 (cw-juw): async PUT commit landed -> encode + respond now.
         ((eq? (car m) 'put-done)
          (respond-put-done! m) (loop))
+        ; cw-2au: router broadcast after an /Auth/* call — drop the cached
+        ; auth-disabled? so the next request re-reads replicated auth state.
+        ((eq? (car m) 'auth-invalidate)
+         (set! auth-known #f) (loop))
         ; a subsequent client-streamed message -> forward to the stream worker.
         ; A dead worker (it crashed / already exited) must NOT take down the
         ; dispatcher: guard the send and drop the stale route.

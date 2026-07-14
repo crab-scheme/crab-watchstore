@@ -113,9 +113,14 @@ LID="$(echo "$GL" | sed -n 's/^lease \([^ ]*\) granted.*/\1/p')"
 
 GF="$(ectl1 "$FOLLOWER_EP" lease grant 100)"
 echo "  $ etcdctl (follower) lease grant 100 -> $(echo "$GF" | tr '\n' '|')"
+if [ "${CWS_ENGINE:-raft}" = quepaxa ]; then
+  # leaderless leases: ANY node serves Lease RPCs (real-etcd behavior)
+  assert_has "granted" "$GF" "LeaseGrant on a non-coordinator succeeds (leaderless leases)"
+else
 assert_hasnot "granted" "$GF" "LeaseGrant on a follower does NOT succeed"
 assert_hasnot "unexpected ack" "$GF" "LeaseGrant on a follower is NOT an INTERNAL 'unexpected ack'"
 assert_redirect "$GF" "LeaseGrant on a follower returns a clean not-leader redirect"
+fi
 
 echo
 echo "== LeaseKeepAlive: leader keeps it alive; follower redirects, never fakes TTL=0 (cw-u4a.43) =="
@@ -128,7 +133,11 @@ echo "  $ etcdctl (follower) lease keep-alive --once -> $(echo "$KF" | tr '\n' '
 assert_hasnot "unexpected ack" "$KF" "LeaseKeepAlive on a follower is NOT an INTERNAL 'unexpected ack'"
 # the core cw-u4a.43 fix: a follower must NOT report the still-live lease as expired (TTL=0).
 assert_hasnot "expired" "$KF" "follower keepalive did NOT falsely report the live lease expired (TTL=0)"
+if [ "${CWS_ENGINE:-raft}" = quepaxa ]; then
+  assert_has "keepalived" "$KF" "LeaseKeepAlive on a non-coordinator succeeds (leaderless leases)"
+else
 assert_redirect "$KF" "LeaseKeepAlive on a follower returns a clean not-leader redirect (cw-u4a.43)"
+fi
 
 # the lease is still alive on the leader after the follower's rejected keepalive.
 TTL="$(ectl1 "$LEADER_EP" lease timetolive "$LID")"

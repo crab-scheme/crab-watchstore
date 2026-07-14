@@ -165,10 +165,22 @@
   (check "get key with embedded NUL" val-null (and rn (kv-rec-value rn)))
   (check "get key with all-0xFF bytes" val-ff  (and rf (kv-rec-value rf))))
 
-; Range over both should find exactly 2 keys.
+; Range over both should find exactly 2 keys — and return the DECODED user
+; keys byte-exactly (exercises key-cf-decode-user-key's escaped-0x00 path,
+; native bytevector-nul-unescape since cw-71k).
 (let* ((zero (make-bytevector 1 0))
        (res  (range-bv zero zero 'sort-order 'ascend 'sort-target 'key)))
-  (check "embedded-null + all-ff: count = 2" 2 (range-count res)))
+  (check "embedded-null + all-ff: count = 2" 2 (range-count res))
+  (let ((returned-keys (map car (range-kvs res))))
+    (check "embedded-NUL key decodes byte-exactly" key-with-null (list-ref returned-keys 0))
+    (check "all-0xFF key decodes byte-exactly"     key-all-ff    (list-ref returned-keys 1))))
+
+; Direct enc/decode round-trips through the escaped-0x00 path (cw-71k):
+; leading, trailing, and consecutive NUL runs all collapse back exactly.
+(check "decode round-trip: leading NUL"   (bv 0 65)     (key-cf-decode-user-key (enc-key (bv 0 65) 7 0)))
+(check "decode round-trip: trailing NUL"  (bv 65 0)     (key-cf-decode-user-key (enc-key (bv 65 0) 7 0)))
+(check "decode round-trip: NUL run"       (bv 0 0 0)    (key-cf-decode-user-key (enc-key (bv 0 0 0) 7 0)))
+(check "decode round-trip: mixed"         (bv 107 0 107) (key-cf-decode-user-key (enc-key (bv 107 0 107) 7 0)))
 
 ; ===========================================================================
 (section "§2 prefix-vs-superkey: length-prefix keeps groups disjoint")

@@ -253,20 +253,24 @@
 (mvcc-apply UCTX (list (b "PUT") (b "zz") (b "v5")))
 (check "§3 current-rev=5 after v5" 5 (mvcc-current-rev UCTX))
 
-; Apply COMPACT to rev 5 through the apply-fn wiring (same pipeline as shard-actor):
-;   mvcc-apply sets compact-rev=5, then watch-check-compaction! detects
-;   delivered_rev(3) < compact-rev(5) and cancels the watcher.
+; Apply COMPACT to rev 5 through the apply-fn wiring (same pipeline as shard-actor).
+; cw-xq9 root-cause fix: watch-check-compaction! no longer CANCELS a registered
+; (synced-by-construction) watcher below the floor — that mass-ErrCompacted every
+; quiet k8s watch at each 5-min compaction and froze the apiserver caches. It now
+; advances the de-dup floor to compact-1 and cancels nothing; live delivery continues.
 (let ((r (mvcc-apply UCTX (list (b "COMPACT") (b "5")))))
   (check "§3 compact to 5 ok" (cons 'ok 5) r))
 (let ((canceled (watch-check-compaction! reg3 UCTX)))
-  (check "§3 watch-check-compaction! (apply-fn COMPACT path) canceled the watcher"
-         (list wid3) canceled))
-(check "§3 registry empty after compaction cancel" 0 (reg-count reg3))
+  (check "§3 watch-check-compaction! cancels NOTHING (cw-xq9)" '() canceled))
+(check "§3 watcher still registered after compaction" 1 (reg-count reg3))
+(check "§3 lagging delivered_rev advanced to compact-1"
+       4 (w-delivered-rev (reg-get reg3 wid3)))
+(check "§3 no canceled WatchResponse emitted" 0 (length (wbox-cancels box3)))
 
-(let ((cs (wbox-cancels box3)))
-  (check "§3 canceled WatchResponse reached consumer via wire bridge" 1 (length cs))
-  (check "§3 cancel compact_revision=5" 5 (wr-compact-revision (car cs)))
-  (check "§3 cancel watch_id correct" wid3 (wr-watch-id (car cs))))
+; the watcher still delivers live events past the compaction
+(set-w-synced?! (reg-get reg3 wid3) #t)
+(unit-apply! reg3 "PUT" "zz" "v6")
+(check "§3 live event after compaction still delivered" 1 (length (wbox-events box3)))
 
 ; ===========================================================================
 ; CLUSTER SECTION — §2: deeper 9-rev historical replay
@@ -478,5 +482,72 @@
          8 (length tuples))
   (check "§2 live event 10 at position 7"
          '(500 put "/d/4" 10) (list-ref tuples 7)))
+
+; ===========================================================================
+; §6 — cw-i07 (G4): a pending do-create must not hold OTHER watch_ids'
+;      already-flowing events hostage on the same stream.
+;
+;      grpc-watch.scm's do-create registers the new watch and then loops
+;      awaiting its 'watch-created ack; any 'watch-response frame that
+;      arrives on the worker's mailbox during that await used to be
+;      unconditionally buffered and held until the new watch's created-ack
+;      landed — even one that belonged to a DIFFERENT, already-established
+;      watch_id on the same stream. Under a slow shard round-trip that
+;      starved every other watcher on the connection of live events for the
+;      whole registration window (the informer-pinning bug this gate
+;      targets).
+;
+;      This exercises the FIXED arbitration rule directly: a wr-sexp whose
+;      wid is already in live-wids ships immediately; only the pending new
+;      watch's own replay (wid not yet established) waits for its ack. It
+;      mirrors do-create's cond arm exactly (see cw-i07 in grpc-watch.scm)
+;      against a scripted mailbox sequence, so the ordering guarantee is
+;      pinned independent of real shard/network timing.
+; ===========================================================================
+(section "§6: do-create does not hold other watch_ids' events hostage (cw-i07)")
+
+(define fair-live-wids '())
+(define fair-out '())
+(define (fair-emit! wr) (set! fair-out (cons wr fair-out)))
+
+; mirrors grpc-watch.scm do-create's 'watch-response cond arm post-fix.
+(define (fair-handle-response wr buffered)
+  (let ((w (car wr)))
+    (if (memv w fair-live-wids)
+        (begin (fair-emit! wr) buffered)
+        (cons wr buffered))))
+
+; mirrors do-create's 'watch-created cond arm: establish, ack, flush replay.
+(define (fair-handle-created wid buffered)
+  (set! fair-live-wids (cons wid fair-live-wids))
+  (fair-emit! (list wid 0 #t #f "" 0 '()))
+  (for-each fair-emit! (reverse buffered)))
+
+; wid 601 is already established (a prior create completed on this stream).
+(fair-handle-created 601 '())
+
+; wid 602's create is now in flight (its await loop is running). While it
+; is pending: a LIVE event for the already-established wid 601 arrives,
+; then wid 602's own replay event (buffered — no created-ack yet), then
+; wid 602's created-ack (which flushes its buffered replay).
+(let* ((b0 '())
+       (b1 (fair-handle-response (list 601 5 #f #f "" 0 '((put #(k1) #f))) b0))
+       (b2 (fair-handle-response (list 602 3 #f #f "" 0 '((put #(k2) #f))) b1)))
+  (fair-handle-created 602 b2))
+
+(let ((order (reverse fair-out)))
+  (check "§6 4 frames emitted" 4 (length order))
+  (check "§6 wid 601's created ack first"
+         601 (car (list-ref order 0)))
+  (check "§6 wid 601's live event ships WHILE 602's create is pending (not held hostage)"
+         601 (car (list-ref order 1)))
+  (check "§6 wid 602's created ack only after its own await resolves"
+         602 (car (list-ref order 2)))
+  (check "§6 wid 602's own buffered replay flushes after its created ack"
+         602 (car (list-ref order 3)))
+  (check "§6 no reordering within wid 601 (its one event is exactly its own)"
+         '(put #(k1) #f) (car (list-ref (list-ref order 1) 6)))
+  (check "§6 no reordering within wid 602 (its replay event is exactly its own)"
+         '(put #(k2) #f) (car (list-ref (list-ref order 3) 6))))
 
 (done!)

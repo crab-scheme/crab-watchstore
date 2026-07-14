@@ -5,16 +5,16 @@
 services:
   cws-a:
     cap_add: [NET_ADMIN]
-    environment: {WAN_DELAY_MS: "${WAN_DELAY_MS:-75}"}
+    environment: {WAN_DELAY_MS: "${WAN_DELAY_MS:-75}", CWS_ENGINE: "${CWS_ENGINE:-raft}"}
     command: ["--config", "/etc/crab-watchstore.conf", "--tick-ms", "250", "--election-ticks", "8",
               "--locality", "us-east", "--leader-region", "us-east"]
   cws-b:
     cap_add: [NET_ADMIN]
-    environment: {WAN_DELAY_MS: "${WAN_DELAY_MS:-75}"}
+    environment: {WAN_DELAY_MS: "${WAN_DELAY_MS:-75}", CWS_ENGINE: "${CWS_ENGINE:-raft}"}
     command: ["--config", "/etc/crab-watchstore.conf", "--tick-ms", "250", "--election-ticks", "8",
               "--locality", "eu-west", "--leader-region", "us-east"]
   cws-c:
     cap_add: [NET_ADMIN]
-    environment: {WAN_DELAY_MS: "${WAN_DELAY_MS:-75}"}
+    environment: {WAN_DELAY_MS: "${WAN_DELAY_MS:-75}", CWS_ENGINE: "${CWS_ENGINE:-raft}"}
     command: ["--config", "/etc/crab-watchstore.conf", "--tick-ms", "250", "--election-ticks", "8",
               "--locality", "ap-south", "--leader-region", "us-east"]

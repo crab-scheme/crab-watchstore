@@ -23,6 +23,7 @@
 ; the live key-count): one round-trip per request yields rev / term / commit / applied / db-size
 ; / leader / key-count.  The seam is endpoint-local + un-gated, so every node answers honestly.
 
+(include "src/safe-send.scm")  ; cw-2au: send-to-dead-pid is a no-op
 (include "src/encoding.scm")   ; subbv (+ confirms string->utf8 / utf8->string / bytevector-u8-ref)
 
 ; ===========================================================================

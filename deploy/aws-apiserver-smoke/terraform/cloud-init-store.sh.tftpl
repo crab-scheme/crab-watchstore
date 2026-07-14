@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# cloud-init for a crab-watchstore store node (Graviton/arm64). Pulls the native
+# binary + src from S3 and runs node-cluster.scm under systemd with this node's
+# slice of the cluster spec. Templated by Terraform: node_name, cluster_spec, bucket.
+set -euxo pipefail
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+# libstdc++6 + ca-certs are the crabscheme binary's only runtime deps. Ubuntu 24.04 dropped the
+# `awscli` apt package, so install AWS CLI v2 from the bundle (the instance role signs the S3 GET).
+apt-get install -y --no-install-recommends libstdc++6 ca-certificates curl unzip >/dev/null
+curl -sL "https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" -o /tmp/awscli.zip
+unzip -q /tmp/awscli.zip -d /tmp
+/tmp/aws/install
+export PATH=/usr/local/bin:$PATH
+
+install -d /opt/crabwatchstore /opt/crabwatchstore/data
+cd /opt/crabwatchstore
+
+# /etc/hosts: peers -> their public EIP (cross-region routes via the NAT'd EIP). THIS node ->
+# 0.0.0.0: Raft's node-listen RESOLVES the name and binds it, so self must resolve to 0.0.0.0
+# (bind all interfaces) — peers reach it on the EIP via NAT. (127.0.0.1 would bind loopback only;
+# the EIP isn't a local interface so binding it fails.) grpc/2379 already binds 0.0.0.0 (it keys
+# off the host STRING being non-numeric, not the resolved address), so it's unaffected.
+while read -r ip name; do
+  [ -z "$name" ] && continue
+  if [ "$name" = "${node_name}" ]; then
+    echo "0.0.0.0 $name"
+  else
+    echo "$ip $name"
+  fi
+done >>/etc/hosts <<'HOSTS'
+${hosts_block}
+HOSTS
+
+# Wait for the artifact (build-and-stage.sh may still be uploading on a fresh run).
+for i in $(seq 1 60); do
+  if aws s3 cp "s3://${bucket}/crabwatchstore.tgz" /opt/crabwatchstore/crabwatchstore.tgz; then break; fi
+  echo "waiting for s3://${bucket}/crabwatchstore.tgz ($i)"; sleep 10
+done
+tar xzf crabwatchstore.tgz                  # -> ./crabscheme  ./src
+chmod +x /opt/crabwatchstore/crabscheme
+
+cat >/etc/systemd/system/crabwatchstore.service <<UNIT
+[Unit]
+Description=crab-watchstore node ${node_name}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/opt/crabwatchstore
+ExecStart=/opt/crabwatchstore/crabscheme run src/node-cluster.scm -- \
+  --node ${node_name} \
+  --durable yes \
+  --db /opt/crabwatchstore/data/cw \
+  --cluster ${cluster_spec} \
+  --tick-ms 250 --election-ticks 8 \
+  --shard-groups 3 --global-rev yes
+Restart=always
+RestartSec=3
+LimitNOFILE=1048576
+StandardOutput=append:/opt/crabwatchstore/node.log
+StandardError=append:/opt/crabwatchstore/node.log
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now crabwatchstore.service

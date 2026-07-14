@@ -279,7 +279,13 @@
     (if (or (null? l) (= n 0)) (reverse acc)
         (loop (cdr l) (- n 1) (cons (car l) acc)))))
 (define (append-for st peer)
-  (let* ((nx (cdr (assq peer (aget st 'next))))
+  ; cw-bm5: clamp next to lastLogIndex+1. A peer's next must never exceed the leader's
+  ; log end (a follower can't hold entries the leader lacks); if a next-advance bug let it,
+  ; entry-term/entries-from ran off the end of the log and CRASHED shard-main under real
+  ; control-plane load. Clamp to the caught-up value and send a contained heartbeat; a
+  ; genuinely-behind follower self-corrects via AER reject. Never kill the store over it.
+  (let* ((raw (cdr (assq peer (aget st 'next))))
+         (nx  (min raw (+ 1 (log-len st))))
          (prev (- nx 1)))
     (list 'ae (aget st 'term) (aget st 'id) prev (entry-term st prev)
           (take-at-most (entries-from st nx) AE-MAX-ENTRIES)
@@ -603,8 +609,14 @@
       ; Any AER (success OR rejection) proves this peer reached us this window —
       ; record it for CheckQuorum (raft-checkquorum counts `heard` + self).
       (succ
-       (let* ((st1 (aset* st (list 'match (aset (aget st 'match) from midx)
-                                   'next (aset (aget st 'next) from (+ midx 1))
+       ; cw-bm5 SOURCE fix: clamp the acked match to lastLogIndex. A follower cannot have
+       ; replicated entries the leader lacks, so midx > log-len is a stale/racey AER; left
+       ; unclamped it corrupts BOTH match (-> maybe-commit advances commit past the log) AND
+       ; next (-> append-for indexes off the end -> shard crash). The iter-1 append-for clamp
+       ; is the downstream guard; this keeps the stored match/next sane at the source.
+       (let* ((m   (min midx (log-len st)))
+              (st1 (aset* st (list 'match (aset (aget st 'match) from m)
+                                   'next (aset (aget st 'next) from (+ m 1))
                                    'heard (add-mem from (aget st 'heard)))))
               (st2 (maybe-commit st1)))
          ; maybe-commit auto-appends Cnew when a joint config commits — replicate it

@@ -100,4 +100,4 @@
                         "ms wps=" (number->string wps)))
 (newline)
 (check "throughput measured (>0)" #t (> wps 0))
-(summary)
+(done!)

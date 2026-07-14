@@ -57,10 +57,9 @@
          (handle (store-open db-path #t))
          (ctx (make-ctx handle "default" sync?))
          ; cw-65x: this is the sole applier ctx — enable the latest-version
-         ; cache. H6 wbuf stays OFF until a binary with store-put-many ships
-         ; (July-12 fleet binary predates it; undefined globals fail at load
-         ; — cw-c8b).
-         (ctx (begin (mvcc-enable-latest-cache! ctx) ctx))
+         ; cache + the H6 write buffer (one store-put-many WriteBatch per
+         ; command; needs a post-July-12 binary, deployed since cw-c8b).
+         (ctx (begin (mvcc-enable-latest-cache! ctx) (kv-wbuf-enable! ctx) ctx))
          ; cw-m9c (G1): same dedicated-thread Range/LIST reader pool as the raft
          ; driver (shard-actor.scm) — big scans must not hold THIS mailbox
          ; either, or writes/consensus ticks stall behind them for the full
@@ -121,8 +120,11 @@
     ; cw-vku diagnosis: always-on slow-path spans (cheap when fast). Any shard
     ; action (engine step / GC / flush) that holds THIS mailbox >100ms logs one
     ; line WITH a wall-clock timestamp so stalls correlate across nodes.
+    (define SLOW-MS
+      (let ((e (get-environment-variable "CWS_SLOW_MS")))
+        (if e (or (string->number e) 100) 100)))
     (define (slow! what ms t0)
-      (if (>= ms 100)
+      (if (>= ms SLOW-MS)
           (begin
             (display (string-append "SLOW " (qk) " t=" (number->string t0)
                                     " " what "=" (number->string ms)))
@@ -323,7 +325,9 @@
     ; Compact the engine to (applied - QP-LOG-KEEP) every QP-COMPACT-EVERY
     ; applied slots: laggards within the window use ranged fetch, deeper
     ; laggards take the ws-snap store-snapshot path (both already exist).
-    (define QP-LOG-KEEP 512)
+    (define QP-LOG-KEEP
+      (let ((e (get-environment-variable "CWS_QP_LOG_KEEP")))
+        (if e (or (string->number e) 512) 512)))
     (define QP-COMPACT-EVERY 64)
     (define next-compact QP-COMPACT-EVERY)
     (define (post! st old-applied)

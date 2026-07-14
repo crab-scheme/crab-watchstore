@@ -39,7 +39,7 @@ func main() {
 	dur := flag.Duration("dur", 20*time.Second, "load duration")
 	conc := flag.Int("conc", 64, "concurrent writers")
 	valsize := flag.Int("valsize", 256, "value bytes")
-	op := flag.String("op", "put", "put | get")
+	op := flag.String("op", "put", "put | get | txn (k8s-create CAS: If mod(key)=0 Then put)")
 	serializable := flag.Bool("serializable", false, "get: serializable (stale-OK, any replica) vs linearizable (ReadIndex)")
 	follower := flag.Bool("follower", false, "get: route to a follower node (multi-region local read) instead of the leader")
 	seedKeys := flag.Int("seedkeys", 200, "get: keys per worker to seed before the timed read loop")
@@ -58,6 +58,7 @@ func main() {
 		clients[i] = c
 	}
 	val := strings.Repeat("x", *valsize)
+	runid := time.Now().UnixNano()
 	// route a key to an endpoint: leader = endpoints[group % n]; a follower for
 	// the same group (multi-region local read) = endpoints[(group+1) % n].
 	route := func(key string, i int) int {
@@ -111,7 +112,7 @@ func main() {
 				if *op == "get" {
 					key = fmt.Sprintf("k%d_%d", gid, i%*seedKeys)
 				} else {
-					key = fmt.Sprintf("k%d_%d", gid, i)
+					key = fmt.Sprintf("k%d_%d_%d", runid, gid, i)
 				}
 				ci := route(key, i)
 				i++
@@ -123,6 +124,16 @@ func main() {
 						opts = append(opts, clientv3.WithSerializable())
 					}
 					_, err = clients[ci].Get(ctx, key, opts...)
+				} else if *op == "txn" {
+					// the k8s pod-create shape: guarded create on a fresh key.
+					var tr *clientv3.TxnResponse
+					tr, err = clients[ci].Txn(ctx).
+						If(clientv3.Compare(clientv3.ModRevision(key), "=", 0)).
+						Then(clientv3.OpPut(key, val)).
+						Commit()
+					if err == nil && !tr.Succeeded {
+						err = fmt.Errorf("txn guard failed on fresh key %s", key)
+					}
 				} else {
 					_, err = clients[ci].Put(ctx, key, val)
 				}

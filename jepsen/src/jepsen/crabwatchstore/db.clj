@@ -63,8 +63,13 @@
   ;; >1 groups: also enable the synthetic global-revision allocator (--global-rev),
   ;; so cross-group revisions are etcd-faithful (without it, N groups have independent
   ;; per-shard revisions = ADR 0005 option A, which the checkers would flag).
+  ;; cw-97b: --engine quepaxa validates the QuePaxa engine instead of raft
+  ;; (pass --engine on the CLI; default preserves the raft launch exactly).
   (let [sg    (:shard-groups test)
-        extra (if (and sg (> sg 1)) ["--shard-groups" (str sg) "--global-rev" "yes"] [])]
+        eng   (:engine test)
+        extra (concat
+                (if (and sg (> sg 1)) ["--shard-groups" (str sg) "--global-rev" "yes"] [])
+                (if eng ["--engine" (name eng)] []))]
     (apply cu/start-daemon!
       {:logfile logfile
        :pidfile pidfile

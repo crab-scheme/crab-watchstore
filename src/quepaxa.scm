@@ -96,9 +96,6 @@
 
 (define QP-GAP-FETCH 2)   ; gap ticks before asking peers for the decided value
 (define QP-GAP-NOOP 6)    ; gap ticks before filling the slot with a no-op
-; ponytail: bounded exactly-once window; retries land within ticks, and Q4's
-; compaction floor will make anything older a snapshot catch-up anyway.
-(define QP-BIDS-KEEP 256)
 
 ; ============================================================
 ; node construction + accessors
@@ -142,10 +139,16 @@
           ; applied-batch log for the driver's write-ack bridge (Q6): (bid . ncmds)
           ; appended (newest first) the FIRST time a bid's batch applies.
           (mutable adone)
-          ; exactly-once dedup window: set membership + ring for eviction.
-          (mutable bidset)       ; equal-ht bid -> #t
-          (mutable bidring)      ; vector of QP-BIDS-KEEP bids (#f = empty)
-          (mutable bidix)))      ; next ring slot to overwrite
+          ; exactly-once dedup (cw-rz9): per-(origin . boot) applied-seq state,
+          ; entry = (F . sparse) where F is the contiguous floor (every seq
+          ; <= F applied) and sparse lists applied seqs > F. COMPLETE — a
+          ; hedged duplicate deciding arbitrarily many slots later is still
+          ; deduped (the old 256-bid ring window overflowed under kill +
+          ; partition: Elle duplicate-elements). Bounded: origins are the
+          ; cluster nodes, seqs are per-origin monotone, and a hole below F
+          ; only outlives its origin's death (new boot = fresh entry), so
+          ; sparse is capped by that boot's in-flight count.
+          (mutable seqs)))       ; equal-ht (origin . boot) -> (F . sparse)
 
 ; per-slot proposer attempt
 (define-record-type qprop
@@ -172,9 +175,7 @@
               0 1 0 0
               0 #f
               '() '() '() '()
-              (make-hashtable equal-hash equal?)
-              (make-vector QP-BIDS-KEEP #f)
-              0)))
+              (make-hashtable equal-hash equal?))))
 
 (define (qp-id st)      (qpn-id st))
 (define (qp-applied st) (qpn-applied st))
@@ -190,21 +191,39 @@
 (define (qp-snap-need st) (qpn-snap-need st))
 (define (qp-clear-snap-need st) (set-qpn-snap-need! st #f) st)
 
-; ---- exactly-once dedup window ----
+; ---- exactly-once dedup (cw-rz9): per-origin applied-seq tracking ----
+(define (qp-del-num l n)
+  (cond ((null? l) '())
+        ((eqv? (car l) n) (cdr l))
+        (else (cons (car l) (qp-del-num (cdr l) n)))))
 (define (qp-bid-applied? st bid)
-  (hashtable-ref (qpn-bidset st) bid #f))
+  (let ((e (hashtable-ref (qpn-seqs st) (cons (car bid) (cadr bid)) #f))
+        (s (caddr bid)))
+    (if e (or (<= s (car e)) (if (memv s (cdr e)) #t #f)) #f)))
 (define (qp-bid-note! st bid)
-  (let* ((ring (qpn-bidring st)) (i (qpn-bidix st)) (old (vector-ref ring i)))
-    (if old (hashtable-delete! (qpn-bidset st) old))
-    (vector-set! ring i bid)
-    (hashtable-set! (qpn-bidset st) bid #t)
-    (set-qpn-bidix! st (modulo (+ i 1) QP-BIDS-KEEP))))
-(define (qp-bids-reset! st bids)             ; bids = newest-first list
-  (set-qpn-bidset! st (make-hashtable equal-hash equal?))
-  (set-qpn-bidring! st (make-vector QP-BIDS-KEEP #f))
-  (set-qpn-bidix! st 0)
-  (let loop ((l (reverse (qp-take-n bids QP-BIDS-KEEP))))
-    (if (pair? l) (begin (qp-bid-note! st (car l)) (loop (cdr l))))))
+  (let* ((ht (qpn-seqs st)) (k (cons (car bid) (cadr bid)))
+         (e (let ((x (hashtable-ref ht k #f)))
+              (if x x (let ((x (cons 0 '()))) (hashtable-set! ht k x) x))))
+         (s (caddr bid)))
+    (if (and (> s (car e)) (not (memv s (cdr e))))
+        (begin
+          (set-cdr! e (cons s (cdr e)))
+          (let adv ()
+            (let ((nx (+ 1 (car e))))
+              (if (memv nx (cdr e))
+                  (begin (set-car! e nx)
+                         (set-cdr! e (qp-del-num (cdr e) nx))
+                         (adv)))))))))
+; driver persistence bridge: read/install one origin's state
+(define (qp-seq-state st origin boot)        ; -> (F . sparse) or #f
+  (hashtable-ref (qpn-seqs st) (cons origin boot) #f))
+(define (qp-seq-install! st origin boot f sparse)
+  (hashtable-set! (qpn-seqs st) (cons origin boot) (cons f sparse)))
+(define (qp-seqs-reset! st entries)          ; entries = ((origin boot f . sparse) ...)
+  (set-qpn-seqs! st (make-hashtable equal-hash equal?))
+  (for-each (lambda (en)
+              (qp-seq-install! st (car en) (cadr en) (caddr en) (cdddr en)))
+            entries))
 
 ; drop hashtable keys <= floor
 (define (qp-ht-prune! ht floor)
@@ -228,14 +247,15 @@
         st)))
 
 ; adopt a store snapshot at `base` (the driver has already replaced the
-; persistent store contents and passes the matching sm + applied-bid window).
-(define (qp-install-snapshot st base sm bids)
+; persistent store contents and passes the matching sm + per-origin
+; applied-seq entries, each (origin boot f . sparse)).
+(define (qp-install-snapshot st base sm seq-entries)
   (set-qpn-base! st base)
   (set-qpn-applied! st base)
   (set-qpn-sm! st sm)
   (set-qpn-snap-need! st #f)
   (set-qpn-gapt! st 0)
-  (qp-bids-reset! st bids)
+  (qp-seqs-reset! st seq-entries)
   (qp-ht-prune! (qpn-decided st) base)
   (qp-ht-prune! (qpn-rec st) base)
   (qp-ht-prune! (qpn-props st) base)

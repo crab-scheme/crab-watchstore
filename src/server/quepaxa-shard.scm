@@ -919,7 +919,12 @@
              (let collect ((items (list (cons (car m) (cdr m)))) (n 1))
                (let ((nxt (if (< n PROPOSE-BATCH-CAP) (raw-receive 0) '*timeout*)))
                  (cond
-                   ((and (pair? nxt) (not (symbol? (car nxt))))
+                   ; cw-ecu: exclude string-car pairs — ("REV-GRANT" . lo) authority
+                   ; replies have a STRING car, and scooping one here as a fake
+                   ; (conn . cmd) client item would drop the grant and wedge
+                   ; rev-refill-inflight forever. Re-enqueue it to self instead (else
+                   ; branch below) so the dedicated handler in the main cond sees it.
+                   ((and (pair? nxt) (not (symbol? (car nxt))) (not (string? (car nxt))))
                     (collect (cons nxt items) (+ n 1)))
                    (else
                     ; re-enqueue a non-write frame to SELF (mailbox order shifts

@@ -84,10 +84,21 @@
     ;; round_robin (not gRPC's default pick_first): each new RPC advances to the
     ;; next endpoint, so a follower's UNAVAILABLE(not-leader) on one attempt is
     ;; followed by a different endpoint on the next — combined with with-retry's
-    ;; re-issue loop this reliably lands on the leader. (Tuning retryMaxAttempts /
-    ;; waitForReady here was tried and REGRESSED — it fails RPCs before the picker
-    ;; cycles to the leader; jetcd's defaults + with-retry are what work.)
+    ;; re-issue loop this reliably lands on the leader.
     (.loadBalancerPolicy b "round_robin")
+    ;; cw-rz9: DISABLE jetcd's internal gRPC retry (defaults retry UNAVAILABLE
+    ;; for every method, Txn included). Under a node kill, a COMMITTED Txn
+    ;; whose reply died with the connection was silently resent to another
+    ;; endpoint; the resend failed its own guard, surfaced as a clean
+    ;; isSucceeded=false ("definite no-op"), and the append workload re-read +
+    ;; re-appended → Elle duplicate-elements. All retrying now happens in
+    ;; with-retry / with-txn-retry, which classify definite vs indeterminate.
+    ;; (An earlier note here said retryMaxAttempts regressed leader-finding —
+    ;; that predates the clj-level re-issue loops, which advance the
+    ;; round-robin picker themselves.)
+    ;; NB: jetcd maps this to dev.failsafe withMaxRetries(N) — N is the number
+    ;; of RETRIES, not attempts. 0 = single attempt, no silent resend.
+    (.retryMaxAttempts b (int 0))
     (.build b)))
 
 ;; ---- error classification ----
@@ -138,6 +149,33 @@
    exhaustion, the throwable propagates (→ jepsen :info)."
   [f]
   (retry-until retryable? f))
+
+(defn definitely-rejected?
+  "True iff the throwable is a rejection the server sent BEFORE proposing —
+   not-leader / leader-changed — i.e. the op definitely did not apply. A bare
+   UNAVAILABLE (connection severed mid-call, e.g. the node killed after
+   accepting the request) is NOT included: the op may have committed
+   invisibly. cw-rz9: blindly retrying a guarded Txn after an indeterminate
+   failure duplicates the append — the retry's guard fails because of the
+   op's OWN invisible first commit, the workload re-reads and re-appends,
+   and Elle flags duplicate-elements. Mirrors etcd clientv3, which never
+   auto-retries non-idempotent RPCs on indeterminate errors.
+
+   NOTE the server's own vocabulary (grpc-kv respond-put-done!):
+   'not leader'    = tryagain      — rejected before propose, DEFINITE no-op;
+   'leader changed'= indeterminate — the cmd was in flight across a leader
+   change and MAY have applied. Only the former is retry-safe here."
+  [^Throwable t]
+  (boolean
+    (some (fn [^Throwable e]
+            (re-find #"(?i)not leader" (str (.getMessage e))))
+          (causes t))))
+
+(defn with-txn-retry
+  "with-retry for NON-IDEMPOTENT ops: retry only definite pre-propose
+   rejections; anything indeterminate propagates (→ jepsen :info)."
+  [f]
+  (retry-until definitely-rejected? f))
 
 ;; ---- KV ops (the jepsen-op primitives the workloads build on) ----
 
@@ -208,9 +246,11 @@
    guard, Then apply the puts. `guards` is a seq of [key mod-rev]; `puts` a seq of
    [key value-string]. Returns isSucceeded (false ⇒ some guard failed ⇒ a concurrent
    writer moved a key ⇒ definite no-op, retry the optimistic read). One Raft entry.
-   Retries transient UNAVAILABLE (a rejected Txn never applied)."
+   cw-rz9: retries ONLY definite pre-propose rejections (not-leader); an
+   indeterminate UNAVAILABLE propagates (→ jepsen :info) — see
+   definitely-rejected?."
   [^KV kv guards puts]
-  (with-retry
+  (with-txn-retry
     (fn []
       (let [cmps (into-array Cmp
                    (mapv (fn [[k rev]]

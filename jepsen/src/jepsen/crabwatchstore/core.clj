@@ -74,6 +74,11 @@
     :parse-fn #(Long/parseLong %)
     :validate [pos? "must be positive"]]
 
+   [nil "--engine NAME" "Consensus engine: raft (default) | quepaxa (cw-97b validation)"
+    :default  nil
+    :parse-fn keyword
+    :validate [#{:raft :quepaxa} "must be raft or quepaxa"]]
+
    [nil "--rate HZ" "Approx requests/sec/thread"
     :default  50
     :parse-fn #(Double/parseDouble %)

@@ -191,9 +191,14 @@
       (table-insert! 'ws-shard-commit (qk) (qp-commit st))
       (table-insert! 'ws-shard-applied (qk) (qp-applied st)))
 
-    ; drain the bid-keyed write acks: align applied batches to acc positionally
+    ; drain the bid-keyed write acks: align applied batches to acc positionally.
+    ; cw-rz9: the applied list is TAKEN in post! before the fsync (so the bid
+    ; ring persists atomically with the effects) and parked in pending-done;
+    ; acks still only fire here, after the flush.
+    (define pending-done '())
     (define (drain-writes! st0)
-      (let ((r (qp-take-applied st0)))
+      (let ((r (cons pending-done st0)))
+        (set! pending-done '())
         (let ((done (car r)) (st (cdr r)))
           (if (pair? done)
               (let walk ((d done) (results (reverse acc)))
@@ -331,6 +336,20 @@
     (define QP-COMPACT-EVERY 64)
     (define next-compact QP-COMPACT-EVERY)
     (define (post! st old-applied)
+      ; cw-rz9: take the batches this action applied and persist each
+      ; origin's seq state BEFORE the flush below — same WriteBatch + fsync
+      ; as their effects, so a crash can never separate "applied" from "in
+      ; the dedup state". drain-writes! acks them after the flush.
+      (let ((done (car (qp-take-applied st))))
+        (if (pair? done)
+            (let obs ((d done) (seen '()))
+              (if (null? d)
+                  (set! pending-done (append pending-done done))
+                  (let* ((bid (caar d)) (ob (cons (car bid) (cadr bid))))
+                    (if (member ob seen)
+                        (obs (cdr d) seen)
+                        (begin (persist-seq-state! st (car ob) (cdr ob))
+                               (obs (cdr d) (cons ob seen)))))))))
       (if (> (qp-applied st) old-applied)
           (ctx-save-applied! ctx (qp-applied st) 0))
       (if new-coord
@@ -432,13 +451,57 @@
              (nu (+ 1 (if (and v (>= (bytevector-length v) 8)) (bytes->u64 v 0) 0))))
         (persist-boot! nu)
         nu))
+
+    ; cw-rz9: persisted per-origin applied-seq state — exactly-once across
+    ; restarts AND across window overflow. The engine dedups by
+    ; (origin boot) -> (floor . sparse) applied-seq entries (complete: a
+    ; hedged duplicate deciding arbitrarily many slots later is still
+    ; caught — the old 256-bid ring overflowed under kill+partition and an
+    ; empty reload re-applied batches after restart; both showed up as
+    ; Elle duplicate-elements). Each applied batch overwrites its origin's
+    ; one small `_qp_seq_<origin>_<boot>` key IN THE SAME WriteBatch/fsync
+    ; as its effects (post! persists before ctx-flush!); the full set is
+    ; reloaded at boot and after ws-snap install (the keys ride the store
+    ; snapshot, so a rejoiner inherits the SENDER's state — the cc-cri
+    ; lesson). Value: [u64 floor][u64 n][u64 sparse ...].
+    (define QP-SEQ-PREFIX "_qp_seq_")
+    (define (seq-key origin boot)
+      (string->utf8 (string-append QP-SEQ-PREFIX (symbol->string origin)
+                                   "_" (number->string boot))))
+    (define (seq-state->bytes e)                     ; e = (floor . sparse)
+      (let loop ((l (cdr e))
+                 (acc (bytevector-append (u64->bytes (car e))
+                                         (u64->bytes (length (cdr e))))))
+        (if (null? l) acc
+            (loop (cdr l) (bytevector-append acc (u64->bytes (car l)))))))
+    (define (persist-seq-state! st origin boot)
+      (let ((e (qp-seq-state st origin boot)))
+        (if e (kv-put! ctx (seq-key origin boot) (seq-state->bytes e)))))
+    (define (load-seq-window!)                       ; -> ((origin boot f . sparse) ...)
+      (let ((pfx (string->utf8 QP-SEQ-PREFIX)) (plen (string-length QP-SEQ-PREFIX)))
+        (let loop ((kvs (kv-scan ctx pfx)) (out '()))
+          (if (null? kvs) out
+              (let* ((k (utf8->string (caar kvs))) (v (cdar kvs))
+                     ; origin_boot: boot is everything after the LAST "_"
+                     (cut (let find ((i (- (string-length k) 1)))
+                            (if (char=? (string-ref k i) #\_) i (find (- i 1)))))
+                     (origin (string->symbol (substring k plen cut)))
+                     (boot (string->number (substring k (+ cut 1) (string-length k))))
+                     (f (bytes->u64 v 0)) (n (bytes->u64 v 8))
+                     (sparse (let sp ((j 0) (acc '()))
+                               (if (>= j n) (reverse acc)
+                                   (sp (+ j 1)
+                                       (cons (bytes->u64 v (+ 16 (* 8 j))) acc))))))
+                (loop (cdr kvs) (cons (cons origin (cons boot (cons f sparse))) out)))))))
     (let* ((loaded (ctx-load-applied ctx))
            (p (car loaded))
            (st0 (make-qp node-name voters apply-cmd! 0
                          (list (cons 'coord coord) (cons 'hedge hedge-ticks)
                                (cons 'boot boot-epoch)
                                (cons 'seed (+ 1 (qp-index-of node-name voters))))))
-           (st0 (if (> p 0) (qp-install-snapshot st0 p 0 '()) st0)))
+           ; cw-rz9: reload the persisted per-origin dedup state
+           (seqs0 (load-seq-window!))
+           (st0 (if (> p 0) (qp-install-snapshot st0 p 0 seqs0) st0)))
       (publish! st0)
       (let loop ((st st0))
         (let ((m (cond ((pair? watch-backlog)
@@ -739,7 +802,10 @@
                     (kv-wbuf-drain! ctx)
             (watch-notify-apply! pre (mvcc-current-rev ctx))
                     (send watch-fanout (list 'watch-compact))
-                    (let ((st2 (qp-install-snapshot st sbase 0 '())))
+                    ; cw-rz9: the installed rows carry the SENDER's per-origin
+                    ; seq state — adopt it so a pre-snapshot batch can't
+                    ; re-apply here.
+                    (let ((st2 (qp-install-snapshot st sbase 0 (load-seq-window!))))
                       (publish! st2)
                       (loop st2))))
                  (else (loop st)))))

@@ -259,11 +259,13 @@
 ; --engine quepaxa (cw-gl8): run this node's shard groups on the QuePaxa engine
 ; (leaderless, hedged, no election timeouts) instead of raft. Same mailbox
 ; protocol; election-ticks is reinterpreted as the HEDGE tick count and
-; leader-node pins the COORDINATOR. --join / --global-rev stay raft-only.
+; leader-node pins the COORDINATOR. --global-rev supported since cw-6cq
+; (every replica of a writer group leases independently — see
+; quepaxa-shard.scm). --join stays raft-only (dynamic membership is Q11).
 (define engine (arg-after "--engine"
   (let ((e (get-environment-variable "CWS_ENGINE"))) (if e e "raft"))))
-(if (and (string=? engine "quepaxa") (or join? global-rev))
-    (error "--engine quepaxa does not support --join / --global-rev yet (raft-only)"))
+(if (and (string=? engine "quepaxa") join?)
+    (error "--engine quepaxa does not support --join yet (raft-only)"))
 (define shard-body
   (if (string=? engine "quepaxa")
       "(include \"src/server/quepaxa-shard.scm\")"

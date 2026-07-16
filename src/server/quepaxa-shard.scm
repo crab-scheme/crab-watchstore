@@ -19,7 +19,16 @@
 ;
 ; Deliberately NOT supported on quepaxa groups (raft-only for now):
 ;   dynamic membership (Q11/cw-2w6), MoveLeader (static coordinator; Q10),
-;   global-rev multi-group allocation, parallel apply workers.
+;   parallel apply workers.
+; cw-6cq: --global-rev IS supported. Unlike raft (one leader draws the lease),
+; EVERY replica of a writer group keeps its own rev-lease and rewrites PUT ->
+; PUT-AT at the ORIGIN inside propose-client!, before consensus — so a hedge
+; retry re-proposes the already-rewritten value (cw-rz9 dedup applies it once,
+; never a second draw). See src/rev-allocator.scm / rev-lease-consumer.scm
+; (pure, engine-agnostic, reused unchanged) and shard-actor.scm's gr-* helpers
+; (same names here, ported almost verbatim; the only behavioral difference is
+; WHERE the rewrite happens and that rev-progress keys on group+node, since
+; more than one replica per group can hold an active lease).
 ; Lease grant/keepalive/ttl stay COORDINATOR-gated (one deadline owner), same
 ; redirect shape ('lease-not-leader . coord) the gRPC layer already handles.
 ; ponytail: durable mode fsyncs per transition batch (no cross-transition
@@ -32,6 +41,7 @@
 (include "src/auth.scm")
 (include "src/watch.scm")
 (include "src/quepaxa.scm")
+(include "src/rev-lease-consumer.scm")  ; cw-6cq: writer-side revision lease + PUT->PUT-AT rewrite (global-rev mode)
 
 (define (qp-index-of x lst)
   (let loop ((i 0) (l lst))
@@ -45,6 +55,10 @@
                           (cadr rest) 3))
          (leader-node (if (and (>= (length rest) 7) (symbol? (list-ref rest 6)))
                           (list-ref rest 6) #f))
+         ; cw-6cq: same positional slot as shard-actor.scm's global-rev? (rest[7]).
+         (global-rev? (if (>= (length rest) 8) (and (list-ref rest 7) #t) #f))
+         (rev-authority? (and global-rev? (string=? shard-key "0")))
+         (gr-writer? (and global-rev? (not rev-authority?)))
          ; coordinator: the pinned node if it's a member, else rotated by shard
          ; index so groups spread their fast-path load (mirrors raft's stagger).
          (coord (if (and leader-node (memv leader-node voters))
@@ -80,6 +94,54 @@
                         'watch-fanout-main handle "default" sync?))
          (lease-deadlines (make-eqv-hashtable))
          (lease-revoking (make-eqv-hashtable)))
+
+    ; ---- cw-6cq global-rev: writer-side revision lease, ported from
+    ; shard-actor.scm (see rev-lease-consumer.scm/rev-allocator.scm for the
+    ; pure logic). Unlike raft, EVERY replica of a writer group carries its
+    ; own lease (no single leader), so rev-progress is keyed per (group.node)
+    ; instead of per group.
+    (define REV-BLOCK 256)
+    (define REV-LOW   32)
+    (define rev-lease (lease-new))
+    (define rev-refill-inflight #f)
+    (define rev-progress (make-eqv-hashtable))   ; authority-only: writer-key -> lowest-unapplied|#f
+    (define (gr-writer-key) (string->symbol (string-append shard-key ":" (symbol->string node-name))))
+    (define (gr-authority-pid)
+      (and gr-writer? (table-lookup 'ws-shard-pid (string-append (symbol->string node-name) ":0"))))
+    (define (gr-maybe-refill!)
+      (if (and gr-writer? (not rev-refill-inflight) (lease-needs-refill? rev-lease REV-LOW))
+          (let ((ap (gr-authority-pid)))
+            (if ap
+                (begin (set! rev-refill-inflight REV-BLOCK)
+                       (send ap (cons (self) (list (string->utf8 "REV-GRANT")
+                                                   (string->utf8 (number->string REV-BLOCK))))))))))
+    (define (gr-count-puts cmds)
+      (let loop ((cs cmds) (n 0))
+        (if (null? cs) n
+            (loop (cdr cs) (if (and (pair? (car cs)) (string=? (utf8->string (caar cs)) "PUT"))
+                               (+ n 1) n)))))
+    (define (gr-rewrite-batch! cmds)
+      (map (lambda (c) (let ((r (global-rev-rewrite c rev-lease)))
+                         (set! rev-lease (cdr r)) (car r)))
+           cmds))
+    (define (auth-rewrite-batch cmds)
+      (map (lambda (c)
+             (if (and (pair? c) (string=? (utf8->string (car c)) "PUT"))
+                 (cons (string->utf8 "PUT-GLOBAL") (cdr c))
+                 c))
+           cmds))
+    (define (gr-report-progress!)
+      (if gr-writer?
+          (let ((ap (gr-authority-pid)))
+            (if ap
+                (let ((active? (or (> (lease-remaining rev-lease) 0) (pair? pending-bids))))
+                  (send ap (list 'rev-progress (gr-writer-key)
+                                 (if active? (+ (mvcc-current-rev ctx) 1) #f))))))))
+    (define (gr-watermark-now)
+      (let wmark ((ks (vector->list (hashtable-keys rev-progress))) (w (mvcc-global-rev ctx)))
+        (if (null? ks) w
+            (let ((lu (hashtable-ref rev-progress (car ks) #f)))
+              (wmark (cdr ks) (if lu (min w (- lu 1)) w))))))
 
     (define acc '())                         ; apply results, newest-first
     (define pending-bids '())                ; ((bid . (conn ...)) ...)
@@ -424,21 +486,36 @@
     ; propose a client batch: register waiters under the NEXT bid the engine
     ; will assign ((id . seq+1)) — qp-propose-batch allocates exactly one.
     (define (propose-client! st items)          ; items: ((conn . cmd) ...)
-      (let ((bid (qp-next-bid st)))
-        (set! pending-bids (cons (cons bid (map car items)) pending-bids))
-        (if prof?
-            (let ((tsub (let scan ((l items) (best #f))
-                          (if (null? l) best
-                              (let ((c (caar l)))
-                                (scan (cdr l)
-                                      (if (and (pair? c) (eq? (car c) 'async)
-                                               (>= (length c) 4)
-                                               (or (not best) (< (cadddr c) best)))
-                                          (cadddr c) best)))))))
-              (set! prof-pending
-                    (cons (list bid (current-second) tsub (length items)) prof-pending))))
-        (set! engine-what "propose")
-        (engine! st (lambda (s) (qp-propose-batch s (map cdr items))))))
+      (let* ((raw-cmds (map cdr items))
+             (need (if gr-writer? (gr-count-puts raw-cmds) 0)))
+        ; cw-6cq: bounce (never block) when this batch needs more global revs
+        ; than the local lease currently holds — mirrors shard-actor.scm's
+        ; liveness fix. The client retries once the async refill lands.
+        (if (and gr-writer? (> need 0) (< (lease-remaining rev-lease) need))
+            (begin
+              (gr-maybe-refill!)
+              (for-each (lambda (it) (ack-waiter! (car it) 'tryagain)) items)
+              st)
+            (let* ((bid (qp-next-bid st))
+                   (cmds (cond (gr-writer? (gr-rewrite-batch! raw-cmds))
+                               (rev-authority? (auth-rewrite-batch raw-cmds))
+                               (else raw-cmds))))
+              (set! pending-bids (cons (cons bid (map car items)) pending-bids))
+              (if prof?
+                  (let ((tsub (let scan ((l items) (best #f))
+                                (if (null? l) best
+                                    (let ((c (caar l)))
+                                      (scan (cdr l)
+                                            (if (and (pair? c) (eq? (car c) 'async)
+                                                     (>= (length c) 4)
+                                                     (or (not best) (< (cadddr c) best)))
+                                                (cadddr c) best)))))))
+                    (set! prof-pending
+                          (cons (list bid (current-second) tsub (length items)) prof-pending))))
+              (set! engine-what "propose")
+              (let ((st2 (engine! st (lambda (s) (qp-propose-batch s cmds)))))
+                (gr-maybe-refill!)
+                st2)))))
 
     ; boot epoch: persisted, strictly increasing per restart (bids embed it so
     ; a restart's fresh seq can never collide with pre-crash bids).
@@ -559,6 +636,8 @@
              ; apply only flips the gate; see mvcc-compact-gc-step!). Flushed by
              ; the engine!'s post! below (ctx goes dirty) before any ack.
              (mvcc-compact-gc-step! ctx)
+             (gr-report-progress!)             ; cw-6cq: no-op unless gr-writer?
+             (gr-maybe-refill!)                ; keep the lease warm
              (set! engine-what "tick")
              (let* ((st (engine! st qp-tick))
                     ; cw-2au scale cliff: lease-tick!'s mvcc-all-lease-ids is a FULL
@@ -743,6 +822,27 @@
                (send reply-pid (list 'lease-leases-ok (mvcc-all-lease-ids ctx)))
                (loop st)))
 
+            ;; ---- cw-6cq global-rev: refill reply from the rev-authority. Rides the
+            ;; standard client-proposal ack path as ("REV-GRANT" . lo) — a STRING car,
+            ;; so this MUST be matched before the generic client-cmd fallthrough below.
+            ((and global-rev? (pair? m) (string? (car m)) (string=? (car m) "REV-GRANT"))
+             (if rev-refill-inflight
+                 (begin (set! rev-lease (lease-add rev-lease (cdr m) rev-refill-inflight))
+                        (set! rev-refill-inflight #f)))
+             (loop st))
+            ((eq? (car m) 'global-high)
+             (send (cadr m) (list 'global-high-ok (mvcc-global-rev ctx)))
+             (loop st))
+            ((eq? (car m) 'rev-progress)
+             (if rev-authority? (hashtable-set! rev-progress (cadr m) (caddr m)))
+             (loop st))
+            ((eq? (car m) 'global-watermark)
+             (send (cadr m) (list 'global-watermark-ok (gr-watermark-now)))
+             (loop st))
+            ((eq? (car m) 'compact-admissible)
+             (send (caddr m) (list 'compact-admissible-ok (<= (cadr m) (gr-watermark-now))))
+             (loop st))
+
             ;; ---- unsupported on quepaxa groups (raft-only features) ----
             ((memq (car m) '(member-add member-remove member-promote))
              (send (cadr m) 'member-pending)     ; refused; Q11 (cw-2w6)
@@ -787,6 +887,10 @@
                   (let ((sbase (car snap-accum)) (rows (cadr snap-accum))
                         (pre (mvcc-current-rev ctx)))
                     (set! snap-accum #f)
+                    ; cw-6cq: a snapshot install may supersede revs this replica's
+                    ; own lease had not yet drawn on — drop it; gr-maybe-refill!
+                    ; draws a fresh block on the next write/tick.
+                    (if gr-writer? (begin (set! rev-lease (lease-new)) (set! rev-refill-inflight #f)))
                     (for-each (lambda (kv) (kv-del! ctx (car kv)))
                               (kv-scan ctx (make-bytevector 0)))
                     (for-each (lambda (kv) (kv-put! ctx (car kv) (cdr kv))) rows)

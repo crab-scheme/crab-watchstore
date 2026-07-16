@@ -102,17 +102,33 @@
     ; instead of per group.
     (define REV-BLOCK 256)
     (define REV-LOW   32)
+    ; cw-ecu follow-up: an outstanding REV-GRANT request has no deadline — if the
+    ; reply is lost (peer restart) or simply delayed behind a saturated authority
+    ; mailbox under real concurrent load, rev-refill-inflight stays set FOREVER
+    ; (gr-maybe-refill! refuses to re-request while it's set) and every write on
+    ; this writer group bounces 'tryagain permanently, not transiently. Observed
+    ; live: a 34s wedge under a 64-conn benchmark. REV-REFILL-STALE-TICKS bounds
+    ; the wedge to a few seconds; a duplicate/late reply for an abandoned request
+    ; is a no-op window (the flag it would clear no longer matches) and any
+    ; revisions it granted are simply never drawn — a harmless gap, same as the
+    ; snapshot-install lease reset already tolerates (rev-allocator.scm's
+    ; watermark design does not assume every granted rev is eventually applied).
+    (define REV-REFILL-STALE-TICKS 8)      ; ~2s at the default 250ms tick
     (define rev-lease (lease-new))
     (define rev-refill-inflight #f)
+    (define rev-refill-since #f)           ; tick the outstanding request was sent
     (define rev-progress (make-eqv-hashtable))   ; authority-only: writer-key -> lowest-unapplied|#f
     (define (gr-writer-key) (string->symbol (string-append shard-key ":" (symbol->string node-name))))
     (define (gr-authority-pid)
       (and gr-writer? (table-lookup 'ws-shard-pid (string-append (symbol->string node-name) ":0"))))
     (define (gr-maybe-refill!)
-      (if (and gr-writer? (not rev-refill-inflight) (lease-needs-refill? rev-lease REV-LOW))
+      (if (and gr-writer? (lease-needs-refill? rev-lease REV-LOW)
+               (or (not rev-refill-inflight)
+                   (>= (- ticks rev-refill-since) REV-REFILL-STALE-TICKS)))
           (let ((ap (gr-authority-pid)))
             (if ap
                 (begin (set! rev-refill-inflight REV-BLOCK)
+                       (set! rev-refill-since ticks)
                        (send ap (cons (self) (list (string->utf8 "REV-GRANT")
                                                    (string->utf8 (number->string REV-BLOCK))))))))))
     (define (gr-count-puts cmds)

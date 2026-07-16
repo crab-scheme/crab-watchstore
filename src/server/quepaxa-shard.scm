@@ -31,8 +31,9 @@
 ; more than one replica per group can hold an active lease).
 ; Lease grant/keepalive/ttl stay COORDINATOR-gated (one deadline owner), same
 ; redirect shape ('lease-not-leader . coord) the gRPC layer already handles.
-; ponytail: durable mode fsyncs per transition batch (no cross-transition
-; group-commit deferral yet); add the flush-base machinery if w/s needs it.
+; cw-mtc: durable mode group-commits the fsync across a burst of consecutive
+; peer decide-round messages (engine-burst!/flush-and-drain!) instead of
+; fsyncing every decided slot individually — see post!'s comment.
 
 (include "src/safe-send.scm")  ; cw-2au: send-to-dead-pid is a no-op
 (include "src/encoding.scm")
@@ -413,11 +414,26 @@
         (if e (or (string->number e) 512) 512)))
     (define QP-COMPACT-EVERY 64)
     (define next-compact QP-COMPACT-EVERY)
-    (define (post! st old-applied)
+    ; cw-mtc (perf follow-up to cw-6cq): under real concurrent load, per-slot
+    ; consensus+apply cost was flat at ~35-40ms across every replica of every
+    ; group, and PROF showed fsync (flush=) was only ~3ms of it — the other
+    ; ~32ms was queueing: EVERY decided slot fsync'd (ctx-flush!) individually,
+    ; serially, on this one mailbox thread, before the next could even start
+    ; (~85% of each replica's time budget on fsync alone at measured rates).
+    ; post! now takes `flush?`: when #f, it does the ALWAYS-safe bookkeeping
+    ; (cw-rz9 seq-state persist into the SAME pending WriteBatch, applied-index
+    ; bookkeeping, coordinator-transfer adoption) but defers the fsync + every
+    ; step gated on "durable now" (compaction, acks, stash flush, reads,
+    ; snap-pull, publish) to a later flush-and-drain! call. `pending-done` and
+    ; `acc` already accumulate correctly across multiple deferred post! calls
+    ; (qpn is a mutable record; qp-take-applied drains qpn-adone! in place) —
+    ; drain-writes!'s existing positional alignment of pending-done to acc is
+    ; unaffected by how many post! calls contributed to either list.
+    (define (post! st old-applied flush?)
       ; cw-rz9: take the batches this action applied and persist each
-      ; origin's seq state BEFORE the flush below — same WriteBatch + fsync
-      ; as their effects, so a crash can never separate "applied" from "in
-      ; the dedup state". drain-writes! acks them after the flush.
+      ; origin's seq state BEFORE any flush — same WriteBatch as their
+      ; effects, so a crash can never separate "applied" from "in the dedup
+      ; state". drain-writes! (inside flush-and-drain!) acks them after.
       (let ((done (car (qp-take-applied st))))
         (if (pair? done)
             (let obs ((d done) (seen '()))
@@ -428,10 +444,25 @@
                         (obs (cdr d) seen)
                         (begin (persist-seq-state! st (car ob) (cdr ob))
                                (obs (cdr d) (cons ob seen)))))))))
+      ; cw-mtc fable review: persist-seq-state!'s kv-put! only lands in the
+      ; wbuf, not RocksDB, until the next kv-wbuf-drain!/ctx-flush! — but
+      ; ctx-save-applied! writes the applied-index marker with a DIRECT
+      ; store-put, bypassing wbuf. Drain the seq-state write into RocksDB's
+      ; WAL now so it strictly precedes the marker there too (both still
+      ; ride the SAME eventual ctx-flush!/fsync — this only fixes relative
+      ; WAL order, not durability timing): a crash can never recover
+      ; "applied past N" without N's dedup state already in the WAL.
+      (kv-wbuf-drain! ctx)
       (if (> (qp-applied st) old-applied)
           (ctx-save-applied! ctx (qp-applied st) 0))
       (if new-coord
           (begin (set! st (qp-set-coord st new-coord)) (set! new-coord #f)))
+      (if flush? (flush-and-drain! st) st))
+
+    ; the tail of the old single-shot post!: fsync (if dirty), compaction,
+    ; ack drain, stash flush, read drain, snap-pull, publish. Called once per
+    ; group-committed burst instead of once per decided slot.
+    (define (flush-and-drain! st)
       (if (ctx-dirty? ctx)
           (let ((t0 (current-second)))
             (ctx-flush! ctx)                     ; durable BEFORE any ack
@@ -453,7 +484,9 @@
         (publish! st)
         st))
 
-    ; run one engine action: (st -> (st' . outs)), then post!
+    ; run one engine action: (st -> (st' . outs)), then post! + flush now.
+    ; Unchanged behavior/call shape for every EXISTING call site (propose,
+    ; tick, lease-tick!, pfwd-multi, move-leader) — one action, one flush.
     (define engine-what "?")                 ; cw-vku: label for slow! spans
     (define (engine! st action)
       (let* ((t0 (current-second))
@@ -463,9 +496,41 @@
         (slow! (string-append engine-what "-act") (prof-ms t1 t0) t0)
         (emit! (cdr r))
         (slow! "emit" (prof-ms (current-second) t1) t1)
-        (let ((st2 (post! (car r) old)))
+        (let ((st2 (post! (car r) old #t)))
           (slow! engine-what (prof-ms (current-second) t0) t0)
           st2)))
+
+    ; cw-mtc: group-commit a BURST of consecutive peer 'engine messages
+    ; (espr/decd/gap-fill — the decide-round traffic that dominates under
+    ; real concurrency). Apply each with the fsync deferred, then flush+ack
+    ; ONCE for the whole burst. Bounded by GROUP-COMMIT-CAP so a non-stop
+    ; peer-message stream still bounds ack/tick/read latency. Explicitly
+    ; excludes snap-pull (its own reply path) and a coordinator's pfwd (which
+    ; has its own N-pfwd -> one-slot coalescing above and a different action
+    ; shape) — only plain qp-step peer replies burst here.
+    (define GROUP-COMMIT-CAP 32)
+    (define (engine-burst! st0 from0 rpc0)
+      (let loop ((st st0) (from from0) (rpc rpc0) (n 1))
+        (let* ((t0 (current-second))
+               (old (qp-applied st))
+               (r (qp-step st from rpc))
+               (t1 (current-second)))
+          (slow! (string-append engine-what "-act") (prof-ms t1 t0) t0)
+          (emit! (cdr r))
+          (let ((st1 (post! (car r) old #f)))     ; deferred — no flush yet
+            (if (< n GROUP-COMMIT-CAP)
+                (let ((nxt (raw-receive 0)))
+                  (cond
+                    ((and (pair? nxt) (eq? (car nxt) 'engine)
+                          (pair? (caddr nxt))
+                          (not (eq? (car (caddr nxt)) 'snap-pull))
+                          (not (and (eq? (car (caddr nxt)) 'pfwd) (qp-coord? st1))))
+                     (set! engine-what (string-append "peer-" (symbol->string (car (caddr nxt)))))
+                     (loop st1 (cadr nxt) (caddr nxt) (+ n 1)))
+                    (else
+                     (if (not (eq? nxt '*timeout*)) (send (self) nxt))
+                     (flush-and-drain! st1))))
+                (flush-and-drain! st1))))))
 
     ; ---- coordinator lease expiry (same ADR 0003 §2 flow, coordinator-owned) ----
     (define (lease-tick! st)
@@ -638,7 +703,7 @@
                                        (qp-start-slot s (cons 'multi (reverse vals))))))))))))
                  (else
                   (set! engine-what (string-append "peer-" (symbol->string (car rpc))))
-                  (loop (engine! st (lambda (s) (qp-step s from rpc))))))))
+                  (loop (engine-burst! st from rpc))))))
 
             ;; ---- tick: hedge/retransmit/gap-fill + lease expiry + progress ----
             ((eq? (car m) 'tick)

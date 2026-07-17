@@ -218,6 +218,18 @@
 ; --shards (apply-worker count WITHIN a group).
 (define shard-groups
   (let ((n (string->number (arg-after "--shard-groups" "1")))) (if (and n (> n 0)) n 1)))
+; cw-ivt fix #2: shard-groups > node-count oversubscribes the scheduler with
+; dedicated OS threads (shard+poller+2 range-workers+watch-fanout per group)
+; past the per-shard-pollers.md-measured collapse point — at 8 groups on a
+; 5-node/8-vCPU fleet this produced a genuine consensus livelock (REV-GRANT
+; refill can never win a decide round under sustained oversubscription), not
+; just a perf cliff. Warn loudly rather than silently limping.
+(if (> shard-groups (length nodes))
+    (begin
+      (display (string-append "WARN --shard-groups " (number->string shard-groups)
+                              " exceeds node count " (number->string (length nodes))
+                              " — risk of consensus livelock under sustained load (cw-ivt)"))
+      (newline)))
 (define shard-key-list
   (let loop ((i 0) (acc '())) (if (= i shard-groups) (reverse acc)
                                   (loop (+ i 1) (cons (number->string i) acc)))))
@@ -259,11 +271,13 @@
 ; --engine quepaxa (cw-gl8): run this node's shard groups on the QuePaxa engine
 ; (leaderless, hedged, no election timeouts) instead of raft. Same mailbox
 ; protocol; election-ticks is reinterpreted as the HEDGE tick count and
-; leader-node pins the COORDINATOR. --join / --global-rev stay raft-only.
+; leader-node pins the COORDINATOR. --global-rev supported since cw-6cq
+; (every replica of a writer group leases independently — see
+; quepaxa-shard.scm). --join stays raft-only (dynamic membership is Q11).
 (define engine (arg-after "--engine"
   (let ((e (get-environment-variable "CWS_ENGINE"))) (if e e "raft"))))
-(if (and (string=? engine "quepaxa") (or join? global-rev))
-    (error "--engine quepaxa does not support --join / --global-rev yet (raft-only)"))
+(if (and (string=? engine "quepaxa") join?)
+    (error "--engine quepaxa does not support --join yet (raft-only)"))
 (define shard-body
   (if (string=? engine "quepaxa")
       "(include \"src/server/quepaxa-shard.scm\")"

@@ -66,36 +66,73 @@
   (let ((ctx (make-ctx handle cf sync?))
         (reg (make-watch-registry)))
     (define (invalidate!) (set-shard-ctx-crev! ctx -1))
-    (let loop ()
-      (let ((m (raw-receive)))
-        (guard (e (#t #f))     ; a registry op must never crash this worker (cw-04k)
-          (if (pair? m)
-              (cond
-                ((eq? (car m) 'watch-apply)
-                 (let ((pre (cadr m)) (post (caddr m)))
-                   (set-shard-ctx-crev! ctx post)   ; authoritative — already durable
-                   (watch-on-apply! reg ctx pre post)
-                   (send (cadddr m) (list 'watch-apply-ack))))
-                ((eq? (car m) 'watch-compact)
-                 (invalidate!)
-                 (watch-check-compaction! reg ctx))
-                ((eq? (car m) 'watch-progress)
-                 (invalidate!)
-                 (watch-progress-all! reg ctx))
-                ((eq? (car m) 'watch-register)
-                 (let ((reply-pid (cadr m)) (spec (caddr m)))
-                   (invalidate!)
-                   (let* ((deliver-fn
-                           (lambda (wr)
-                             (guard (e (#t #f))
-                               (send reply-pid (list 'watch-response (watch-response->sexp wr))))))
-                          (res (watch-register! reg ctx spec deliver-fn)))
-                     (if (and (pair? res) (eq? (car res) 'compacted))
-                         (send reply-pid (cons 'watch-compacted (cdr res)))
-                         (send reply-pid (list 'watch-created res (mvcc-current-rev ctx)))))))
-                ((eq? (car m) 'watch-cancel)
-                 (let ((reply-pid (cadr m)) (wid (caddr m)))
-                   (let ((ok (watch-cancel! reg wid)))
-                     (send reply-pid (cons 'watch-canceled (if ok wid #f))))))
-                (else #f))))
-        (loop)))))
+    ; cw-6cq perf follow-up: under real write load the shard sends one 'watch-apply
+    ; per applied command (a 1-revision window each), and each was handled with its
+    ; own REV-CF scan + candidate walk — per-message fixed overhead dominates at
+    ; ~30ms/message, clamping the SHARD's throughput to this worker's message rate
+    ; (watch-drain-one-ack! blocks the shard mailbox once WATCH-FANOUT-MAX-INFLIGHT
+    ; is outstanding). Since the shard is this worker's ONLY sender, consecutive
+    ; 'watch-apply messages are CONTIGUOUS windows ((pre1,post1] (post1,post2] ...);
+    ; merge every one already sitting in the mailbox into ONE (pre1,postk] scan and
+    ; ack each merged message individually so the shard's inflight counter stays
+    ; exact. Delivery semantics are unchanged — watch-on-apply! already handles
+    ; multi-revision windows (that's what a TXN produces today). A non-watch-apply
+    ; message interrupting the scoop is CARRIED into the next loop iteration rather
+    ; than re-enqueued to self, preserving the single-sender FIFO order the
+    ; synced-watcher registration guarantee (see file header) depends on.
+    (let loop ((carried #f))
+      (let* ((m (if carried carried (raw-receive)))
+             ; a registry op must never crash this worker (cw-04k). The guard's body
+             ; only computes side effects + the next CARRIED message (or #f) — the
+             ; tail call to `loop` stays OUTSIDE guard's dynamic extent (below), same
+             ; as the original single-message-per-iteration shape, so an unbounded
+             ; run never grows the guard-nesting depth.
+             (next
+              (guard (e (#t #f))
+                (if (pair? m)
+                    (cond
+                      ((eq? (car m) 'watch-apply)
+                       (let collect ((pre (cadr m)) (post (caddr m)) (acks (list (cadddr m))))
+                         (let ((n (raw-receive 0)))
+                           (if (and (pair? n) (eq? (car n) 'watch-apply))
+                               (collect pre (caddr n) (cons (cadddr n) acks))
+                               (begin
+                                 (set-shard-ctx-crev! ctx post)   ; authoritative — already durable
+                                 ; narrower guard than the outer one: if watch-on-apply!
+                                 ; itself throws (cw-04k), the epilogue below still runs —
+                                 ; every merged message gets acked and the carried message
+                                 ; `n` is still returned, so a batch-epilogue exception can
+                                 ; never lose more than the original single-message failure
+                                 ; mode (one skipped delivery), and never drops `n` (which
+                                 ; would otherwise hang whatever client sent it forever).
+                                 (guard (e (#t #f)) (watch-on-apply! reg ctx pre post))
+                                 (for-each (lambda (p) (send p (list 'watch-apply-ack))) acks)
+                                 (if (eq? n '*timeout*) #f n))))))
+                      ((eq? (car m) 'watch-compact)
+                       (invalidate!)
+                       (watch-check-compaction! reg ctx)
+                       #f)
+                      ((eq? (car m) 'watch-progress)
+                       (invalidate!)
+                       (watch-progress-all! reg ctx)
+                       #f)
+                      ((eq? (car m) 'watch-register)
+                       (let ((reply-pid (cadr m)) (spec (caddr m)))
+                         (invalidate!)
+                         (let* ((deliver-fn
+                                 (lambda (wr)
+                                   (guard (e (#t #f))
+                                     (send reply-pid (list 'watch-response (watch-response->sexp wr))))))
+                                (res (watch-register! reg ctx spec deliver-fn)))
+                           (if (and (pair? res) (eq? (car res) 'compacted))
+                               (send reply-pid (cons 'watch-compacted (cdr res)))
+                               (send reply-pid (list 'watch-created res (mvcc-current-rev ctx))))))
+                       #f)
+                      ((eq? (car m) 'watch-cancel)
+                       (let ((reply-pid (cadr m)) (wid (caddr m)))
+                         (let ((ok (watch-cancel! reg wid)))
+                           (send reply-pid (cons 'watch-canceled (if ok wid #f)))))
+                       #f)
+                      (else #f))
+                    #f))))
+        (loop next)))))

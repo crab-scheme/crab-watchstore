@@ -115,9 +115,17 @@
     ; snapshot-install lease reset already tolerates (rev-allocator.scm's
     ; watermark design does not assume every granted rev is eventually applied).
     (define REV-REFILL-STALE-TICKS 8)      ; ~2s at the default 250ms tick
+    ; cw-ivt fix #1: a stale refill retrying forever is invisible to an operator
+    ; (the shard-groups=8 livelock looked like a silent 16min hang, not an
+    ; error). After this many consecutive stale cycles (~1 minute), log ONE
+    ; loud ALARM line per threshold crossing — cheap, and turns "revision
+    ; frozen, nobody knows why" into a grep-able signal without changing the
+    ; retry semantics (still not a permanent block, per the header note above).
+    (define REV-REFILL-ALARM-CYCLES 30)
     (define rev-lease (lease-new))
     (define rev-refill-inflight #f)
     (define rev-refill-since #f)           ; tick the outstanding request was sent
+    (define rev-refill-stale-count 0)      ; consecutive stale-retry cycles, for the alarm
     (define rev-progress (make-eqv-hashtable))   ; authority-only: writer-key -> lowest-unapplied|#f
     (define (gr-writer-key) (string->symbol (string-append shard-key ":" (symbol->string node-name))))
     (define (gr-authority-pid)
@@ -128,10 +136,22 @@
                    (>= (- ticks rev-refill-since) REV-REFILL-STALE-TICKS)))
           (let ((ap (gr-authority-pid)))
             (if ap
-                (begin (set! rev-refill-inflight REV-BLOCK)
-                       (set! rev-refill-since ticks)
-                       (send ap (cons (self) (list (string->utf8 "REV-GRANT")
-                                                   (string->utf8 (number->string REV-BLOCK))))))))))
+                (begin
+                  (if rev-refill-inflight
+                      (begin
+                        (set! rev-refill-stale-count (+ rev-refill-stale-count 1))
+                        (if (= 0 (modulo rev-refill-stale-count REV-REFILL-ALARM-CYCLES))
+                            (begin
+                              (display (string-append "ALARM " (qk) " REV-GRANT stuck: "
+                                                      (number->string rev-refill-stale-count)
+                                                      " stale refill cycles, authority may be "
+                                                      "overloaded (cw-ivt)"))
+                              (newline))))
+                      (set! rev-refill-stale-count 0))
+                  (set! rev-refill-inflight REV-BLOCK)
+                  (set! rev-refill-since ticks)
+                  (send ap (cons (self) (list (string->utf8 "REV-GRANT")
+                                              (string->utf8 (number->string REV-BLOCK))))))))))
     (define (gr-count-puts cmds)
       (let loop ((cs cmds) (n 0))
         (if (null? cs) n
@@ -909,7 +929,8 @@
             ((and global-rev? (pair? m) (string? (car m)) (string=? (car m) "REV-GRANT"))
              (if rev-refill-inflight
                  (begin (set! rev-lease (lease-add rev-lease (cdr m) rev-refill-inflight))
-                        (set! rev-refill-inflight #f)))
+                        (set! rev-refill-inflight #f)
+                        (set! rev-refill-stale-count 0)))
              (loop st))
             ((eq? (car m) 'global-high)
              (send (cadr m) (list 'global-high-ok (mvcc-global-rev ctx)))

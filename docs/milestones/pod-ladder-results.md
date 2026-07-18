@@ -231,3 +231,86 @@ mitigation is no longer needed at 10k.
 Known simulator caveat: a k3s restart during kwok status patches left ladder5k pods
 Running but Ready=False (kwok doesn't resync); phase-based counts used throughout.
 Open tail: cw-5qk (stale reads at burst), cw-98k (fanout ack leak), cw-p99 (test flake).
+
+## RETRACTED entry (cw-b5e, 2026-07-18) — wrong cluster, do not cite
+
+An earlier version of this section claimed a "shard-groups=1, ~39-40k pod ceiling"
+finding from `CWS_PROF` tracing on the `deploy/aws-apiserver-smoke` terraform fleet
+(n1-n5, `18.219.175.139` etc.). **That finding is invalid**: the apiserver actually
+running the pod ladder had `--datastore-endpoint` pointed at a different, pre-existing,
+untracked 5-node fleet (`cws-xl`, x1-x5, `13.58.169.188` etc., 5x c7g.2xlarge,
+single-region us-east-2, launched 2026-07-16, already running `--shard-groups 6
+--global-rev yes --grpc-workers 128`). The terraform fleet was idle the whole time
+except for one manual `etcdctl put` smoke key. The 39,300-pod convergence result and the
+`CWS_PROF` batch/latency numbers above were measured against the idle terraform fleet,
+not the fleet actually serving traffic — the write-up conflated the two. See the
+follow-up entry below for the corrected run against the real serving cluster.
+
+## Rung 62.6k (cw-66v, 2026-07-18) — corrected run, real cws-xl cluster, shard-groups=6
+
+Real cluster: `cws-xl` (x1-x5, `13.58.169.188`/`18.221.62.188`/`18.216.21.54`/
+`18.223.188.219`/`3.143.18.247`), 5x c7g.2xlarge (8 vCPU/16GB each), single-region
+us-east-2, pre-existing/untracked infra, `--shard-groups 6 --global-rev yes
+--grpc-workers 128 --engine quepaxa`. This is the cluster the apiserver's
+`--datastore-endpoint` actually points at (see retraction above).
+
+**50,000 rung: converged cleanly.** 50,000/50,000 Running, readyz ok, zero `ALARM`
+lines (relevant given 6 shard-groups > 5 nodes is the cw-ivt oversubscription scenario —
+did not reproduce here, likely because these are 8-vCPU boxes vs the smaller fleet where
+cw-ivt was found). Store CPU ~48-50%, RAM ~37%, evenly spread across all 5 nodes (6
+shards balanced onto 5 nodes, some nodes host 2 shard leaders). `CWS_PROF` sample at this
+point: consensus RTT avg 48ms, p50 20ms, p90 131ms, p99 260ms, max 1014ms — healthy,
+parallelized across 5-6 independent shard leaders (vs. one in the retracted single-shard
+measurement).
+
+**100,000 rung: stalled at ~62,600, degrading.** Convergence slowed sharply past ~60k
+(dropped from ~1000s/min to ~70/min), a full pod LIST took 40-44s, and apiserver readyz
+intermittently flipped to `etcd failed`/`etcd-readiness failed` (recovered each time
+within ~30s — transient, not a hard crash). Store CPU held at 170-190% (of 800% budget
+on 8 vCPU); RAM ~35%. A fresh `CWS_PROF` sample at this stage showed real degradation:
+consensus RTT avg 529ms (**11x worse than the 50k sample**), p50 163ms, p90 1537ms, p99
+3598ms, max 8268ms, plus thousands of `SLOW peer-decd-act=` lines per node (105-549ms
+individual peer-decode+apply hops inside the shard mailbox — did not exist at all in the
+50k sample). Batch size still ~93% n=1 (unbatched) at both rungs, so batching isn't the
+differentiator between healthy and degraded.
+
+**Root cause: NOT ESTABLISHED, treat as an open hypothesis, not a finding.** The write-up
+originally attributed this to "per-op decode/apply cost growing with keyspace size"
+(`multiregion-test-plan.md` G1/G2), but that attribution was never actually distinguished
+from two live alternatives, per external review (fable, 2026-07-18):
+- **Single-shard-thread saturation.** 170-190% CPU across 6 shard-groups on 5 nodes is
+  consistent with 1-2 *fully pinned single-threaded* shard actors (each shard actor is
+  single-threaded per the architecture documented throughout this file) — "not
+  CPU-saturated" was measured as %-of-8-vCPU-box, not %-of-the-one-thread-that-matters.
+  No `top -H` per-thread sample was taken at the degraded point (the earlier cw-dgp
+  investigation in this same file *did* take one and found exactly this signature —
+  not repeating that check here is a methodology regression).
+- **A plain write-throughput/queueing ceiling.** The `SLOW peer-decd-act=` hop timings
+  likely include mailbox queue wait, not just per-op processing cost, and keyspace size
+  and write rate both grew together through the climb — nothing in the data separates
+  "more objects cost more per op" from "more concurrent writers exceed the shard's
+  throughput and queue." G6 (compaction cost at scale) and the async range-worker pool's
+  actual coverage of the 40-44s LIST were not checked either.
+
+There's also an unreconciled discrepancy worth flagging: the (retracted) first attempt
+stalled around ~39-40k on this same `cws-xl` cluster, while this corrected run converged
+50,000 cleanly two days later before stalling near 62,600. That gap (warm keyspace? prior
+run's residual state? compaction timing?) is not explained by anything measured here.
+
+**"~62,600 pods" is a mid-climb stall, not a validated ceiling** — unlike every earlier
+rung in this file, it has no 30-min soak and no put-during-LIST probe (the plan's own
+headline gate metric). The etcd "~150,000-pod envelope, ~2.4x gap" comparison in an
+earlier draft of this entry has been removed: `multiregion-test-plan.md` §4b explicitly
+requires a matched-hardware, matched-workload etcd baseline before any such comparison is
+drawn, which was not run here, and KWOK-fake-pod churn is not real kubelet churn.
+
+**Cheapest next experiment (not yet run):** hold the deployment steady at ~62k (stop the
+climb) and resample `CWS_PROF` + the 1/s put probe. Latency recovering under steady
+churn-only load would point to queueing/throughput; latency persisting would support a
+real per-op-cost mechanism — then compare LIST ms/row at 10k/50k/62k keyspace sizes
+(constant = linear/G1-class, growing = superlinear/G2-cw-dgp-class), alongside a
+`top -H` per-thread sample. Infra for this run has since been torn down (all of `cws-xl`,
+`cws-apiserver-2/3`, and the terraform `apiserver-smoke` fleet were terminated
+2026-07-18), so this needs a fresh deploy to answer. Also not done: an actual
+shard-groups=1 vs shard-groups=6 A/B on identical hardware (the retracted numbers can't
+be reused for that comparison). Follow-up tracked under cw-7cn.
